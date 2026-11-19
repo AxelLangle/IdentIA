@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.config import get_settings
 from app.db import create_db_engine, get_db
 from app.main import create_app
 from app.vision.engine import normalize_embedding
@@ -123,7 +124,7 @@ def fake_engine() -> FakeBiometricEngine:
 
 
 @pytest.fixture()
-def api_client(
+def raw_api_client(
     tmp_path: Path, fake_engine: FakeBiometricEngine
 ) -> Generator[tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path], None, None]:
     db_file = tmp_path / "test_identia.db"
@@ -152,3 +153,22 @@ def api_client(
         yield client, TestingSessionLocal, fake_engine, tmp_path
 
     test_engine.dispose()
+
+
+@pytest.fixture()
+def api_client(
+    raw_api_client: tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path],
+) -> tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path]:
+    client, TestingSessionLocal, fake_engine, tmp_path = raw_api_client
+    settings = get_settings()
+    login_res = client.post(
+        "/api/auth/login",
+        json={
+            "email": settings.bootstrap_superadmin_email,
+            "password": settings.bootstrap_superadmin_password,
+        },
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+    client.headers.update({"Authorization": f"Bearer {token}"})
+    return client, TestingSessionLocal, fake_engine, tmp_path
