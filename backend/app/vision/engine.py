@@ -171,21 +171,35 @@ def enhance_frame_for_detection(image_bgr: np.ndarray) -> np.ndarray:
 
 
 def normalize_face_lighting(aligned_bgr: np.ndarray) -> np.ndarray:
-    """Compensa sombras y contraluz en el recorte alineado sin alterar colores cromáticos."""
+    """Compensa solo iluminación extrema (oscuridad/contraluz o sobreexposición) sin alterar luz normal."""
     lab = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
-    mean_l = max(float(np.mean(l_ch)), 1.0)
+    mean_l = float(np.mean(l_ch))
 
-    if mean_l < 110.0 or mean_l > 175.0:
-        gamma = float(np.clip(math.log(128.0 / 255.0) / math.log(mean_l / 255.0), 0.45, 1.80))
+    if 85.0 <= mean_l <= 195.0:
+        return aligned_bgr
+
+    if mean_l < 85.0:
+        gamma = float(
+            np.clip(math.log(112.0 / 255.0) / math.log(max(mean_l, 8.0) / 255.0), 0.50, 1.0)
+        )
         lut = np.array(
             [np.clip(((i / 255.0) ** gamma) * 255.0, 0, 255) for i in range(256)],
             dtype=np.uint8,
         )
-        l_ch = cv2.LUT(l_ch, lut)
+        l_gamma = cv2.LUT(l_ch, lut)
+        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(2, 2))
+        l_norm = cv2.addWeighted(l_gamma, 0.75, clahe.apply(l_gamma), 0.25, 0)
+    else:
+        gamma = float(
+            np.clip(math.log(165.0 / 255.0) / math.log(min(mean_l, 250.0) / 255.0), 1.0, 1.65)
+        )
+        lut = np.array(
+            [np.clip(((i / 255.0) ** gamma) * 255.0, 0, 255) for i in range(256)],
+            dtype=np.uint8,
+        )
+        l_norm = cv2.LUT(l_ch, lut)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    l_norm = clahe.apply(l_ch)
     merged = cv2.merge([l_norm, a_ch, b_ch])
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
