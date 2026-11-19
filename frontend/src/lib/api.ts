@@ -117,13 +117,17 @@ export const api = {
     personId: number,
     imageBlob: Blob,
     poseLabel: PoseLabel,
-    storeAvatar?: boolean
+    storeAvatar?: boolean,
+    dryRun = false
   ) => {
     const form = new FormData();
     form.append("image", imageBlob, "frame.jpg");
     form.append("pose_label", poseLabel);
     if (storeAvatar !== undefined) {
       form.append("store_avatar", String(storeAvatar));
+    }
+    if (dryRun) {
+      form.append("dry_run", "true");
     }
     return requestJson<EnrollFrameResponse>(`/api/persons/${personId}/enroll-frame`, {
       method: "POST",
