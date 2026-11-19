@@ -262,3 +262,30 @@ def test_backlight_and_side_shadow_detection() -> None:
         strict_lighting=False,
     )
     assert kiosk_rep.ok is True
+
+    # Contraluz moderado (rostro nítido brillo ~55 con fondo brillante 235):
+    # bloqueado en enrolamiento (strict_lighting=True), permitido en kiosco (strict_lighting=False)
+    mod_face = make_sharp_face_image(400, 400, (100, 80, 180, 200), brightness_base=55)
+    mod_backlight = np.full((400, 400, 3), 235, dtype=np.uint8)
+    mod_backlight[80:280, 100:280] = mod_face[80:280, 100:280]
+
+    strict_bl = evaluate_face_quality(
+        mod_backlight,
+        box,
+        min_brightness=32.0,
+        backlight_delta_threshold=70.0,
+        strict_lighting=True,
+    )
+    assert strict_bl.ok is False
+    assert strict_bl.backlight_detected is True
+    assert "Contraluz" in (strict_bl.reason or "")
+
+    kiosk_bl = evaluate_face_quality(
+        mod_backlight,
+        box,
+        min_brightness=18.0,
+        backlight_delta_threshold=70.0,
+        strict_lighting=False,
+    )
+    assert kiosk_bl.ok is True
+    assert kiosk_bl.backlight_detected is True
