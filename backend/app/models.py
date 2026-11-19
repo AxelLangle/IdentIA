@@ -35,11 +35,20 @@ class Organization(Base):
     groups: Mapped[list["Group"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
+    users: Mapped[list["User"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
     persons: Mapped[list["Person"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
     sessions: Mapped[list["AttendanceSession"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
+    )
+    delegated_credentials: Mapped[list["DelegatedCredential"]] = relationship(
+        cascade="all, delete-orphan"
+    )
+    audit_logs: Mapped[list["AuditLog"]] = relationship(
+        cascade="all, delete-orphan"
     )
 
 
@@ -175,3 +184,75 @@ class AttendanceEvent(Base):
 
     session: Mapped["AttendanceSession"] = relationship(back_populates="events")
     person: Mapped["Person"] = relationship(back_populates="attendance_events")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    email: Mapped[str] = mapped_column(String(160), unique=True, nullable=False, index=True)
+    full_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(30), nullable=False, default="operator")
+    organization_id: Mapped[int | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
+
+    organization: Mapped["Organization | None"] = relationship(back_populates="users")
+
+
+class DelegatedCredential(Base):
+    __tablename__ = "delegated_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    secret_prefix: Mapped[str] = mapped_column(String(20), nullable=False)
+    secret_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    assigned_to_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    assigned_to_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    allowed_operations: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="revoke_biometrics"
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    target_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_summary: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    executed_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    authorized_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    delegated_credential_id: Mapped[int | None] = mapped_column(
+        ForeignKey("delegated_credentials.id", ondelete="SET NULL"), nullable=True
+    )
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now_naive, index=True
+    )
