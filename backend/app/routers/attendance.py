@@ -229,7 +229,7 @@ async def recognize_frame(
         image_bgr,
         primary_box,
         min_size_px=settings.kiosk_min_face_size_px,
-        min_blur=settings.min_blur_variance,
+        min_blur=settings.kiosk_min_blur_variance,
         min_brightness=settings.kiosk_min_brightness,
         max_brightness=settings.max_brightness,
         max_shadow_asymmetry=settings.kiosk_max_shadow_asymmetry,
