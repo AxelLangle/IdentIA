@@ -7,15 +7,14 @@ from sqlalchemy.orm import Session, selectinload
 from app.config import get_settings
 from app.db import get_db
 from app.models import FaceEmbedding, Group, Organization, Person, PersonGroup
+from app.routers import to_face_box_schema, to_quality_schema
 from app.schemas import (
     BiometricsRevokeResponse,
     EnrollFrameResponse,
-    FaceBoxSchema,
     PersonCreate,
     PersonRead,
     PersonUpdate,
     PoseLabel,
-    QualityReportSchema,
 )
 from app.vision.engine import (
     bytes_to_embedding,
@@ -24,25 +23,10 @@ from app.vision.engine import (
     decode_image_bytes,
     embedding_to_bytes,
 )
-from app.vision.quality import FaceBox, evaluate_face_quality
+from app.vision.quality import evaluate_face_quality
 
 router = APIRouter(prefix="/api", tags=["persons"])
-
-
-def _to_face_box_schema(box: FaceBox, img_w: int, img_h: int) -> FaceBoxSchema:
-    return FaceBoxSchema(
-        x=box.x,
-        y=box.y,
-        w=box.w,
-        h=box.h,
-        confidence=round(box.confidence, 4),
-        image_width=img_w,
-        image_height=img_h,
-        nx=round(max(0.0, box.x) / max(img_w, 1), 4),
-        ny=round(max(0.0, box.y) / max(img_h, 1), 4),
-        nw=round(max(0.0, box.w) / max(img_w, 1), 4),
-        nh=round(max(0.0, box.h) / max(img_h, 1), 4),
-    )
+REQUIRED_POSES_COUNT = 6
 
 
 def _serialize_person(person: Person, current_model_version: str) -> PersonRead:
@@ -221,6 +205,7 @@ async def enroll_frame(
     image: UploadFile = File(...),
     pose_label: PoseLabel = Form(...),
     store_avatar: bool | None = Form(default=None),
+    dry_run: bool = Form(default=False),
     db: Session = Depends(get_db),
 ) -> EnrollFrameResponse:
     settings = get_settings()
@@ -256,54 +241,102 @@ async def enroll_frame(
         for e in person.embeddings
         if e.model_version == settings.model_version
     ]
+    already_complete = len(current_poses) >= REQUIRED_POSES_COUNT
 
     detections = engine.detect(image_bgr)
     if len(detections) == 0:
         return EnrollFrameResponse(
             accepted=False,
+            pose_valid=False,
             pose_label=pose_label,
             message="No se detectó ningún rostro. Colócate frente a la cámara.",
             embeddings_count=len(current_poses),
             poses_completed=current_poses,
+            is_complete=already_complete,
+            required_poses_count=REQUIRED_POSES_COUNT,
         )
 
     primary_box, primary_row = detections[0]
-    face_box_schema = _to_face_box_schema(primary_box, img_w, img_h)
+    face_box_schema = to_face_box_schema(primary_box, img_w, img_h)
 
     if len(detections) > 1:
         return EnrollFrameResponse(
             accepted=False,
+            pose_valid=False,
             pose_label=pose_label,
             message="Se detectaron varios rostros; asegúrate de estar solo frente a la cámara.",
             embeddings_count=len(current_poses),
             poses_completed=current_poses,
+            is_complete=already_complete,
+            required_poses_count=REQUIRED_POSES_COUNT,
             face_box=face_box_schema,
         )
+
+    frontal_emb = next(
+        (
+            e
+            for e in person.embeddings
+            if e.pose_label == "frontal" and e.model_version == settings.model_version
+        ),
+        None,
+    )
+    frontal_mouth_ratio = frontal_emb.mouth_ratio if frontal_emb is not None else None
+    frontal_pitch_ratio = frontal_emb.pitch_ratio if frontal_emb is not None else None
 
     quality = evaluate_face_quality(
         image_bgr,
         primary_box,
         min_size_px=settings.min_face_size_px,
-        min_blur=settings.min_blur_variance,
-        min_brightness=settings.min_brightness,
+        min_blur=settings.enroll_min_blur_variance,
+        min_brightness=settings.enroll_min_brightness,
         max_brightness=settings.max_brightness,
+        expected_pose=pose_label,
+        frontal_mouth_ratio=frontal_mouth_ratio,
+        frontal_pitch_ratio=frontal_pitch_ratio,
+        max_shadow_asymmetry=settings.enroll_max_shadow_asymmetry,
+        backlight_delta_threshold=settings.backlight_delta_threshold,
+        strict_lighting=True,
     )
-    quality_schema = QualityReportSchema(
-        ok=quality.ok,
-        reason=quality.reason,
-        blur_score=round(quality.blur_score, 2),
-        brightness=round(quality.brightness, 2),
-        face_width=quality.face_width,
-        face_height=quality.face_height,
-        pose_hint=quality.pose_hint,
-    )
+    quality_schema = to_quality_schema(quality)
+
     if not quality.ok:
         return EnrollFrameResponse(
             accepted=False,
+            pose_valid=False,
             pose_label=pose_label,
             message=quality.reason or "Calidad de imagen insuficiente.",
             embeddings_count=len(current_poses),
             poses_completed=current_poses,
+            is_complete=already_complete,
+            required_poses_count=REQUIRED_POSES_COUNT,
+            face_box=face_box_schema,
+            quality=quality_schema,
+        )
+
+    if not quality.pose_matches:
+        return EnrollFrameResponse(
+            accepted=False,
+            pose_valid=False,
+            pose_label=pose_label,
+            message=quality.pose_feedback or "La orientación del rostro no coincide con la pose solicitada.",
+            embeddings_count=len(current_poses),
+            poses_completed=current_poses,
+            is_complete=already_complete,
+            required_poses_count=REQUIRED_POSES_COUNT,
+            face_box=face_box_schema,
+            quality=quality_schema,
+        )
+
+    if dry_run:
+        return EnrollFrameResponse(
+            accepted=False,
+            pose_valid=True,
+            pose_label=pose_label,
+            message="Pose validada, mantén firme la posición...",
+            embeddings_count=len(current_poses),
+            poses_completed=current_poses,
+            is_complete=already_complete,
+            required_poses_count=REQUIRED_POSES_COUNT,
             face_box=face_box_schema,
             quality=quality_schema,
         )
@@ -324,10 +357,13 @@ async def enroll_frame(
         if max_self_sim < settings.self_consistency_threshold:
             return EnrollFrameResponse(
                 accepted=False,
+                pose_valid=False,
                 pose_label=pose_label,
                 message="El rostro capturado no coincide con las tomas previas de esta persona.",
                 embeddings_count=len(current_poses),
                 poses_completed=current_poses,
+                is_complete=already_complete,
+                required_poses_count=REQUIRED_POSES_COUNT,
                 face_box=face_box_schema,
                 quality=quality_schema,
             )
@@ -339,6 +375,8 @@ async def enroll_frame(
         existing_pose.model_name = settings.model_name
         existing_pose.model_version = settings.model_version
         existing_pose.quality_score = round(quality.blur_score, 2)
+        existing_pose.mouth_ratio = round(quality.mouth_ratio, 4)
+        existing_pose.pitch_ratio = round(quality.pitch_ratio, 4)
         existing_pose.created_at = datetime.now()
     else:
         db.add(
@@ -349,6 +387,8 @@ async def enroll_frame(
                 model_name=settings.model_name,
                 model_version=settings.model_version,
                 quality_score=round(quality.blur_score, 2),
+                mouth_ratio=round(quality.mouth_ratio, 4),
+                pitch_ratio=round(quality.pitch_ratio, 4),
             )
         )
 
@@ -375,10 +415,13 @@ async def enroll_frame(
 
     return EnrollFrameResponse(
         accepted=True,
+        pose_valid=True,
         pose_label=pose_label,
         message=f"Pose '{pose_label}' registrada en memoria y vector almacenado.",
         embeddings_count=len(updated_poses),
         poses_completed=updated_poses,
+        is_complete=len(updated_poses) >= REQUIRED_POSES_COUNT,
+        required_poses_count=REQUIRED_POSES_COUNT,
         face_box=face_box_schema,
         quality=quality_schema,
         avatar_saved=avatar_saved,

@@ -131,8 +131,19 @@ export function KioskPage({
       boxLabel = "No reconocido";
     } else {
       boxStatus = "warning";
-      boxLabel =
-        lastResult.match_status === "ambiguous" ? "Coincidencia ambigua" : "Ajusta posición/luz";
+      if (lastResult.match_status === "ambiguous") {
+        boxLabel = "Coincidencia ambigua";
+      } else if (lastResult.message.includes("borrosa")) {
+        boxLabel = "Imagen borrosa";
+      } else if (lastResult.message.includes("Acércate")) {
+        boxLabel = "Acércate más";
+      } else if (lastResult.message.includes("Contraluz")) {
+        boxLabel = "Contraluz fuerte";
+      } else if (lastResult.message.includes("iluminación")) {
+        boxLabel = "Poca luz";
+      } else {
+        boxLabel = "Calidad baja";
+      }
     }
   }
 
@@ -285,7 +296,19 @@ export function KioskPage({
                     {lastResult.worked_minutes !== null && (
                       <> · Jornada: {lastResult.worked_minutes} min</>
                     )}
+                    {lastResult.match_status === "low_quality" && lastResult.quality && (
+                      <>
+                        {" "}
+                        · Nitidez: {lastResult.quality.blur_score} · Brillo:{" "}
+                        {lastResult.quality.brightness}
+                      </>
+                    )}
                   </p>
+                  {lastResult.quality?.backlight_detected && (
+                    <span className="inline-block mt-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                      Contraluz detectado · compensación activa
+                    </span>
+                  )}
                 </div>
               </div>
               <span className="text-xs font-mono text-slate-400 shrink-0">

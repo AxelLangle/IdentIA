@@ -1,6 +1,6 @@
 export type OrgMode = "enterprise" | "education";
 export type PersonRole = "employee" | "student" | "teacher" | "admin";
-export type PoseLabel = "frontal" | "left" | "right" | "up" | "smile";
+export type PoseLabel = "frontal" | "left" | "right" | "up" | "down" | "smile";
 export type ActionMode = "auto" | "check_in" | "check_out" | "present";
 export type SessionStatus = "open" | "closed";
 
@@ -65,14 +65,24 @@ export interface QualityReport {
   face_width: number;
   face_height: number;
   pose_hint: string;
+  shadow_asymmetry: number;
+  backlight_detected: boolean;
+  yaw_ratio: number;
+  pitch_ratio: number;
+  mouth_ratio: number;
+  pose_matches: boolean;
+  pose_feedback: string | null;
 }
 
 export interface EnrollFrameResponse {
   accepted: boolean;
+  pose_valid: boolean;
   pose_label: PoseLabel;
   message: string;
   embeddings_count: number;
   poses_completed: PoseLabel[];
+  is_complete: boolean;
+  required_poses_count: number;
   face_box: FaceBox | null;
   quality: QualityReport | null;
   avatar_saved: boolean;

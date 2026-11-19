@@ -12,10 +12,12 @@ Surgió como una reconstrucción completa desde cero del proyecto académico ant
 - **Frontend (`frontend/`):** React + Vite + TypeScript + Tailwind CSS + WebRTC (`getUserMedia`).
 - **Motor Biométrico:**
   1. Decodificación de frame en memoria RAM (sin guardar fotografías crudas en disco).
-  2. Detección multi-rostro con **YuNet (`face_detection_yunet_2023mar.onnx`)**.
-  3. Validación de calidad (tamaño mínimo, nitidez por varianza Laplaciana e iluminación).
-  4. Alineación facial por landmarks y extracción de embedding L2-normalizado de 128 dimensiones con **SFace (`face_recognition_sface_2021dec.onnx`)**.
+  2. Detección multi-rostro con **YuNet (`face_detection_yunet_2023mar.onnx`)** con fallback LAB/CLAHE en contraluz.
+  3. Validación de calidad (tamaño mínimo, nitidez, iluminación, sombra lateral, contraluz y validación geométrica de 6 poses: `frontal`, `left`, `right`, `up`, `down`, `smile`).
+  4. Alineación facial, normalización selectiva de iluminación extrema LAB y extracción de embedding L2-normalizado de 128 dimensiones con **SFace (`sface_2021dec_v2`)**.
   5. Búsqueda 1:N por similitud coseno con umbral calibrado (`0.42`) y verificación de margen contra el segundo candidato (`0.05`).
+
+> Consulta también el [Manual de Uso y Operación](docs/USER_MANUAL.md) y la [Arquitectura Técnica](docs/ARCHITECTURE.md).
 
 ---
 
@@ -116,6 +118,15 @@ npm run build
 ## Hoja de Ruta
 
 - **Fase 0–1 (Completa):** Arquitectura unificada, repositorio limpio y motor biométrico ONNX YuNet + SFace con control de calidad.
-- **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, registro guiado de 5 poses, grupos, sesiones y exportación CSV).
-- **Fase 3 (Siguiente):** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
-- **Fase 4 (Futura):** Liveness activo (detección de parpadeo/micro-movimientos en navegador), autenticación de roles (Admin/Docente/RRHH) y migración opcional a PostgreSQL/pgvector.
+- **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, grupos, sesiones y exportación CSV).
+- **Bloque A (Completa en `feat/bloque-a-enrolamiento-iluminacion`):** Compensación de contraluz/sombras LAB/CLAHE, asistente guiado de 6 poses con validación geométrica y revisión temporal en memoria.
+- **Bloques B–D (En curso desde `develop`):** Multi-Tenant RBAC + revocación con credenciales delegadas, modelo educativo completo (carreras/grupos/materias/profesores) y turnos empresariales.
+- **Siguiente:** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
+
+---
+
+## Flujo de Ramas Git
+
+- `main`: Rama estable.
+- `staging`: Preproducción.
+- `develop`: Integración principal; cada nueva funcionalidad parte en una rama `feat/*` desde `develop`.

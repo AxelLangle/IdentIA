@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
+  AlertTriangle,
   Camera,
   Check,
+  CheckCircle2,
   Plus,
+  RotateCcw,
   Search,
   ShieldAlert,
   Sparkles,
@@ -27,13 +30,46 @@ interface EnrollmentPageProps {
   onRefreshPersons: () => Promise<void>;
 }
 
-const POSES: { key: PoseLabel; title: string; instruction: string }[] = [
-  { key: "frontal", title: "1. Frontal", instruction: "Mira directamente al centro de la cámara." },
-  { key: "left", title: "2. Izquierda", instruction: "Gira suavemente la cabeza a la izquierda." },
-  { key: "right", title: "3. Derecha", instruction: "Gira suavemente la cabeza a la derecha." },
-  { key: "up", title: "4. Arriba", instruction: "Levanta ligeramente el mentón mirando al frente." },
-  { key: "smile", title: "5. Sonrisa", instruction: "Sonríe de forma natural mirando a la cámara." },
+const POSES: { key: PoseLabel; title: string; shortLabel: string; instruction: string }[] = [
+  {
+    key: "frontal",
+    title: "1. Frontal",
+    shortLabel: "Frontal",
+    instruction: "Mira directamente al centro de la cámara con rostro nivelado.",
+  },
+  {
+    key: "left",
+    title: "2. Izquierda",
+    shortLabel: "Izquierda",
+    instruction: "Gira suavemente la cabeza hacia tu izquierda manteniendo los ojos visibles.",
+  },
+  {
+    key: "right",
+    title: "3. Derecha",
+    shortLabel: "Derecha",
+    instruction: "Gira suavemente la cabeza hacia tu derecha manteniendo los ojos visibles.",
+  },
+  {
+    key: "up",
+    title: "4. Arriba",
+    shortLabel: "Arriba",
+    instruction: "Levanta ligeramente el mentón mirando un poco hacia arriba.",
+  },
+  {
+    key: "down",
+    title: "5. Abajo",
+    shortLabel: "Abajo",
+    instruction: "Inclina suavemente la cabeza mirando ligeramente hacia abajo.",
+  },
+  {
+    key: "smile",
+    title: "6. Sonrisa",
+    shortLabel: "Sonrisa",
+    instruction: "Mira al frente y sonríe de forma marcada y natural.",
+  },
 ];
+
+const TOTAL_POSES = POSES.length;
 
 export function EnrollmentPage({
   organization,
@@ -42,6 +78,10 @@ export function EnrollmentPage({
   onRefreshPersons,
 }: EnrollmentPageProps) {
   const cameraRef = useRef<CameraViewHandle | null>(null);
+  const inFlightRef = useRef(false);
+  const pauseUntilRef = useRef(0);
+  const stabilityRef = useRef(0);
+  const previewsRef = useRef<Partial<Record<PoseLabel, string>>>({});
 
   const [search, setSearch] = useState("");
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -65,24 +105,77 @@ export function EnrollmentPage({
   const [cameraReady, setCameraReady] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [autoCapture, setAutoCapture] = useState(false);
+  const [stabilityCount, setStabilityCount] = useState(0);
   const [enrollStatus, setEnrollStatus] = useState<EnrollFrameResponse | null>(null);
   const [enrollError, setEnrollError] = useState<string | null>(null);
+  const [posePreviews, setPosePreviews] = useState<Partial<Record<PoseLabel, string>>>({});
+  const [completedBanner, setCompletedBanner] = useState<string | null>(null);
 
   const activePerson = persons.find((p) => p.id === activePersonId) ?? null;
   const currentPose = POSES[poseIndex] ?? POSES[0];
+
+  const revokeAllPreviews = useCallback(() => {
+    Object.values(previewsRef.current).forEach((url) => {
+      if (url) URL.revokeObjectURL(url);
+    });
+    previewsRef.current = {};
+    setPosePreviews({});
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      revokeAllPreviews();
+    };
+  }, [revokeAllPreviews]);
 
   useEffect(() => {
     setRole(organization.mode === "education" ? "student" : "employee");
     setStoreAvatar(organization.store_avatar_by_default);
     setActivePersonId(null);
     setAutoCapture(false);
-  }, [organization.id, organization.mode, organization.store_avatar_by_default]);
+    setCompletedBanner(null);
+    revokeAllPreviews();
+  }, [
+    organization.id,
+    organization.mode,
+    organization.store_avatar_by_default,
+    revokeAllPreviews,
+  ]);
 
   const filteredPersons = persons.filter((p) => {
     const q = search.trim().toLowerCase();
     if (!q) return true;
     return p.full_name.toLowerCase().includes(q) || p.external_id.toLowerCase().includes(q);
   });
+
+  function startEnrollmentFor(person: Person) {
+    revokeAllPreviews();
+    stabilityRef.current = 0;
+    setStabilityCount(0);
+    setCompletedBanner(null);
+    setActivePersonId(person.id);
+    setAutoCapture(false);
+    setEnrollStatus(null);
+    setEnrollError(null);
+    const nextMissing = POSES.findIndex((pose) => !person.poses_completed.includes(pose.key));
+    setPoseIndex(nextMissing === -1 ? 0 : nextMissing);
+  }
+
+  function finishEnrollment() {
+    if (!activePerson) return;
+    const personName = activePerson.full_name;
+    const count = activePerson.poses_completed.length;
+    setAutoCapture(false);
+    setActivePersonId(null);
+    setEnrollStatus(null);
+    setEnrollError(null);
+    stabilityRef.current = 0;
+    setStabilityCount(0);
+    revokeAllPreviews();
+    setCompletedBanner(
+      `Enrolamiento de ${personName} finalizado (${count}/${TOTAL_POSES} poses guardadas en memoria vectorial).`
+    );
+  }
 
   async function handleCreatePerson(e: FormEvent) {
     e.preventDefault();
@@ -105,10 +198,7 @@ export function EnrollmentPage({
       setShowCreateForm(false);
       await onRefreshPersons();
       if (created.biometric_consent) {
-        setActivePersonId(created.id);
-        setPoseIndex(0);
-        setEnrollStatus(null);
-        setEnrollError(null);
+        startEnrollmentFor(created);
       }
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "No se pudo crear el registro.");
@@ -117,49 +207,107 @@ export function EnrollmentPage({
     }
   }
 
-  async function captureCurrentPose() {
-    if (!activePerson || !cameraReady || capturing) return;
-    const cam = cameraRef.current;
-    if (!cam) return;
+  const saveMemoryPreview = useCallback((poseKey: PoseLabel, blob: Blob) => {
+    const prevUrl = previewsRef.current[poseKey];
+    if (prevUrl) URL.revokeObjectURL(prevUrl);
+    const nextUrl = URL.createObjectURL(blob);
+    previewsRef.current = { ...previewsRef.current, [poseKey]: nextUrl };
+    setPosePreviews({ ...previewsRef.current });
+  }, []);
 
-    setCapturing(true);
-    setEnrollError(null);
-    try {
-      const blob = await cam.captureBlob();
-      if (!blob) return;
-      const res = await api.enrollFrame(
-        activePerson.id,
-        blob,
-        currentPose.key,
-        storeAvatar
-      );
-      setEnrollStatus(res);
-      if (res.accepted) {
-        await onRefreshPersons();
-        const nextMissingIdx = POSES.findIndex(
-          (p) => !res.poses_completed.includes(p.key)
+  const submitCapture = useCallback(
+    async (poseKey: PoseLabel, dryRun: boolean) => {
+      if (!activePerson || !cameraReady || inFlightRef.current) return;
+      const cam = cameraRef.current;
+      if (!cam) return;
+
+      inFlightRef.current = true;
+      if (!dryRun) setCapturing(true);
+      setEnrollError(null);
+      try {
+        const blob = await cam.captureBlob();
+        if (!blob) return;
+
+        const res = await api.enrollFrame(
+          activePerson.id,
+          blob,
+          poseKey,
+          storeAvatar,
+          dryRun
         );
-        if (nextMissingIdx !== -1) {
-          setPoseIndex(nextMissingIdx);
-        } else {
-          setAutoCapture(false);
+        setEnrollStatus(res);
+
+        if (dryRun) {
+          if (res.pose_valid) {
+            stabilityRef.current += 1;
+            setStabilityCount(stabilityRef.current);
+            if (stabilityRef.current >= 2) {
+              stabilityRef.current = 0;
+              setStabilityCount(0);
+              setCapturing(true);
+              const commitRes = await api.enrollFrame(
+                activePerson.id,
+                blob,
+                poseKey,
+                storeAvatar,
+                false
+              );
+              setEnrollStatus(commitRes);
+              if (commitRes.accepted) {
+                saveMemoryPreview(poseKey, blob);
+                pauseUntilRef.current = Date.now() + 1100;
+                await onRefreshPersons();
+                const nextMissingIdx = POSES.findIndex(
+                  (p) => !commitRes.poses_completed.includes(p.key)
+                );
+                if (nextMissingIdx !== -1) {
+                  setPoseIndex(nextMissingIdx);
+                } else {
+                  setAutoCapture(false);
+                }
+              }
+            }
+          } else {
+            stabilityRef.current = 0;
+            setStabilityCount(0);
+          }
+          return;
         }
+
+        if (res.accepted) {
+          saveMemoryPreview(poseKey, blob);
+          pauseUntilRef.current = Date.now() + 900;
+          await onRefreshPersons();
+          const nextMissingIdx = POSES.findIndex(
+            (p) => !res.poses_completed.includes(p.key)
+          );
+          if (nextMissingIdx !== -1) {
+            setPoseIndex(nextMissingIdx);
+          } else {
+            setAutoCapture(false);
+          }
+        }
+      } catch (err) {
+        setEnrollError(err instanceof Error ? err.message : "Error al enviar captura.");
+        setAutoCapture(false);
+        stabilityRef.current = 0;
+        setStabilityCount(0);
+      } finally {
+        inFlightRef.current = false;
+        setCapturing(false);
       }
-    } catch (err) {
-      setEnrollError(err instanceof Error ? err.message : "Error al enviar captura.");
-      setAutoCapture(false);
-    } finally {
-      setCapturing(false);
-    }
-  }
+    },
+    [activePerson, cameraReady, onRefreshPersons, saveMemoryPreview, storeAvatar]
+  );
 
   useEffect(() => {
     if (!autoCapture || !activePerson || !cameraReady) return;
     const timer = window.setInterval(() => {
-      void captureCurrentPose();
-    }, 950);
+      if (Date.now() < pauseUntilRef.current) return;
+      void submitCapture(currentPose.key, true);
+    }, 450);
     return () => window.clearInterval(timer);
-  });
+  }, [activePerson, autoCapture, cameraReady, currentPose.key, submitCapture]);
 
   async function handleRevokeBiometrics(person: Person) {
     if (!window.confirm(`¿Revocar y eliminar los vectores biométricos de ${person.full_name}?`)) {
@@ -168,6 +316,7 @@ export function EnrollmentPage({
     await api.revokeBiometrics(person.id);
     if (activePersonId === person.id) {
       setEnrollStatus(null);
+      revokeAllPreviews();
     }
     await onRefreshPersons();
   }
@@ -178,6 +327,7 @@ export function EnrollmentPage({
     if (activePersonId === person.id) {
       setActivePersonId(null);
       setAutoCapture(false);
+      revokeAllPreviews();
     }
     await onRefreshPersons();
   }
@@ -188,13 +338,18 @@ export function EnrollmentPage({
     );
   }
 
+  const completedCount = activePerson?.poses_completed.length ?? 0;
+  const allPosesDone = completedCount >= TOTAL_POSES;
+  const progressPct = Math.round((completedCount / TOTAL_POSES) * 100);
+
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Personas y Registro Biométrico</h2>
           <p className="text-sm text-slate-400">
-            Alta de padrón y asistente guiado de 5 poses en memoria (sin guardar fotos crudas)
+            Asistente guiado de {TOTAL_POSES} poses con validación geométrica e iluminación (sin
+            guardar fotos crudas)
           </p>
         </div>
 
@@ -207,6 +362,22 @@ export function EnrollmentPage({
           Nueva Persona
         </button>
       </div>
+
+      {completedBanner && (
+        <div className="rounded-2xl bg-emerald-500/15 border border-emerald-500/40 px-4 py-3 flex items-center justify-between gap-3 text-sm text-emerald-200">
+          <div className="flex items-center gap-2.5">
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+            <span>{completedBanner}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setCompletedBanner(null)}
+            className="text-xs text-emerald-300 hover:underline shrink-0"
+          >
+            Ocultar
+          </button>
+        </div>
+      )}
 
       {showCreateForm && (
         <form
@@ -333,7 +504,7 @@ export function EnrollmentPage({
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Lista del padrón */}
-        <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+        <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           <div className="relative">
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
@@ -345,7 +516,7 @@ export function EnrollmentPage({
             />
           </div>
 
-          <div className="space-y-2.5 max-h-[540px] overflow-y-auto pr-1">
+          <div className="space-y-2.5 max-h-[640px] overflow-y-auto pr-1">
             {filteredPersons.length === 0 ? (
               <p className="text-sm text-slate-500 py-10 text-center">
                 No hay personas registradas que coincidan con la búsqueda.
@@ -385,14 +556,14 @@ export function EnrollmentPage({
 
                       <span
                         className={`px-2.5 py-1 rounded-full text-xs font-medium shrink-0 ${
-                          p.embeddings_count >= 3
+                          p.embeddings_count >= TOTAL_POSES
                             ? "bg-emerald-500/15 text-emerald-300"
                             : p.embeddings_count > 0
                               ? "bg-amber-500/15 text-amber-300"
                               : "bg-slate-800 text-slate-400"
                         }`}
                       >
-                        {p.embeddings_count}/5 poses
+                        {p.embeddings_count}/{TOTAL_POSES} poses
                       </span>
                     </div>
 
@@ -401,7 +572,11 @@ export function EnrollmentPage({
                         {!p.biometric_consent ? (
                           <span className="text-amber-400">Sin consentimiento biométrico</span>
                         ) : p.needs_reenroll ? (
-                          <span className="text-amber-300">Requiere re-enrolamiento</span>
+                          <span className="text-amber-300">
+                            Actualiza rostro (nueva normalización)
+                          </span>
+                        ) : p.embeddings_count >= TOTAL_POSES ? (
+                          <span className="text-emerald-300">Registro biométrico completo</span>
                         ) : (
                           <span>Listo para captura</span>
                         )}
@@ -411,16 +586,7 @@ export function EnrollmentPage({
                         <button
                           type="button"
                           disabled={!p.biometric_consent}
-                          onClick={() => {
-                            setActivePersonId(p.id);
-                            setAutoCapture(false);
-                            setEnrollStatus(null);
-                            setEnrollError(null);
-                            const nextMissing = POSES.findIndex(
-                              (pose) => !p.poses_completed.includes(pose.key)
-                            );
-                            setPoseIndex(nextMissing === -1 ? 0 : nextMissing);
-                          }}
+                          onClick={() => startEnrollmentFor(p)}
                           className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white"
                         >
                           <Camera className="w-3.5 h-3.5" />
@@ -456,17 +622,17 @@ export function EnrollmentPage({
           </div>
         </div>
 
-        {/* Asistente guiado de 5 poses */}
-        <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+        {/* Asistente guiado de 6 poses */}
+        <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           {!activePerson ? (
-            <div className="h-full min-h-[380px] flex flex-col items-center justify-center text-center text-slate-400 p-6">
+            <div className="h-full min-h-[420px] flex flex-col items-center justify-center text-center text-slate-400 p-6">
               <UserCheck className="w-12 h-12 text-indigo-400/70 mb-3" />
               <h3 className="font-semibold text-base text-slate-200">
                 Selecciona una persona para enrolar
               </h3>
               <p className="text-xs text-slate-500 max-w-sm mt-1">
-                Solo necesitamos entre 3 y 5 tomas limpias con distintas poses para generar los
-                embeddings SFace. No volverás a entrenar modelos pesados.
+                Capturaremos {TOTAL_POSES} poses distintas verificadas en tiempo real para que el
+                reconocimiento sea preciso incluso con cambios de ángulo o luz.
               </p>
             </div>
           ) : (
@@ -475,7 +641,7 @@ export function EnrollmentPage({
                 <div>
                   <h3 className="font-semibold text-base">{activePerson.full_name}</h3>
                   <p className="text-xs text-slate-400">
-                    {activePerson.embeddings_count}/5 poses registradas
+                    Progreso: {completedCount} de {TOTAL_POSES} poses completadas ({progressPct}%)
                   </p>
                 </div>
 
@@ -490,41 +656,69 @@ export function EnrollmentPage({
                 </label>
               </div>
 
-              {/* Pills de poses */}
-              <div className="grid grid-cols-5 gap-1.5">
-                {POSES.map((pose, idx) => {
-                  const completed = activePerson.poses_completed.includes(pose.key);
-                  const selected = idx === poseIndex;
-                  return (
-                    <button
-                      key={pose.key}
-                      type="button"
-                      onClick={() => setPoseIndex(idx)}
-                      className={`px-2 py-2 rounded-lg text-[11px] font-medium border flex items-center justify-center gap-1 transition-colors ${
-                        selected
-                          ? "bg-indigo-600 border-indigo-400 text-white"
-                          : completed
-                            ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-300"
-                            : "bg-slate-800 border-slate-700 text-slate-400"
-                      }`}
-                    >
-                      {completed && <Check className="w-3 h-3 shrink-0" />}
-                      <span className="truncate">{pose.title.split(" ")[1]}</span>
-                    </button>
-                  );
-                })}
+              {/* Barra de progreso */}
+              <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-300 ${
+                    allPosesDone ? "bg-emerald-500" : "bg-indigo-500"
+                  }`}
+                  style={{ width: `${progressPct}%` }}
+                />
               </div>
 
-              <div className="rounded-xl bg-indigo-500/10 border border-indigo-500/30 px-3.5 py-2.5 text-xs text-indigo-200">
-                <strong>{currentPose.title}:</strong> {currentPose.instruction}
+              {/* Banner destacado cuando se completan las 6 poses */}
+              {allPosesDone && (
+                <div className="rounded-2xl bg-emerald-500/15 border border-emerald-500/40 p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <p className="font-semibold text-sm text-emerald-200 flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      ¡Enrolamiento biométrico completado ({TOTAL_POSES}/{TOTAL_POSES})!
+                    </p>
+                    <p className="text-xs text-emerald-200/80">
+                      Los vectores ya están almacenados sin guardar fotos crudas. Puedes repetir
+                      cualquier toma abajo o finalizar el registro.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={finishEnrollment}
+                    className="px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white shrink-0"
+                  >
+                    Finalizar enrolamiento
+                  </button>
+                </div>
+              )}
+
+              {/* Instrucción actual + estabilidad */}
+              <div className="rounded-xl bg-indigo-500/10 border border-indigo-500/30 px-3.5 py-2.5 flex items-center justify-between gap-3 text-xs text-indigo-200">
+                <div>
+                  <strong>{currentPose.title}:</strong> {currentPose.instruction}
+                </div>
+                {autoCapture && (
+                  <span className="px-2 py-0.5 rounded-full bg-indigo-600/40 text-[11px] font-semibold shrink-0">
+                    Estabilidad {stabilityCount}/2
+                  </span>
+                )}
               </div>
 
               <CameraView
                 ref={cameraRef}
                 active={Boolean(activePerson)}
                 faceBox={enrollStatus?.face_box ?? null}
-                boxStatus={enrollStatus ? (enrollStatus.accepted ? "ok" : "warning") : "idle"}
-                label={enrollStatus?.quality ? `Nitidez ${enrollStatus.quality.blur_score}` : undefined}
+                boxStatus={
+                  enrollStatus
+                    ? enrollStatus.accepted || enrollStatus.pose_valid
+                      ? "ok"
+                      : "warning"
+                    : "idle"
+                }
+                label={
+                  enrollStatus?.quality
+                    ? enrollStatus.pose_valid
+                      ? `Pose OK · ${currentPose.shortLabel}`
+                      : `Detectado: ${enrollStatus.quality.pose_hint}`
+                    : undefined
+                }
                 onReadyChange={setCameraReady}
                 onError={setEnrollError}
               />
@@ -533,7 +727,7 @@ export function EnrollmentPage({
                 <button
                   type="button"
                   disabled={!cameraReady || capturing}
-                  onClick={() => void captureCurrentPose()}
+                  onClick={() => void submitCapture(currentPose.key, false)}
                   className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white"
                 >
                   <Camera className="w-4 h-4" />
@@ -543,7 +737,11 @@ export function EnrollmentPage({
                 <button
                   type="button"
                   disabled={!cameraReady}
-                  onClick={() => setAutoCapture((v) => !v)}
+                  onClick={() => {
+                    stabilityRef.current = 0;
+                    setStabilityCount(0);
+                    setAutoCapture((v) => !v);
+                  }}
                   className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
                     autoCapture
                       ? "bg-amber-600 border-amber-500 text-white"
@@ -551,7 +749,7 @@ export function EnrollmentPage({
                   }`}
                 >
                   <Sparkles className="w-4 h-4" />
-                  {autoCapture ? "Detener Auto" : "Auto-captura"}
+                  {autoCapture ? "Detener Auto" : "Auto-captura guiada"}
                 </button>
               </div>
 
@@ -564,21 +762,108 @@ export function EnrollmentPage({
               {enrollStatus && (
                 <div
                   className={`rounded-xl border px-3.5 py-2.5 text-xs ${
-                    enrollStatus.accepted
+                    enrollStatus.accepted || enrollStatus.pose_valid
                       ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-200"
                       : "bg-amber-500/10 border-amber-500/40 text-amber-200"
                   }`}
                 >
-                  <p className="font-medium">{enrollStatus.message}</p>
+                  <div className="flex items-center gap-2 font-medium">
+                    {enrollStatus.quality?.backlight_detected && (
+                      <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0" />
+                    )}
+                    <span>{enrollStatus.message}</span>
+                  </div>
                   {enrollStatus.quality && (
                     <p className="text-[11px] opacity-80 mt-0.5">
                       Nitidez: {enrollStatus.quality.blur_score} · Brillo:{" "}
-                      {enrollStatus.quality.brightness} · Tamaño:{" "}
+                      {enrollStatus.quality.brightness} · Asimetría luz:{" "}
+                      {enrollStatus.quality.shadow_asymmetry} · Tamaño:{" "}
                       {enrollStatus.quality.face_width}×{enrollStatus.quality.face_height}px
                     </p>
                   )}
                 </div>
               )}
+
+              {/* Revisión temporal de las 6 poses en memoria RAM */}
+              <div className="space-y-2 pt-1">
+                <p className="text-xs text-slate-400">
+                  Revisión de tomas (vista temporal en navegador; pulsa Repetir si deseas rehacer
+                  alguna pose):
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                  {POSES.map((pose, idx) => {
+                    const completed = activePerson.poses_completed.includes(pose.key);
+                    const selected = idx === poseIndex;
+                    const previewUrl = posePreviews[pose.key];
+                    return (
+                      <div
+                        key={pose.key}
+                        className={`rounded-xl border p-2.5 flex items-center justify-between gap-2 transition-colors ${
+                          selected
+                            ? "bg-indigo-600/15 border-indigo-400"
+                            : completed
+                              ? "bg-emerald-500/10 border-emerald-500/30"
+                              : "bg-slate-800/50 border-slate-800"
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            stabilityRef.current = 0;
+                            setStabilityCount(0);
+                            setPoseIndex(idx);
+                          }}
+                          className="flex items-center gap-2 min-w-0 text-left flex-1"
+                        >
+                          {previewUrl ? (
+                            <img
+                              src={previewUrl}
+                              alt={pose.shortLabel}
+                              className="w-9 h-9 rounded-lg object-cover border border-slate-700 scale-x-[-1] shrink-0"
+                            />
+                          ) : (
+                            <div
+                              className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
+                                completed
+                                  ? "bg-emerald-500/20 text-emerald-300"
+                                  : "bg-slate-800 text-slate-500"
+                              }`}
+                            >
+                              {completed ? (
+                                <Check className="w-4 h-4" />
+                              ) : (
+                                <span className="text-xs font-semibold">{idx + 1}</span>
+                              )}
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <p className="text-xs font-medium truncate">{pose.shortLabel}</p>
+                            <p className="text-[10px] text-slate-400">
+                              {completed ? "Lista" : "Pendiente"}
+                            </p>
+                          </div>
+                        </button>
+
+                        {completed && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              stabilityRef.current = 0;
+                              setStabilityCount(0);
+                              setPoseIndex(idx);
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 shrink-0"
+                            title={`Repetir ${pose.shortLabel}`}
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            Repetir
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             </>
           )}
         </div>

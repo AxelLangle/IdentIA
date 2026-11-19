@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 OrgMode = Literal["enterprise", "education"]
 PersonRole = Literal["employee", "student", "teacher", "admin"]
-PoseLabel = Literal["frontal", "left", "right", "up", "smile"]
+PoseLabel = Literal["frontal", "left", "right", "up", "down", "smile"]
 SessionType = Literal["workday", "class"]
 SessionStatus = Literal["open", "closed"]
 ActionMode = Literal["auto", "check_in", "check_out", "present"]
@@ -125,14 +125,24 @@ class QualityReportSchema(BaseModel):
     face_width: int
     face_height: int
     pose_hint: str
+    shadow_asymmetry: float = 0.0
+    backlight_detected: bool = False
+    yaw_ratio: float = 0.0
+    pitch_ratio: float = 0.55
+    mouth_ratio: float = 0.72
+    pose_matches: bool = True
+    pose_feedback: str | None = None
 
 
 class EnrollFrameResponse(BaseModel):
     accepted: bool
+    pose_valid: bool = False
     pose_label: str
     message: str
     embeddings_count: int
     poses_completed: list[str]
+    is_complete: bool = False
+    required_poses_count: int = 6
     face_box: FaceBoxSchema | None = None
     quality: QualityReportSchema | None = None
     avatar_saved: bool = False
