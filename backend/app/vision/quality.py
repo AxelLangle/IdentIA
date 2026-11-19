@@ -68,13 +68,13 @@ def estimate_pose_hint(box: FaceBox) -> str:
     """Estima la orientación del rostro usando las proporciones de landmarks."""
     yaw_ratio, pitch_ratio, _ = compute_pose_metrics(box)
 
-    if yaw_ratio >= 0.14:
+    if yaw_ratio >= 0.13:
         return "left"
-    if yaw_ratio <= -0.14:
+    if yaw_ratio <= -0.13:
         return "right"
-    if pitch_ratio <= 0.45:
+    if pitch_ratio <= 0.48:
         return "up"
-    if pitch_ratio >= 0.62:
+    if pitch_ratio >= 0.60:
         return "down"
     return "frontal"
 
@@ -83,61 +83,66 @@ def validate_expected_pose(
     box: FaceBox,
     expected_pose: str,
     frontal_mouth_ratio: float | None = None,
+    frontal_pitch_ratio: float | None = None,
 ) -> tuple[bool, str | None]:
-    """Valida estrictamente si el rostro coincide con la pose solicitada."""
+    """Valida si el rostro coincide con la pose solicitada considerando la toma frontal."""
     yaw_ratio, pitch_ratio, mouth_ratio = compute_pose_metrics(box)
 
     if expected_pose == "frontal":
-        if abs(yaw_ratio) > 0.12:
+        if abs(yaw_ratio) > 0.14:
             return False, "Centra tu rostro mirando directamente al frente."
-        if not (0.45 <= pitch_ratio <= 0.63):
+        if not (0.40 <= pitch_ratio <= 0.68):
             return False, "Nivela la cabeza mirando al frente sin inclinarla."
         return True, None
 
     if expected_pose == "left":
         if yaw_ratio < -0.08:
             return False, "Giraste hacia tu derecha; gira la cabeza hacia tu izquierda."
-        if yaw_ratio < 0.14:
+        if yaw_ratio < 0.13:
             return False, "Gira un poco más la cabeza hacia tu izquierda."
-        if yaw_ratio > 0.70:
+        if yaw_ratio > 0.72:
             return False, "No gires tanto; mantén ambos ojos visibles hacia tu izquierda."
-        if not (0.38 <= pitch_ratio <= 0.70):
+        if not (0.34 <= pitch_ratio <= 0.74):
             return False, "Mantén la cabeza nivelada mientras giras a tu izquierda."
         return True, None
 
     if expected_pose == "right":
         if yaw_ratio > 0.08:
             return False, "Giraste hacia tu izquierda; gira la cabeza hacia tu derecha."
-        if yaw_ratio > -0.14:
+        if yaw_ratio > -0.13:
             return False, "Gira un poco más la cabeza hacia tu derecha."
-        if yaw_ratio < -0.70:
+        if yaw_ratio < -0.72:
             return False, "No gires tanto; mantén ambos ojos visibles hacia tu derecha."
-        if not (0.38 <= pitch_ratio <= 0.70):
+        if not (0.34 <= pitch_ratio <= 0.74):
             return False, "Mantén la cabeza nivelada mientras giras a tu derecha."
         return True, None
 
     if expected_pose == "up":
-        if abs(yaw_ratio) > 0.18:
+        if abs(yaw_ratio) > 0.22:
             return False, "Centra tu rostro antes de mirar ligeramente hacia arriba."
-        if pitch_ratio > 0.45:
+        target_up = min(frontal_pitch_ratio - 0.05, 0.52) if frontal_pitch_ratio is not None else 0.49
+        if pitch_ratio > target_up:
             return False, "Levanta un poco más el mentón mirando ligeramente hacia arriba."
         return True, None
 
     if expected_pose == "down":
-        if abs(yaw_ratio) > 0.18:
+        if abs(yaw_ratio) > 0.22:
             return False, "Centra tu rostro antes de inclinar la cabeza hacia abajo."
-        if pitch_ratio < 0.62:
+        target_down = (
+            max(frontal_pitch_ratio + 0.05, 0.57) if frontal_pitch_ratio is not None else 0.60
+        )
+        if pitch_ratio < target_down:
             return False, "Inclina un poco más la cabeza hacia abajo."
         return True, None
 
     if expected_pose == "smile":
-        if abs(yaw_ratio) > 0.15 or not (0.42 <= pitch_ratio <= 0.66):
+        if abs(yaw_ratio) > 0.18 or not (0.38 <= pitch_ratio <= 0.70):
             return False, "Mira al frente centrado antes de sonreír."
         if frontal_mouth_ratio is not None:
-            if not (mouth_ratio >= frontal_mouth_ratio * 1.05 or mouth_ratio >= 0.82):
-                return False, "Mira al frente y sonríe de forma más marcada."
-        elif mouth_ratio < 0.78:
-            return False, "Mira al frente y sonríe de forma más marcada."
+            if not (mouth_ratio >= frontal_mouth_ratio * 1.025 or mouth_ratio >= 0.78):
+                return False, "Mira al frente y sonríe de forma natural."
+        elif mouth_ratio < 0.76:
+            return False, "Mira al frente y sonríe de forma natural."
         return True, None
 
     return True, None
@@ -147,12 +152,13 @@ def evaluate_face_quality(
     image_bgr: np.ndarray,
     face_box: FaceBox,
     min_size_px: int = 64,
-    min_blur: float = 35.0,
+    min_blur: float = 18.0,
     min_brightness: float = 35.0,
     max_brightness: float = 235.0,
     expected_pose: str | None = None,
     frontal_mouth_ratio: float | None = None,
-    max_shadow_asymmetry: float = 52.0,
+    frontal_pitch_ratio: float | None = None,
+    max_shadow_asymmetry: float = 68.0,
     backlight_delta_threshold: float = 70.0,
     strict_lighting: bool = True,
 ) -> QualityReport:
@@ -167,7 +173,10 @@ def evaluate_face_quality(
     pose_hint = estimate_pose_hint(face_box)
     if expected_pose is not None:
         pose_matches, pose_feedback = validate_expected_pose(
-            face_box, expected_pose, frontal_mouth_ratio=frontal_mouth_ratio
+            face_box,
+            expected_pose,
+            frontal_mouth_ratio=frontal_mouth_ratio,
+            frontal_pitch_ratio=frontal_pitch_ratio,
         )
     else:
         pose_matches, pose_feedback = True, None
@@ -196,7 +205,7 @@ def evaluate_face_quality(
 
     # Contraste estirado en baja luz para no confundir subexposición con desenfoque
     blur_source = gray
-    if brightness < 90.0 and (int(gray.max()) - int(gray.min())) > 12:
+    if brightness < 65.0 and (int(gray.max()) - int(gray.min())) > 12:
         blur_source = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
     blur_score = float(cv2.Laplacian(blur_source, cv2.CV_64F).var())
 
