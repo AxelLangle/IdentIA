@@ -2,19 +2,59 @@ import type {
   ActionMode,
   AttendanceEvent,
   AttendanceSession,
+  AuditLogEntry,
+  AuthUser,
+  BatchBiometricsRevokeResponse,
+  DelegatedCredential,
+  DelegatedCredentialCreated,
   EnrollFrameResponse,
   Group,
   HealthResponse,
+  LoginResponse,
   Organization,
   OrgMode,
   Person,
   PersonRole,
   PoseLabel,
   RecognizeFrameResponse,
+  UserRole,
 } from "../types/api";
 
+const TOKEN_STORAGE_KEY = "identia_token";
+let onUnauthorizedCallback: (() => void) | null = null;
+
+export function getStoredToken(): string | null {
+  return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+export function setStoredToken(token: string | null): void {
+  if (token) {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } else {
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  }
+}
+
+export function setOnUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorizedCallback = handler;
+}
+
+async function fetchWithAuth(url: string, init: RequestInit = {}): Promise<Response> {
+  const token = getStoredToken();
+  const headers = new Headers(init.headers);
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const response = await fetch(url, { ...init, headers });
+  if (response.status === 401 && !url.endsWith("/api/auth/login")) {
+    setStoredToken(null);
+    onUnauthorizedCallback?.();
+  }
+  return response;
+}
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetchWithAuth(url, init);
   if (!response.ok) {
     let detail = `Error HTTP ${response.status}`;
     try {
@@ -34,6 +74,82 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 export const api = {
   getHealth: () => requestJson<HealthResponse>("/api/health"),
 
+  login: async (email: string, password: string): Promise<LoginResponse> => {
+    const res = await requestJson<LoginResponse>("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    setStoredToken(res.access_token);
+    return res;
+  },
+  getMe: () => requestJson<AuthUser>("/api/auth/me"),
+
+  listUsers: (organizationId?: number | null) => {
+    const params = new URLSearchParams();
+    if (organizationId !== undefined && organizationId !== null) {
+      params.set("organization_id", String(organizationId));
+    }
+    const qs = params.toString();
+    return requestJson<AuthUser[]>(`/api/users${qs ? `?${qs}` : ""}`);
+  },
+  createUser: (data: {
+    email: string;
+    full_name: string;
+    password: string;
+    role: UserRole;
+    organization_id?: number | null;
+  }) =>
+    requestJson<AuthUser>("/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  updateUser: (
+    userId: number,
+    data: Partial<{ full_name: string; password: string; role: UserRole; is_active: boolean }>
+  ) =>
+    requestJson<AuthUser>(`/api/users/${userId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+
+  listDelegatedCredentials: (organizationId?: number | null) => {
+    const params = new URLSearchParams();
+    if (organizationId !== undefined && organizationId !== null) {
+      params.set("organization_id", String(organizationId));
+    }
+    const qs = params.toString();
+    return requestJson<DelegatedCredential[]>(
+      `/api/security/delegated-credentials${qs ? `?${qs}` : ""}`
+    );
+  },
+  createDelegatedCredential: (data: {
+    organization_id?: number | null;
+    label: string;
+    assigned_to_user_id?: number | null;
+    assigned_to_name?: string | null;
+    custom_secret?: string | null;
+    expires_in_days?: number | null;
+  }) =>
+    requestJson<DelegatedCredentialCreated>("/api/security/delegated-credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  revokeDelegatedCredential: (credId: number) =>
+    requestJson<DelegatedCredential>(`/api/security/delegated-credentials/${credId}/revoke`, {
+      method: "POST",
+    }),
+  listAuditLogs: (organizationId?: number | null, limit = 100) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (organizationId !== undefined && organizationId !== null) {
+      params.set("organization_id", String(organizationId));
+    }
+    return requestJson<AuditLogEntry[]>(`/api/security/audit-logs?${params.toString()}`);
+  },
+
   listOrganizations: () => requestJson<Organization[]>("/api/organizations"),
   createOrganization: (data: {
     name: string;
@@ -41,6 +157,11 @@ export const api = {
     late_tolerance_minutes?: number;
     cooldown_seconds?: number;
     store_avatar_by_default?: boolean;
+    admin_user?: {
+      full_name: string;
+      email: string;
+      password: string;
+    } | null;
   }) =>
     requestJson<Organization>("/api/organizations", {
       method: "POST",
@@ -49,7 +170,12 @@ export const api = {
     }),
   updateOrganization: (
     orgId: number,
-    data: Partial<Pick<Organization, "name" | "mode" | "late_tolerance_minutes" | "cooldown_seconds" | "store_avatar_by_default">>
+    data: Partial<
+      Pick<
+        Organization,
+        "name" | "mode" | "late_tolerance_minutes" | "cooldown_seconds" | "store_avatar_by_default"
+      >
+    >
   ) =>
     requestJson<Organization>(`/api/organizations/${orgId}`, {
       method: "PATCH",
@@ -134,11 +260,16 @@ export const api = {
       body: form,
     });
   },
-  revokeBiometrics: (personId: number) =>
-    requestJson<{ person_id: number; deleted_embeddings: number; avatar_cleared: boolean }>(
-      `/api/persons/${personId}/biometrics`,
-      { method: "DELETE" }
-    ),
+  revokeBiometricsBatch: (data: {
+    person_ids: number[];
+    authorization_secret: string;
+    reason?: string;
+  }) =>
+    requestJson<BatchBiometricsRevokeResponse>("/api/persons/biometrics/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
 
   listSessions: (organizationId: number, status?: "open" | "closed") => {
     const params = new URLSearchParams({ organization_id: String(organizationId) });
@@ -206,11 +337,23 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  exportCsvUrl: (organizationId: number, sessionId?: number | null) => {
+  downloadCsv: async (organizationId: number, sessionId?: number | null): Promise<void> => {
     const params = new URLSearchParams({ organization_id: String(organizationId) });
     if (sessionId !== undefined && sessionId !== null) {
       params.set("session_id", String(sessionId));
     }
-    return `/api/attendance/export.csv?${params.toString()}`;
+    const response = await fetchWithAuth(`/api/attendance/export.csv?${params.toString()}`);
+    if (!response.ok) {
+      throw new Error(`No se pudo descargar el reporte (HTTP ${response.status}).`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "asistencia_identia.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   },
 };
