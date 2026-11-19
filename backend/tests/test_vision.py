@@ -8,12 +8,19 @@ from app.vision.engine import (
     cosine_similarity,
     decode_image_bytes,
     embedding_to_bytes,
+    enhance_frame_for_detection,
     match_embedding,
     normalize_embedding,
+    normalize_face_lighting,
 )
 from app.vision.models_loader import ensure_models
-from app.vision.quality import FaceBox, evaluate_face_quality
-from tests.conftest import encode_jpeg_bytes, make_sharp_face_image, make_unit_vector
+from app.vision.quality import FaceBox, evaluate_face_quality, validate_expected_pose
+from tests.conftest import (
+    encode_jpeg_bytes,
+    make_pose_landmarks,
+    make_sharp_face_image,
+    make_unit_vector,
+)
 
 
 def test_embedding_normalization_and_roundtrip() -> None:
@@ -135,3 +142,86 @@ def test_real_onnx_models_load_and_infer() -> None:
     assert emb.shape == (128,)
     assert emb.dtype == np.float32
     assert np.isclose(np.linalg.norm(emb), 1.0, atol=1e-5)
+
+
+def test_lighting_normalization_rescues_dark_crops() -> None:
+    dark_crop = np.full((112, 112, 3), 25, dtype=np.uint8)
+    dark_crop[20:90, 25:85] = 40
+    normalized = normalize_face_lighting(dark_crop)
+    assert normalized.shape == (112, 112, 3)
+    assert float(np.mean(normalized)) > 80.0
+    assert float(np.mean(normalized)) > float(np.mean(dark_crop)) * 2.0
+
+    dark_frame = np.full((240, 320, 3), 28, dtype=np.uint8)
+    boosted = enhance_frame_for_detection(dark_frame)
+    assert boosted.shape == dark_frame.shape
+    assert float(np.mean(boosted)) > float(np.mean(dark_frame))
+
+
+def test_pose_validation_geometry_all_six_poses() -> None:
+    poses = ("frontal", "left", "right", "up", "down", "smile")
+    for expected in poses:
+        box = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks(expected))
+        ok, feedback = validate_expected_pose(box, expected, frontal_mouth_ratio=0.70)
+        assert ok is True, f"Pose {expected} debería pasar: {feedback}"
+
+        # Un rostro frontal no debe pasar como pose lateral/vertical/sonrisa
+        if expected != "frontal":
+            frontal_box = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))
+            ok_wrong, msg_wrong = validate_expected_pose(
+                frontal_box, expected, frontal_mouth_ratio=0.70
+            )
+            assert ok_wrong is False
+            assert msg_wrong is not None
+
+    # Verifica polaridad exacta izquierda vs derecha
+    left_box = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("left"))
+    ok_swap, msg_swap = validate_expected_pose(left_box, "right")
+    assert ok_swap is False
+    assert "izquierda" in (msg_swap or "").lower()
+
+
+def test_backlight_and_side_shadow_detection() -> None:
+    # Fondo muy brillante (240) con rostro muy oscuro (25) -> contraluz fuerte
+    backlight_img = np.full((400, 400, 3), 240, dtype=np.uint8)
+    backlight_img[80:280, 100:280] = 25
+    box = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))
+
+    enroll_rep = evaluate_face_quality(
+        backlight_img,
+        box,
+        min_brightness=45.0,
+        backlight_delta_threshold=70.0,
+        strict_lighting=True,
+    )
+    assert enroll_rep.ok is False
+    assert enroll_rep.backlight_detected is True
+    assert "Contraluz" in (enroll_rep.reason or "")
+
+    # Sombra lateral marcada: mitad izquierda brillante (200), derecha oscura (60) -> asimetría 140
+    shadow_img = make_sharp_face_image(400, 400, (100, 80, 180, 200), brightness_base=140)
+    shadow_img[80:280, 100:190] = 200
+    shadow_img[80:280, 190:280] = 60
+
+    strict_rep = evaluate_face_quality(
+        shadow_img,
+        box,
+        min_brightness=45.0,
+        max_shadow_asymmetry=52.0,
+        strict_lighting=True,
+    )
+    assert strict_rep.ok is False
+    assert strict_rep.shadow_asymmetry > 52.0
+    assert "Sombra lateral" in (strict_rep.reason or "")
+
+    # En modo kiosco (strict_lighting=False), tolera sombra moderada si nitidez/brillo cumplen
+    kiosk_img = make_sharp_face_image(400, 400, (100, 80, 180, 200), brightness_base=140)
+    kiosk_img[80:280, 100:190] = np.clip(kiosk_img[80:280, 100:190].astype(np.int16) + 35, 0, 255).astype(np.uint8)
+    kiosk_img[80:280, 190:280] = np.clip(kiosk_img[80:280, 190:280].astype(np.int16) - 35, 0, 255).astype(np.uint8)
+    kiosk_rep = evaluate_face_quality(
+        kiosk_img,
+        box,
+        min_brightness=20.0,
+        strict_lighting=False,
+    )
+    assert kiosk_rep.ok is True
