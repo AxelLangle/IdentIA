@@ -3,6 +3,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.models import AttendanceEvent, FaceEmbedding
 from app.vision.engine import normalize_embedding
 from app.vision.quality import FaceBox
@@ -179,8 +180,16 @@ def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
     saved_images = list(Path(tmp_path).rglob("*.jpg")) + list(Path(tmp_path).rglob("*.png"))
     assert saved_images == []
 
-    # Revocación de biometría
-    revoked = client.delete(f"/api/persons/{person_id}/biometrics")
+    # Revocación de biometría protegida con contraseña de autorización
+    settings = get_settings()
+    revoked = client.request(
+        "DELETE",
+        f"/api/persons/{person_id}/biometrics",
+        json={
+            "authorization_secret": settings.bootstrap_superadmin_password,
+            "reason": "Prueba de revocación individual",
+        },
+    )
     assert revoked.status_code == 200
     assert revoked.json()["deleted_embeddings"] == 6
     assert revoked.json()["avatar_cleared"] is True
