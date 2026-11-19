@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from app.models import AttendanceEvent
+from sqlalchemy import select
+
+from app.models import AttendanceEvent, FaceEmbedding
 from app.vision.engine import normalize_embedding
 from app.vision.quality import FaceBox
 from tests.conftest import (
@@ -31,7 +33,7 @@ def test_health_and_seeded_organization(api_client) -> None:
 
 
 def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
-    client, _, engine, tmp_path = api_client
+    client, SessionLocal, engine, tmp_path = api_client
     org_id = client.get("/api/organizations").json()[0]["id"]
 
     # Persona sin consentimiento biométrico
@@ -162,6 +164,16 @@ def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
 
     final_person = [p for p in client.get(f"/api/persons?organization_id={org_id}").json() if p["id"] == person_id][0]
     assert final_person["embeddings_count"] == 6
+
+    with SessionLocal() as db:
+        frontal_emb = db.scalars(
+            select(FaceEmbedding).where(
+                FaceEmbedding.person_id == person_id,
+                FaceEmbedding.pose_label == "frontal",
+            )
+        ).one()
+        assert frontal_emb.pitch_ratio is not None
+        assert frontal_emb.mouth_ratio is not None
 
     # Privacidad: ninguna foto cruda .jpg/.png persistida en el directorio temporal de datos
     saved_images = list(Path(tmp_path).rglob("*.jpg")) + list(Path(tmp_path).rglob("*.png"))
