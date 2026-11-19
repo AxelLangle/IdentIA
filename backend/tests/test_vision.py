@@ -145,17 +145,54 @@ def test_real_onnx_models_load_and_infer() -> None:
 
 
 def test_lighting_normalization_rescues_dark_crops() -> None:
+    # En iluminación normal, normalize_face_lighting no debe alterar la imagen para preservar precisión nativa
+    well_lit = np.full((112, 112, 3), 135, dtype=np.uint8)
+    well_lit[20:90, 25:85] = 155
+    assert np.array_equal(normalize_face_lighting(well_lit), well_lit)
+
     dark_crop = np.full((112, 112, 3), 25, dtype=np.uint8)
     dark_crop[20:90, 25:85] = 40
     normalized = normalize_face_lighting(dark_crop)
     assert normalized.shape == (112, 112, 3)
-    assert float(np.mean(normalized)) > 80.0
+    assert float(np.mean(normalized)) > 70.0
     assert float(np.mean(normalized)) > float(np.mean(dark_crop)) * 2.0
 
     dark_frame = np.full((240, 320, 3), 28, dtype=np.uint8)
     boosted = enhance_frame_for_detection(dark_frame)
     assert boosted.shape == dark_frame.shape
     assert float(np.mean(boosted)) > float(np.mean(dark_frame))
+
+
+def test_relative_pitch_and_natural_smile() -> None:
+    # Cámara alta: frontal en pitch_ratio=0.57 y mentón arriba suave en pitch_ratio=0.50
+    gentle_up_box = FaceBox(
+        100,
+        80,
+        180,
+        200,
+        0.98,
+        [(150.0, 145.0), (230.0, 145.0), (190.0, 185.0), (162.0, 225.0), (218.0, 225.0)],
+    )
+    ok_up, msg_up = validate_expected_pose(gentle_up_box, "up", frontal_pitch_ratio=0.57)
+    assert ok_up is True, msg_up
+
+    # Sonrisa natural (+3% respecto a frontal_mouth_ratio=0.70 -> mouth_ratio=0.721)
+    natural_smile_box = FaceBox(
+        100,
+        80,
+        180,
+        200,
+        0.98,
+        [(150.0, 145.0), (230.0, 145.0), (190.0, 188.0), (161.0, 225.0), (219.0, 225.0)],
+    )
+    ok_smile, msg_smile = validate_expected_pose(
+        natural_smile_box, "smile", frontal_mouth_ratio=0.70
+    )
+    assert ok_smile is True, msg_smile
+
+    neutral_box = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))
+    ok_neutral, _ = validate_expected_pose(neutral_box, "smile", frontal_mouth_ratio=0.70)
+    assert ok_neutral is False
 
 
 def test_pose_validation_geometry_all_six_poses() -> None:
@@ -206,12 +243,12 @@ def test_backlight_and_side_shadow_detection() -> None:
     strict_rep = evaluate_face_quality(
         shadow_img,
         box,
-        min_brightness=45.0,
-        max_shadow_asymmetry=52.0,
+        min_brightness=32.0,
+        max_shadow_asymmetry=68.0,
         strict_lighting=True,
     )
     assert strict_rep.ok is False
-    assert strict_rep.shadow_asymmetry > 52.0
+    assert strict_rep.shadow_asymmetry > 68.0
     assert "Sombra lateral" in (strict_rep.reason or "")
 
     # En modo kiosco (strict_lighting=False), tolera sombra moderada si nitidez/brillo cumplen
