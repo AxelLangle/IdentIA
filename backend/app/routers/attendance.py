@@ -14,6 +14,7 @@ from app.models import (
     Organization,
     Person,
     PersonGroup,
+    User,
 )
 from app.routers import to_face_box_schema, to_quality_schema
 from app.schemas import (
@@ -25,6 +26,7 @@ from app.schemas import (
     SessionCreate,
     SessionRead,
 )
+from app.security import assert_org_access, get_current_user, resolve_org_scope
 from app.services.attendance_service import (
     export_events_csv,
     get_or_create_active_session,
@@ -81,13 +83,15 @@ def _serialize_session(
 
 @router.get("/sessions", response_model=list[SessionRead])
 def list_sessions(
-    organization_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[SessionRead]:
+    scoped_org_id = resolve_org_scope(current_user, organization_id)
     stmt = (
         select(AttendanceSession)
-        .where(AttendanceSession.organization_id == organization_id)
+        .where(AttendanceSession.organization_id == scoped_org_id)
         .order_by(AttendanceSession.id.desc())
     )
     if status_filter:
@@ -97,7 +101,7 @@ def list_sessions(
     group_names = {
         g.id: g.name
         for g in db.scalars(
-            select(Group).where(Group.organization_id == organization_id)
+            select(Group).where(Group.organization_id == scoped_org_id)
         ).all()
     }
     event_counts = {
@@ -119,7 +123,12 @@ def list_sessions(
 
 
 @router.post("/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED)
-def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> SessionRead:
+def create_session(
+    payload: SessionCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SessionRead:
+    assert_org_access(current_user, payload.organization_id)
     org = db.get(Organization, payload.organization_id)
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
@@ -151,10 +160,15 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> Ses
 
 
 @router.post("/sessions/{session_id}/close", response_model=SessionRead)
-def close_session(session_id: int, db: Session = Depends(get_db)) -> SessionRead:
+def close_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SessionRead:
     session = db.get(AttendanceSession, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+    assert_org_access(current_user, session.organization_id)
 
     if session.status != "closed":
         session.status = "closed"
@@ -177,11 +191,13 @@ async def recognize_frame(
     session_id: int | None = Form(default=None),
     group_id: int | None = Form(default=None),
     action_mode: ActionMode = Form(default="auto"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> RecognizeFrameResponse:
     t0 = time.perf_counter()
     settings = get_settings()
 
+    assert_org_access(current_user, organization_id)
     org = db.get(Organization, organization_id)
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
@@ -370,17 +386,19 @@ async def recognize_frame(
 
 @router.get("/attendance/events", response_model=list[AttendanceEventRead])
 def list_events(
-    organization_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
     session_id: int | None = Query(default=None),
     person_id: int | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[AttendanceEventRead]:
+    scoped_org_id = resolve_org_scope(current_user, organization_id)
     stmt = (
         select(AttendanceEvent, Person, AttendanceSession)
         .join(Person, Person.id == AttendanceEvent.person_id)
         .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
-        .where(AttendanceSession.organization_id == organization_id)
+        .where(AttendanceSession.organization_id == scoped_org_id)
         .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
         .limit(limit)
     )
@@ -396,11 +414,13 @@ def list_events(
 @router.post("/attendance/manual", response_model=AttendanceEventRead, status_code=status.HTTP_201_CREATED)
 def create_manual_attendance(
     payload: ManualAttendanceRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AttendanceEventRead:
     session = db.get(AttendanceSession, payload.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+    assert_org_access(current_user, session.organization_id)
     person = db.get(Person, payload.person_id)
     if person is None or person.organization_id != session.organization_id:
         raise HTTPException(
@@ -426,15 +446,17 @@ def create_manual_attendance(
 
 @router.get("/attendance/export.csv")
 def export_attendance_csv(
-    organization_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
     session_id: int | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
+    scoped_org_id = resolve_org_scope(current_user, organization_id)
     stmt = (
         select(AttendanceEvent, Person, AttendanceSession)
         .join(Person, Person.id == AttendanceEvent.person_id)
         .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
-        .where(AttendanceSession.organization_id == organization_id)
+        .where(AttendanceSession.organization_id == scoped_org_id)
         .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
     )
     if session_id is not None:
