@@ -124,6 +124,7 @@ class FaceEmbedding(Base):
     model_name: Mapped[str] = mapped_column(String(40), nullable=False)
     model_version: Mapped[str] = mapped_column(String(60), nullable=False)
     quality_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    mouth_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
 
     person: Mapped["Person"] = relationship(back_populates="embeddings")
