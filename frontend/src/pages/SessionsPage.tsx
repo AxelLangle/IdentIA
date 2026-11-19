@@ -4,12 +4,14 @@ import { api } from "../lib/api";
 import type {
   AttendanceEvent,
   AttendanceSession,
+  AuthUser,
   Group,
   Organization,
   Person,
 } from "../types/api";
 
 interface SessionsPageProps {
+  currentUser: AuthUser;
   organization: Organization;
   groups: Group[];
   sessions: AttendanceSession[];
@@ -19,6 +21,7 @@ interface SessionsPageProps {
 }
 
 export function SessionsPage({
+  currentUser,
   organization,
   groups,
   sessions,
@@ -26,6 +29,7 @@ export function SessionsPage({
   events,
   onRefreshAll,
 }: SessionsPageProps) {
+  const canManageGroups = currentUser.role === "superadmin" || currentUser.role === "org_admin";
   // Crear grupo
   const [groupName, setGroupName] = useState("");
   const [groupCode, setGroupCode] = useState("");
@@ -116,16 +120,19 @@ export function SessionsPage({
           </p>
         </div>
 
-        <a
-          href={api.exportCsvUrl(
-            organization.id,
-            filterSessionId ? Number(filterSessionId) : null
-          )}
+        <button
+          type="button"
+          onClick={() =>
+            void api.downloadCsv(
+              organization.id,
+              filterSessionId ? Number(filterSessionId) : null
+            )
+          }
           className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
         >
           <Download className="w-4 h-4" />
           Descargar CSV
-        </a>
+        </button>
       </div>
 
       {/* Grupos y Sesiones */}
@@ -135,49 +142,51 @@ export function SessionsPage({
             {organization.mode === "education" ? "Grupos / Materias" : "Áreas / Departamentos"}
           </h3>
 
-          <form onSubmit={handleCreateGroup} className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-            <input
-              type="text"
-              required
-              value={groupName}
-              onChange={(e) => setGroupName(e.target.value)}
-              placeholder="Nombre"
-              className="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-            />
-            <input
-              type="text"
-              required
-              value={groupCode}
-              onChange={(e) => setGroupCode(e.target.value)}
-              placeholder="Código"
-              className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-            />
-            <button
-              type="submit"
-              className="inline-flex items-center justify-center gap-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg px-3 py-2 text-sm font-semibold"
-            >
-              <Plus className="w-4 h-4" />
-              Crear
-            </button>
-            <div className="col-span-2">
-              <label className="block text-[11px] text-slate-400 mb-1">Inicio horario</label>
+          {canManageGroups && (
+            <form onSubmit={handleCreateGroup} className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
               <input
-                type="time"
-                value={scheduleStart}
-                onChange={(e) => setScheduleStart(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                type="text"
+                required
+                value={groupName}
+                onChange={(e) => setGroupName(e.target.value)}
+                placeholder="Nombre"
+                className="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
-            </div>
-            <div className="col-span-2">
-              <label className="block text-[11px] text-slate-400 mb-1">Fin horario</label>
               <input
-                type="time"
-                value={scheduleEnd}
-                onChange={(e) => setScheduleEnd(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                type="text"
+                required
+                value={groupCode}
+                onChange={(e) => setGroupCode(e.target.value)}
+                placeholder="Código"
+                className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
-            </div>
-          </form>
+              <button
+                type="submit"
+                className="inline-flex items-center justify-center gap-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg px-3 py-2 text-sm font-semibold"
+              >
+                <Plus className="w-4 h-4" />
+                Crear
+              </button>
+              <div className="col-span-2">
+                <label className="block text-[11px] text-slate-400 mb-1">Inicio horario</label>
+                <input
+                  type="time"
+                  value={scheduleStart}
+                  onChange={(e) => setScheduleStart(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-[11px] text-slate-400 mb-1">Fin horario</label>
+                <input
+                  type="time"
+                  value={scheduleEnd}
+                  onChange={(e) => setScheduleEnd(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                />
+              </div>
+            </form>
+          )}
 
           <div className="space-y-2 max-h-56 overflow-y-auto">
             {groups.map((g) => (
@@ -193,13 +202,15 @@ export function SessionsPage({
                     {g.schedule_start} - {g.schedule_end} · {g.members_count} integrantes
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => void handleDeleteGroup(g.id)}
-                  className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                {canManageGroups && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteGroup(g.id)}
+                    className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             ))}
           </div>
