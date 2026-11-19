@@ -14,8 +14,10 @@ Surgió como una reconstrucción completa desde cero del proyecto académico ant
   1. Decodificación de frame en memoria RAM (sin guardar fotografías crudas en disco).
   2. Detección multi-rostro con **YuNet (`face_detection_yunet_2023mar.onnx`)** con fallback LAB/CLAHE en contraluz.
   3. Validación de calidad (tamaño mínimo, nitidez, iluminación, sombra lateral, contraluz y validación geométrica de 6 poses: `frontal`, `left`, `right`, `up`, `down`, `smile`).
-  4. Alineación facial, normalización fotométrica LAB/CLAHE y extracción de embedding L2-normalizado de 128 dimensiones con **SFace (`sface_2021dec_lit`)**.
+  4. Alineación facial, normalización selectiva de iluminación extrema LAB y extracción de embedding L2-normalizado de 128 dimensiones con **SFace (`sface_2021dec_v2`)**.
   5. Búsqueda 1:N por similitud coseno con umbral calibrado (`0.42`) y verificación de margen contra el segundo candidato (`0.05`).
+
+> Consulta también el [Manual de Uso y Operación](docs/USER_MANUAL.md) y la [Arquitectura Técnica](docs/ARCHITECTURE.md).
 
 ---
 
