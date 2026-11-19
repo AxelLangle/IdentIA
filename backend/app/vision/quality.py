@@ -259,6 +259,12 @@ def evaluate_face_quality(
     if brightness > max_brightness:
         return _fail("Exceso de luz o sobreexposición directa en el rostro.")
 
+    if strict_lighting and backlight_detected:
+        return _fail(
+            "Contraluz detectado durante el registro. Evita tener luz intensa detrás de ti "
+            "para obtener la máxima precisión en el reconocimiento."
+        )
+
     if strict_lighting and shadow_asymmetry > max_shadow_asymmetry:
         return _fail(
             "Sombra lateral muy marcada en el rostro. Busca iluminación más pareja para el registro."
