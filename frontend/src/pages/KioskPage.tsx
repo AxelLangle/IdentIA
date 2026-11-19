@@ -286,6 +286,11 @@ export function KioskPage({
                       <> · Jornada: {lastResult.worked_minutes} min</>
                     )}
                   </p>
+                  {lastResult.quality?.backlight_detected && (
+                    <span className="inline-block mt-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                      Contraluz detectado · compensación activa
+                    </span>
+                  )}
                 </div>
               </div>
               <span className="text-xs font-mono text-slate-400 shrink-0">
