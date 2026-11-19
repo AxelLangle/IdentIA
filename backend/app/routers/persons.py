@@ -281,16 +281,18 @@ async def enroll_frame(
         None,
     )
     frontal_mouth_ratio = frontal_emb.mouth_ratio if frontal_emb is not None else None
+    frontal_pitch_ratio = frontal_emb.pitch_ratio if frontal_emb is not None else None
 
     quality = evaluate_face_quality(
         image_bgr,
         primary_box,
         min_size_px=settings.min_face_size_px,
-        min_blur=settings.min_blur_variance,
+        min_blur=settings.enroll_min_blur_variance,
         min_brightness=settings.enroll_min_brightness,
         max_brightness=settings.max_brightness,
         expected_pose=pose_label,
         frontal_mouth_ratio=frontal_mouth_ratio,
+        frontal_pitch_ratio=frontal_pitch_ratio,
         max_shadow_asymmetry=settings.enroll_max_shadow_asymmetry,
         backlight_delta_threshold=settings.backlight_delta_threshold,
         strict_lighting=True,
@@ -374,6 +376,7 @@ async def enroll_frame(
         existing_pose.model_version = settings.model_version
         existing_pose.quality_score = round(quality.blur_score, 2)
         existing_pose.mouth_ratio = round(quality.mouth_ratio, 4)
+        existing_pose.pitch_ratio = round(quality.pitch_ratio, 4)
         existing_pose.created_at = datetime.now()
     else:
         db.add(
@@ -385,6 +388,7 @@ async def enroll_frame(
                 model_version=settings.model_version,
                 quality_score=round(quality.blur_score, 2),
                 mouth_ratio=round(quality.mouth_ratio, 4),
+                pitch_ratio=round(quality.pitch_ratio, 4),
             )
         )
 
