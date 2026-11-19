@@ -12,6 +12,7 @@ import { api } from "../lib/api";
 import type { NavTab } from "../components/Layout";
 import type {
   AttendanceEvent,
+  AuthUser,
   HealthResponse,
   Organization,
   OrgMode,
@@ -19,6 +20,7 @@ import type {
 } from "../types/api";
 
 interface DashboardPageProps {
+  currentUser: AuthUser;
   organization: Organization;
   health: HealthResponse | null;
   persons: Person[];
@@ -29,6 +31,7 @@ interface DashboardPageProps {
 }
 
 export function DashboardPage({
+  currentUser,
   organization,
   health,
   persons,
@@ -47,7 +50,15 @@ export function DashboardPage({
   const [showNewOrg, setShowNewOrg] = useState(false);
   const [newOrgName, setNewOrgName] = useState("");
   const [newOrgMode, setNewOrgMode] = useState<OrgMode>("education");
+  const [createInitialAdmin, setCreateInitialAdmin] = useState(true);
+  const [adminFullName, setAdminFullName] = useState("");
+  const [adminEmail, setAdminEmail] = useState("");
+  const [adminPassword, setAdminPassword] = useState("");
+  const [orgFormError, setOrgFormError] = useState<string | null>(null);
   const [creatingOrg, setCreatingOrg] = useState(false);
+
+  const isSuperadmin = currentUser.role === "superadmin";
+  const canEditOrg = isSuperadmin || currentUser.role === "org_admin";
 
   useEffect(() => {
     setMode(organization.mode);
@@ -87,15 +98,28 @@ export function DashboardPage({
   async function handleCreateOrg(e: FormEvent) {
     e.preventDefault();
     if (!newOrgName.trim()) return;
+    setOrgFormError(null);
     setCreatingOrg(true);
     try {
       const created = await api.createOrganization({
         name: newOrgName.trim(),
         mode: newOrgMode,
+        admin_user: createInitialAdmin
+          ? {
+              full_name: adminFullName.trim(),
+              email: adminEmail.trim(),
+              password: adminPassword,
+            }
+          : null,
       });
       setNewOrgName("");
+      setAdminFullName("");
+      setAdminEmail("");
+      setAdminPassword("");
       setShowNewOrg(false);
       await onOrganizationCreated(created.id);
+    } catch (err) {
+      setOrgFormError(err instanceof Error ? err.message : "No se pudo crear la organización.");
     } finally {
       setCreatingOrg(false);
     }
@@ -112,21 +136,24 @@ export function DashboardPage({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {isSuperadmin && (
+            <button
+              type="button"
+              onClick={() => setShowNewOrg((v) => !v)}
+              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors"
+            >
+              <Plus className="w-4 h-4" />
+              Nueva Organización
+            </button>
+          )}
           <button
             type="button"
-            onClick={() => setShowNewOrg((v) => !v)}
-            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors"
-          >
-            <Plus className="w-4 h-4" />
-            Nueva Organización
-          </button>
-          <a
-            href={api.exportCsvUrl(organization.id)}
+            onClick={() => void api.downloadCsv(organization.id)}
             className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors"
           >
             <Download className="w-4 h-4" />
             Exportar CSV
-          </a>
+          </button>
           <button
             type="button"
             onClick={() => onNavigateTab("kiosk")}
@@ -138,40 +165,93 @@ export function DashboardPage({
         </div>
       </div>
 
-      {showNewOrg && (
+      {isSuperadmin && showNewOrg && (
         <form
           onSubmit={handleCreateOrg}
-          className="bg-slate-900 border border-indigo-500/40 rounded-2xl p-4 flex flex-wrap items-end gap-4"
+          className="bg-slate-900 border border-indigo-500/40 rounded-2xl p-5 space-y-4"
         >
-          <div className="flex-1 min-w-[220px]">
-            <label className="block text-xs text-slate-400 mb-1">Nombre de la institución o empresa</label>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="sm:col-span-2">
+              <label className="block text-xs text-slate-400 mb-1">
+                Nombre de la institución o empresa
+              </label>
+              <input
+                type="text"
+                required
+                value={newOrgName}
+                onChange={(e) => setNewOrgName(e.target.value)}
+                placeholder="Ej. Ingeniería en Software — UPT"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">Modo operativo</label>
+              <select
+                value={newOrgMode}
+                onChange={(e) => setNewOrgMode(e.target.value as OrgMode)}
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="education">Escuela (Pase de lista)</option>
+                <option value="enterprise">Empresa (Check-in / Check-out)</option>
+              </select>
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
             <input
-              type="text"
-              required
-              value={newOrgName}
-              onChange={(e) => setNewOrgName(e.target.value)}
-              placeholder="Ej. Ingeniería en Software — UPT"
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              type="checkbox"
+              checked={createInitialAdmin}
+              onChange={(e) => setCreateInitialAdmin(e.target.checked)}
+              className="rounded border-slate-600 bg-slate-800 text-indigo-600"
             />
-          </div>
-          <div>
-            <label className="block text-xs text-slate-400 mb-1">Modo operativo</label>
-            <select
-              value={newOrgMode}
-              onChange={(e) => setNewOrgMode(e.target.value as OrgMode)}
-              className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+            Crear administrador exclusivo para esta organización
+          </label>
+
+          {createInitialAdmin && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+              <input
+                type="text"
+                required
+                value={adminFullName}
+                onChange={(e) => setAdminFullName(e.target.value)}
+                placeholder="Nombre del administrador"
+                className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              />
+              <input
+                type="email"
+                required
+                value={adminEmail}
+                onChange={(e) => setAdminEmail(e.target.value)}
+                placeholder="admin@nuevaorg.com"
+                className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              />
+              <input
+                type="password"
+                required
+                minLength={6}
+                value={adminPassword}
+                onChange={(e) => setAdminPassword(e.target.value)}
+                placeholder="Contraseña (mín. 6)"
+                className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              />
+            </div>
+          )}
+
+          {orgFormError && (
+            <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+              {orgFormError}
+            </p>
+          )}
+
+          <div className="flex justify-end">
+            <button
+              type="submit"
+              disabled={creatingOrg}
+              className="px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50"
             >
-              <option value="education">Escuela (Pase de lista)</option>
-              <option value="enterprise">Empresa (Check-in / Check-out)</option>
-            </select>
+              {creatingOrg ? "Creando..." : "Crear Organización"}
+            </button>
           </div>
-          <button
-            type="submit"
-            disabled={creatingOrg}
-            className="px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50"
-          >
-            {creatingOrg ? "Creando..." : "Crear"}
-          </button>
         </form>
       )}
 
@@ -238,8 +318,9 @@ export function DashboardPage({
             <label className="block text-xs text-slate-400 mb-1">Modo operativo</label>
             <select
               value={mode}
+              disabled={!canEditOrg}
               onChange={(e) => setMode(e.target.value as OrgMode)}
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-60"
             >
               <option value="enterprise">Empresa (Entrada y Salida)</option>
               <option value="education">Escuela (Pase de lista único)</option>
@@ -253,9 +334,10 @@ export function DashboardPage({
                 type="number"
                 min={0}
                 max={180}
+                disabled={!canEditOrg}
                 value={tolerance}
                 onChange={(e) => setTolerance(Number(e.target.value))}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-60"
               />
             </div>
             <div>
@@ -264,9 +346,10 @@ export function DashboardPage({
                 type="number"
                 min={5}
                 max={3600}
+                disabled={!canEditOrg}
                 value={cooldown}
                 onChange={(e) => setCooldown(Number(e.target.value))}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-60"
               />
             </div>
           </div>
@@ -274,6 +357,7 @@ export function DashboardPage({
           <label className="flex items-start gap-2.5 text-xs text-slate-300 cursor-pointer">
             <input
               type="checkbox"
+              disabled={!canEditOrg}
               checked={storeAvatar}
               onChange={(e) => setStoreAvatar(e.target.checked)}
               className="mt-0.5 rounded border-slate-600 bg-slate-800 text-indigo-600"
@@ -290,13 +374,15 @@ export function DashboardPage({
             </p>
           )}
 
-          <button
-            type="submit"
-            disabled={saving}
-            className="w-full py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 transition-colors"
-          >
-            {saving ? "Guardando..." : "Guardar configuración"}
-          </button>
+          {canEditOrg && (
+            <button
+              type="submit"
+              disabled={saving}
+              className="w-full py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 transition-colors"
+            >
+              {saving ? "Guardando..." : "Guardar configuración"}
+            </button>
+          )}
         </form>
 
         <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-5 flex flex-col">
