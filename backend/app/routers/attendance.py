@@ -15,13 +15,12 @@ from app.models import (
     Person,
     PersonGroup,
 )
+from app.routers import to_face_box_schema, to_quality_schema
 from app.schemas import (
     ActionMode,
     AttendanceEventRead,
-    FaceBoxSchema,
     ManualAttendanceRequest,
     PersonSummaryBrief,
-    QualityReportSchema,
     RecognizeFrameResponse,
     SessionCreate,
     SessionRead,
@@ -32,25 +31,9 @@ from app.services.attendance_service import (
     record_recognized_attendance,
 )
 from app.vision.engine import bytes_to_embedding, decode_image_bytes, match_embedding
-from app.vision.quality import FaceBox, evaluate_face_quality
+from app.vision.quality import evaluate_face_quality
 
 router = APIRouter(prefix="/api", tags=["attendance"])
-
-
-def _to_face_box_schema(box: FaceBox, img_w: int, img_h: int) -> FaceBoxSchema:
-    return FaceBoxSchema(
-        x=box.x,
-        y=box.y,
-        w=box.w,
-        h=box.h,
-        confidence=round(box.confidence, 4),
-        image_width=img_w,
-        image_height=img_h,
-        nx=round(max(0.0, box.x) / max(img_w, 1), 4),
-        ny=round(max(0.0, box.y) / max(img_h, 1), 4),
-        nw=round(max(0.0, box.w) / max(img_w, 1), 4),
-        nh=round(max(0.0, box.h) / max(img_h, 1), 4),
-    )
 
 
 def _serialize_event(
@@ -241,24 +224,19 @@ async def recognize_frame(
         )
 
     primary_box, primary_row = detections[0]
-    face_box_schema = _to_face_box_schema(primary_box, img_w, img_h)
+    face_box_schema = to_face_box_schema(primary_box, img_w, img_h)
     quality = evaluate_face_quality(
         image_bgr,
         primary_box,
         min_size_px=settings.kiosk_min_face_size_px,
         min_blur=settings.min_blur_variance,
-        min_brightness=settings.min_brightness,
+        min_brightness=settings.kiosk_min_brightness,
         max_brightness=settings.max_brightness,
+        max_shadow_asymmetry=settings.kiosk_max_shadow_asymmetry,
+        backlight_delta_threshold=settings.backlight_delta_threshold,
+        strict_lighting=False,
     )
-    quality_schema = QualityReportSchema(
-        ok=quality.ok,
-        reason=quality.reason,
-        blur_score=round(quality.blur_score, 2),
-        brightness=round(quality.brightness, 2),
-        face_width=quality.face_width,
-        face_height=quality.face_height,
-        pose_hint=quality.pose_hint,
-    )
+    quality_schema = to_quality_schema(quality)
 
     if not quality.ok:
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -305,11 +283,15 @@ async def recognize_frame(
 
     if decision.status == "unknown":
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        msg = (
-            "No hay personas con biometría registrada en este alcance."
-            if not gallery
-            else "Rostro no reconocido en el padrón activo."
-        )
+        if not gallery:
+            msg = "No hay personas con biometría registrada en este alcance."
+        elif quality.backlight_detected:
+            msg = (
+                "Rostro no reconocido. Se detectó contraluz fuerte; intenta mirar más de frente "
+                "o mejorar la luz frontal."
+            )
+        else:
+            msg = "Rostro no reconocido en el padrón activo."
         return RecognizeFrameResponse(
             faces_detected=len(detections),
             match_status="unknown",
