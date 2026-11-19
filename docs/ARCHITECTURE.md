@@ -45,6 +45,22 @@ El mismo motor soporta ambos casos de uso mediante configuración organizacional
 | `FaceEmbedding` | 6 vectores validados por pose (`frontal`, `left`, `right`, `up`, `down`, `smile`) | Mismo esquema de 6 poses |
 | `AttendanceSession` | Jornada diaria (`session_type = "workday"`) | Sesión de clase (`session_type = "class"`) |
 | `AttendanceEvent` | Eventos `check_in` y `check_out` con cálculo de puntualidad y horas trabajadas | Evento `present` único por sesión (`on_time` o `late`) |
+| `User` | Cuentas de acceso (`superadmin`, `org_admin`, `operator`) | Cuentas de acceso (`superadmin`, `org_admin`, `teacher`, `operator`) |
+| `DelegatedCredential` | Claves delegadas hasheadas (`scrypt`) para operaciones sensibles | Misma delegación con trazabilidad de creador y asignado |
+| `AuditLog` | Bitácora inmutable de altas, credenciales y revocaciones | Misma bitácora aislada por organización |
+
+---
+
+## 3.1. Seguridad Multi-Tenant RBAC, Credenciales Delegadas y Alembic
+
+- **Aislamiento estricto en Backend:** Todo endpoint operativo exige token JWT (`Authorization: Bearer ...`) validado por `get_current_user`. Los roles `org_admin`, `teacher` y `operator` quedan fijados a su `organization_id` mediante `resolve_org_scope` y `assert_org_access`, devolviendo `403 Forbidden` ante cualquier intento de acceso cruzado.
+- **Superadmin global:** `superadmin` accede a todas las organizaciones y es el único rol autorizado para crear nuevas organizaciones (asignando opcionalmente su `org_admin` inicial en la misma transacción).
+- **Revocación protegida y credenciales delegadas (`security_service.py`):**
+  - La revocación biométrica (individual o en lote vía `POST /api/persons/biometrics/revoke`) exige `authorization_secret` válido.
+  - Acepta contraseña del `superadmin`, del `org_admin` de la organización o una `DelegatedCredential` activa (no expirada/revocada) con permiso `revoke_biometrics`.
+  - Las contraseñas y claves delegadas se almacenan únicamente mediante hash **`scrypt`** con salt aleatorio (`hashlib.scrypt`) y comparación en tiempo constante (`hmac.compare_digest`).
+  - Cada operación sensible escribe un registro en `audit_logs` indicando quién ejecutó, quién autorizó (o creó la credencial delegada), prefijo de credencial y objetivo afectado.
+- **Migraciones versionadas:** Esquema gestionado mediante **Alembic** (`backend/alembic.ini` y `backend/migrations/`).
 
 ---
 
