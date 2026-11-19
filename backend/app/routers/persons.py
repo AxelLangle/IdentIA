@@ -1,20 +1,41 @@
 from datetime import datetime
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import FaceEmbedding, Group, Organization, Person, PersonGroup
+from app.models import FaceEmbedding, Group, Organization, Person, PersonGroup, User
 from app.routers import to_face_box_schema, to_quality_schema
 from app.schemas import (
+    BatchBiometricsRevokeRequest,
+    BatchBiometricsRevokeResponse,
+    BiometricsRevokeRequest,
     BiometricsRevokeResponse,
     EnrollFrameResponse,
     PersonCreate,
     PersonRead,
     PersonUpdate,
     PoseLabel,
+)
+from app.security import assert_org_access, get_current_user, require_roles, resolve_org_scope
+from app.services.security_service import (
+    AuthorizationResult,
+    record_audit_log,
+    verify_sensitive_authorization,
 )
 from app.vision.engine import (
     bytes_to_embedding,
@@ -86,16 +107,18 @@ def _sync_person_groups(
 
 @router.get("/persons", response_model=list[PersonRead])
 def list_persons(
-    organization_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
     group_id: int | None = Query(default=None),
     search: str | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[PersonRead]:
     settings = get_settings()
+    scoped_org_id = resolve_org_scope(current_user, organization_id)
     stmt = (
         select(Person)
         .options(selectinload(Person.embeddings), selectinload(Person.group_links))
-        .where(Person.organization_id == organization_id)
+        .where(Person.organization_id == scoped_org_id)
         .order_by(Person.id.desc())
     )
     if group_id is not None:
@@ -115,9 +138,11 @@ def list_persons(
 @router.post("/persons", response_model=PersonRead, status_code=status.HTTP_201_CREATED)
 def create_person(
     payload: PersonCreate,
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
     db: Session = Depends(get_db),
 ) -> PersonRead:
     settings = get_settings()
+    assert_org_access(current_user, payload.organization_id)
     org = db.get(Organization, payload.organization_id)
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
@@ -157,12 +182,14 @@ def create_person(
 def update_person(
     person_id: int,
     payload: PersonUpdate,
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
     db: Session = Depends(get_db),
 ) -> PersonRead:
     settings = get_settings()
     person = db.get(Person, person_id)
     if person is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
+    assert_org_access(current_user, person.organization_id)
 
     data = payload.model_dump(exclude_unset=True)
     group_ids = data.pop("group_ids", None)
@@ -190,10 +217,15 @@ def update_person(
 
 
 @router.delete("/persons/{person_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_person(person_id: int, db: Session = Depends(get_db)) -> None:
+def delete_person(
+    person_id: int,
+    current_user: User = Depends(require_roles("superadmin", "org_admin")),
+    db: Session = Depends(get_db),
+) -> None:
     person = db.get(Person, person_id)
     if person is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
+    assert_org_access(current_user, person.organization_id)
     db.delete(person)
     db.commit()
 
@@ -206,6 +238,7 @@ async def enroll_frame(
     pose_label: PoseLabel = Form(...),
     store_avatar: bool | None = Form(default=None),
     dry_run: bool = Form(default=False),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
     db: Session = Depends(get_db),
 ) -> EnrollFrameResponse:
     settings = get_settings()
@@ -216,6 +249,7 @@ async def enroll_frame(
     ).first()
     if person is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
+    assert_org_access(current_user, person.organization_id)
     if not person.biometric_consent:
         raise HTTPException(
             status_code=400,
@@ -428,8 +462,105 @@ async def enroll_frame(
     )
 
 
+def _revoke_persons_biometrics(
+    db: Session,
+    *,
+    current_user: User,
+    persons: list[Person],
+    authorization_secret: str,
+    reason: str | None,
+) -> tuple[int, bool, AuthorizationResult]:
+    org_ids = {p.organization_id for p in persons}
+    if len(org_ids) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Todas las personas seleccionadas deben pertenecer a la misma organización.",
+        )
+    target_org_id = next(iter(org_ids))
+    assert_org_access(current_user, target_org_id)
+
+    auth_res = verify_sensitive_authorization(
+        db,
+        current_user=current_user,
+        organization_id=target_org_id,
+        authorization_secret=authorization_secret,
+        required_operation="revoke_biometrics",
+    )
+
+    total_deleted = 0
+    any_avatar_cleared = False
+    reason_note = reason.strip() if reason and reason.strip() else "Revocación de datos biométricos"
+
+    for person in persons:
+        deleted_count = len(person.embeddings)
+        total_deleted += deleted_count
+        for emb in list(person.embeddings):
+            db.delete(emb)
+
+        if person.avatar_base64 is not None:
+            any_avatar_cleared = True
+            person.avatar_base64 = None
+
+        record_audit_log(
+            db,
+            organization_id=target_org_id,
+            action="revoke_biometrics",
+            target_type="person",
+            target_id=person.id,
+            target_summary=f"{person.full_name} ({person.external_id})",
+            executed_by_user=current_user,
+            authorized_by_user=auth_res.authorized_by_user,
+            delegated_credential=auth_res.delegated_credential,
+            details=f"{reason_note} | Vectores eliminados: {deleted_count} | Método: {auth_res.method}",
+        )
+
+    db.commit()
+    return total_deleted, any_avatar_cleared, auth_res
+
+
+@router.post("/persons/biometrics/revoke", response_model=BatchBiometricsRevokeResponse)
+def revoke_biometrics_batch(
+    payload: BatchBiometricsRevokeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BatchBiometricsRevokeResponse:
+    unique_ids = list(dict.fromkeys(payload.person_ids))
+    persons = list(
+        db.scalars(
+            select(Person)
+            .options(selectinload(Person.embeddings))
+            .where(Person.id.in_(unique_ids))
+        ).all()
+    )
+    if len(persons) != len(unique_ids):
+        raise HTTPException(status_code=404, detail="Una o más personas no fueron encontradas.")
+
+    total_deleted, _, auth_res = _revoke_persons_biometrics(
+        db,
+        current_user=current_user,
+        persons=persons,
+        authorization_secret=payload.authorization_secret,
+        reason=payload.reason,
+    )
+    return BatchBiometricsRevokeResponse(
+        revoked_persons_count=len(persons),
+        deleted_embeddings=total_deleted,
+        authorized_by_name=auth_res.authorized_by_user.full_name if auth_res.authorized_by_user else None,
+        authorization_method=auth_res.method,
+        delegated_credential_label=(
+            auth_res.delegated_credential.label if auth_res.delegated_credential else None
+        ),
+    )
+
+
 @router.delete("/persons/{person_id}/biometrics", response_model=BiometricsRevokeResponse)
-def revoke_biometrics(person_id: int, db: Session = Depends(get_db)) -> BiometricsRevokeResponse:
+def revoke_biometrics(
+    person_id: int,
+    payload: BiometricsRevokeRequest | None = Body(default=None),
+    x_authorization_secret: str | None = Header(default=None, alias="X-Authorization-Secret"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BiometricsRevokeResponse:
     person = db.scalars(
         select(Person)
         .options(selectinload(Person.embeddings))
@@ -438,16 +569,23 @@ def revoke_biometrics(person_id: int, db: Session = Depends(get_db)) -> Biometri
     if person is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
 
-    deleted_count = len(person.embeddings)
-    for emb in list(person.embeddings):
-        db.delete(emb)
+    secret = (payload.authorization_secret if payload else None) or x_authorization_secret or ""
+    reason = payload.reason if payload else None
 
-    had_avatar = person.avatar_base64 is not None
-    person.avatar_base64 = None
-    db.commit()
-
+    deleted_count, had_avatar, auth_res = _revoke_persons_biometrics(
+        db,
+        current_user=current_user,
+        persons=[person],
+        authorization_secret=secret,
+        reason=reason,
+    )
     return BiometricsRevokeResponse(
         person_id=person.id,
         deleted_embeddings=deleted_count,
         avatar_cleared=had_avatar,
+        authorized_by_name=auth_res.authorized_by_user.full_name if auth_res.authorized_by_user else None,
+        authorization_method=auth_res.method,
+        delegated_credential_label=(
+            auth_res.delegated_credential.label if auth_res.delegated_credential else None
+        ),
     )
