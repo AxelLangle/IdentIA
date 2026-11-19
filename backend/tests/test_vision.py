@@ -1,0 +1,137 @@
+import numpy as np
+import pytest
+
+from app.config import get_settings
+from app.vision.engine import (
+    BiometricEngine,
+    bytes_to_embedding,
+    cosine_similarity,
+    decode_image_bytes,
+    embedding_to_bytes,
+    match_embedding,
+    normalize_embedding,
+)
+from app.vision.models_loader import ensure_models
+from app.vision.quality import FaceBox, evaluate_face_quality
+from tests.conftest import encode_jpeg_bytes, make_sharp_face_image, make_unit_vector
+
+
+def test_embedding_normalization_and_roundtrip() -> None:
+    raw = np.array([3.0, 4.0, 0.0, 0.0], dtype=np.float32)
+    normed = normalize_embedding(raw)
+    assert np.isclose(np.linalg.norm(normed), 1.0, atol=1e-6)
+    assert np.isclose(cosine_similarity(normed, normed), 1.0, atol=1e-6)
+
+    serialized = embedding_to_bytes(normed)
+    restored = bytes_to_embedding(serialized)
+    assert np.allclose(normed, restored, atol=1e-6)
+
+
+def test_match_embedding_thresholds_and_ambiguity() -> None:
+    v1 = make_unit_vector(10)
+    v2 = make_unit_vector(20)
+    # Vector muy cercano a v1 pero ligeramente perturbado
+    query_close_v1 = normalize_embedding(v1 + 0.08 * v2)
+
+    gallery = [
+        (1, "Ana López", v1),
+        (2, "Carlos Ruiz", v2),
+    ]
+    decision = match_embedding(query_close_v1, gallery, threshold=0.42, margin=0.05)
+    assert decision.status == "matched"
+    assert decision.person_id == 1
+    assert decision.person_name == "Ana López"
+
+    # Caso ambiguo: dos personas casi equidistantes al query
+    v_a = normalize_embedding(np.array([1.0, 0.1, 0.0, 0.0], dtype=np.float32))
+    v_b = normalize_embedding(np.array([1.0, 0.12, 0.0, 0.0], dtype=np.float32))
+    q_mid = normalize_embedding(np.array([1.0, 0.11, 0.0, 0.0], dtype=np.float32))
+    ambiguous = match_embedding(
+        q_mid,
+        [(1, "Persona A", v_a), (2, "Persona B", v_b)],
+        threshold=0.42,
+        margin=0.05,
+    )
+    assert ambiguous.status == "ambiguous"
+    assert ambiguous.person_id is None
+
+    # Caso desconocido
+    orthogonal = normalize_embedding(np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32))
+    unknown = match_embedding(
+        orthogonal,
+        [(1, "Persona A", v_a)],
+        threshold=0.42,
+        margin=0.05,
+    )
+    assert unknown.status == "unknown"
+    assert unknown.person_id is None
+
+
+def test_quality_gate_rejects_poor_captures_and_accepts_good_ones() -> None:
+    good_img = make_sharp_face_image(400, 400, (100, 80, 160, 180), brightness_base=140, blur=False)
+    good_box = FaceBox(
+        x=100,
+        y=80,
+        w=160,
+        h=180,
+        confidence=0.98,
+        landmarks=[(145.0, 130.0), (215.0, 130.0), (180.0, 170.0), (155.0, 210.0), (205.0, 210.0)],
+    )
+    report = evaluate_face_quality(good_img, good_box, min_size_px=64, min_blur=35.0)
+    assert report.ok is True
+    assert report.pose_hint == "frontal"
+
+    # Muy pequeño
+    small_box = FaceBox(x=100, y=80, w=40, h=40, confidence=0.95, landmarks=[])
+    small_rep = evaluate_face_quality(good_img, small_box, min_size_px=64)
+    assert small_rep.ok is False
+    assert "Acércate" in (small_rep.reason or "")
+
+    # Muy oscuro
+    dark_img = np.full((400, 400, 3), 15, dtype=np.uint8)
+    dark_rep = evaluate_face_quality(dark_img, good_box, min_brightness=35.0)
+    assert dark_rep.ok is False
+    assert "iluminación" in (dark_rep.reason or "")
+
+    # Borroso / sin textura
+    blur_img = make_sharp_face_image(400, 400, (100, 80, 160, 180), brightness_base=140, blur=True)
+    blur_rep = evaluate_face_quality(blur_img, good_box, min_blur=35.0)
+    assert blur_rep.ok is False
+    assert "borrosa" in (blur_rep.reason or "")
+
+
+def test_decode_image_bytes_downscales_and_rejects_corrupt() -> None:
+    big = make_sharp_face_image(2000, 1000)
+    decoded = decode_image_bytes(encode_jpeg_bytes(big), max_dim=1280)
+    assert max(decoded.shape[:2]) == 1280
+    assert decoded.shape[1] == 1280
+    assert decoded.shape[0] == 640
+
+    with pytest.raises(ValueError):
+        decode_image_bytes(b"not-an-image")
+
+
+def test_real_onnx_models_load_and_infer() -> None:
+    settings = get_settings()
+    yunet_path, sface_path = ensure_models(settings.models_dir)
+    assert yunet_path.exists()
+    assert sface_path.exists()
+
+    engine = BiometricEngine(
+        yunet_path=yunet_path,
+        sface_path=sface_path,
+        score_threshold=settings.yunet_score_threshold,
+        nms_threshold=settings.yunet_nms_threshold,
+    )
+    blank = np.zeros((320, 320, 3), dtype=np.uint8)
+    assert engine.detect(blank) == []
+
+    synthetic_row = np.array(
+        [100, 80, 120, 140, 135, 130, 185, 130, 160, 160, 140, 195, 180, 195, 0.99],
+        dtype=np.float32,
+    )
+    sample_img = make_sharp_face_image(320, 320, (100, 80, 120, 140))
+    emb = engine.extract_embedding(sample_img, synthetic_row)
+    assert emb.shape == (128,)
+    assert emb.dtype == np.float32
+    assert np.isclose(np.linalg.norm(emb), 1.0, atol=1e-5)
