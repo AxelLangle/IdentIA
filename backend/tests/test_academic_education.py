@@ -1,5 +1,10 @@
 from datetime import date
-from app.config import get_settings
+from pathlib import Path
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import inspect
+from app.config import BACKEND_DIR, get_settings
+from app.db import Base, create_db_engine
 from app.vision.quality import FaceBox
 from tests.conftest import (
     encode_jpeg_bytes,
@@ -460,3 +465,40 @@ def test_admin_consolidated_stats_by_subject_and_group(raw_api_client) -> None:
     breakdown = {st["external_id"]: st for st in g_stat["students_breakdown"]}
     assert breakdown["MAT-001"]["attendance_rate"] == 100.0
     assert breakdown["MAT-002"]["attendance_rate"] == 50.0
+
+
+def test_alembic_0002_recovers_from_partial_create_all(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Verifica que alembic upgrade head completa columnas aunque create_all haya creado tablas nuevas antes."""
+    db_file = tmp_path / "partial_alembic.db"
+    db_url = f"sqlite:///{db_file.as_posix()}"
+    monkeypatch.setenv("IDENTIA_DATABASE_URL", db_url)
+    get_settings.cache_clear()
+
+    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+
+    try:
+        # Simula BD creada en Bloque B (0001) y posterior arranque de uvicorn que ejecuta create_all
+        command.upgrade(cfg, "0001_initial_rbac_and_biometrics")
+        engine = create_db_engine(db_url)
+        Base.metadata.create_all(bind=engine)
+        engine.dispose()
+
+        # Ahora alembic upgrade head no debe fallar por "table careers already exists"
+        command.upgrade(cfg, "head")
+
+        verify_engine = create_db_engine(db_url)
+        insp = inspect(verify_engine)
+        group_cols = {c["name"] for c in insp.get_columns("groups")}
+        session_cols = {c["name"] for c in insp.get_columns("attendance_sessions")}
+        with verify_engine.connect() as conn:
+            rev = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+        verify_engine.dispose()
+
+        assert rev == "0002_education_domain"
+        assert {"career_id", "semester"}.issubset(group_cols)
+        assert {"course_assignment_id", "schedule_id"}.issubset(session_cols)
+    finally:
+        get_settings.cache_clear()
