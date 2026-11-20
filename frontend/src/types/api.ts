@@ -18,12 +18,16 @@ export interface Organization {
 export interface Group {
   id: number;
   organization_id: number;
+  career_id: number | null;
+  career_name: string | null;
   name: string;
   code: string;
+  semester: string | null;
   schedule_start: string;
   schedule_end: string;
   created_at: string;
   members_count: number;
+  courses_count: number;
 }
 
 export interface Person {
@@ -94,6 +98,12 @@ export interface AttendanceSession {
   organization_id: number;
   group_id: number | null;
   group_name: string | null;
+  course_assignment_id: number | null;
+  schedule_id: number | null;
+  subject_name: string | null;
+  subject_code: string | null;
+  career_name: string | null;
+  teacher_name: string | null;
   title: string;
   session_date: string;
   session_type: "workday" | "class";
@@ -218,4 +228,159 @@ export interface BatchBiometricsRevokeResponse {
   authorized_by_name: string | null;
   authorization_method: string;
   delegated_credential_label: string | null;
+}
+
+export interface Career {
+  id: number;
+  organization_id: number;
+  name: string;
+  code: string;
+  description: string | null;
+  created_at: string;
+  groups_count: number;
+  subjects_count: number;
+}
+
+export interface Subject {
+  id: number;
+  organization_id: number;
+  career_id: number | null;
+  career_name: string | null;
+  name: string;
+  code: string;
+  created_at: string;
+}
+
+export interface ClassSchedule {
+  id: number;
+  course_assignment_id: number;
+  day_of_week: number;
+  start_time: string;
+  end_time: string;
+  classroom: string | null;
+  created_at: string;
+}
+
+export interface CourseAssignment {
+  id: number;
+  organization_id: number;
+  group_id: number;
+  group_name: string;
+  group_code: string;
+  career_id: number | null;
+  career_name: string | null;
+  subject_id: number;
+  subject_name: string;
+  subject_code: string;
+  teacher_user_id: number | null;
+  teacher_name: string | null;
+  teacher_email: string | null;
+  term: string | null;
+  is_active: boolean;
+  students_count: number;
+  schedules: ClassSchedule[];
+  created_at: string;
+}
+
+export interface GenerateSessionsResponse {
+  target_date: string;
+  created_count: number;
+  existing_count: number;
+  sessions: AttendanceSession[];
+}
+
+export interface TeacherAgendaSlot {
+  schedule_id: number;
+  course_assignment_id: number;
+  subject_name: string;
+  subject_code: string;
+  group_id: number;
+  group_name: string;
+  group_code: string;
+  career_name: string | null;
+  day_of_week: number;
+  start_time: string;
+  end_time: string;
+  classroom: string | null;
+  slot_status: "in_progress" | "upcoming" | "finished";
+  students_count: number;
+  session: AttendanceSession | null;
+}
+
+export interface TeacherAgendaResponse {
+  target_date: string;
+  current_time: string;
+  current_slot: TeacherAgendaSlot | null;
+  today_slots: TeacherAgendaSlot[];
+  courses: CourseAssignment[];
+}
+
+export interface SubjectAttendanceStat {
+  course_assignment_id: number;
+  subject_id: number;
+  subject_name: string;
+  subject_code: string;
+  group_id: number;
+  group_name: string;
+  group_code: string;
+  career_name: string | null;
+  teacher_name: string | null;
+  sessions_count: number;
+  enrolled_students: number;
+  expected_records: number;
+  present_count: number;
+  on_time_count: number;
+  late_count: number;
+  manual_count: number;
+  absent_count: number;
+  attendance_rate: number;
+}
+
+export interface StudentGroupAttendanceStat {
+  person_id: number;
+  external_id: string;
+  full_name: string;
+  expected_records: number;
+  present_count: number;
+  on_time_count: number;
+  late_count: number;
+  absent_count: number;
+  attendance_rate: number;
+}
+
+export interface GroupAttendanceStat {
+  group_id: number;
+  group_name: string;
+  group_code: string;
+  career_id: number | null;
+  career_name: string | null;
+  semester: string | null;
+  subjects_count: number;
+  students_count: number;
+  total_sessions: number;
+  total_expected: number;
+  total_present: number;
+  total_on_time: number;
+  total_late: number;
+  total_absent: number;
+  overall_attendance_rate: number;
+  students_breakdown: StudentGroupAttendanceStat[];
+}
+
+export interface AcademicStatsSummary {
+  total_careers: number;
+  total_groups: number;
+  total_subjects: number;
+  total_courses: number;
+  total_sessions: number;
+  overall_attendance_rate: number;
+}
+
+export interface AcademicStatsResponse {
+  organization_id: number;
+  date_from: string | null;
+  date_to: string | null;
+  summary: AcademicStatsSummary;
+  by_subject: SubjectAttendanceStat[];
+  by_group: GroupAttendanceStat[];
 }
