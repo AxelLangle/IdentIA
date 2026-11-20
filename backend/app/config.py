@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     model_name: str = "sface"
     model_version: str = "sface_2021dec_v2"
 
+    # Autenticación JWT y usuarios iniciales (bootstrap)
+    jwt_secret_key: str = "identia-dev-secret-change-in-production-32bytes-min"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 480
+    bootstrap_superadmin_email: str = "admin@identia.local"
+    bootstrap_superadmin_password: str = "IdentIA2026!"
+    bootstrap_superadmin_name: str = "Superadmin IdentIA"
+    bootstrap_org_admin_email: str = "empresa@identia.local"
+    bootstrap_org_admin_password: str = "Empresa2026!"
+
     @property
     def resolved_database_url(self) -> str:
         if self.database_url:

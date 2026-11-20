@@ -51,6 +51,7 @@ cd backend
 python -m venv .venv
 source .venv/Scripts/activate
 pip install -r requirements.txt
+alembic upgrade head
 python -m app.vision.models_loader
 uvicorn app.main:app --reload --port 8000
 ```
@@ -61,11 +62,17 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+alembic upgrade head
 python -m app.vision.models_loader
 uvicorn app.main:app --reload --port 8000
 ```
 
 > Al arrancar `models_loader` (o automáticamente al iniciar la API), se descargan en `backend/models/` los modelos oficiales ONNX de OpenCV Zoo (`face_detection_yunet_2023mar.onnx` y `face_recognition_sface_2021dec.onnx`).
+
+#### Credenciales Demo Iniciales (entorno local)
+
+- **Superadmin Global:** `admin@identia.local` / `IdentIA2026!`
+- **Admin Organización Demo:** `empresa@identia.local` / `Empresa2026!`
 
 ### 2. Frontend (React + Vite)
 
@@ -119,8 +126,9 @@ npm run build
 
 - **Fase 0–1 (Completa):** Arquitectura unificada, repositorio limpio y motor biométrico ONNX YuNet + SFace con control de calidad.
 - **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, grupos, sesiones y exportación CSV).
-- **Bloque A (Completa en `feat/bloque-a-enrolamiento-iluminacion`):** Compensación de contraluz/sombras LAB/CLAHE, asistente guiado de 6 poses con validación geométrica y revisión temporal en memoria.
-- **Bloques B–D (En curso desde `develop`):** Multi-Tenant RBAC + revocación con credenciales delegadas, modelo educativo completo (carreras/grupos/materias/profesores) y turnos empresariales.
+- **Bloque A (Completa):** Compensación de contraluz/sombras LAB, bloqueo de contraluz en registro, asistente guiado de 6 poses con validación geométrica y manual de uso.
+- **Bloque B (Completa en `feat/bloque-b-rbac-seguridad`):** Autenticación JWT, aislamiento multi-organización (`superadmin`, `org_admin`, `teacher`, `operator`), revocación individual/lote con contraseñas delegadas hasheadas (`scrypt`), bitácora de auditoría y migraciones Alembic.
+- **Bloques C–D (En curso desde `develop`):** Modelo educativo completo (carreras/grupos/materias/horarios/profesores) y turnos empresariales.
 - **Siguiente:** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
 
 ---

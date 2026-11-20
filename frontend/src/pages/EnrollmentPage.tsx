@@ -4,6 +4,7 @@ import {
   Camera,
   Check,
   CheckCircle2,
+  KeyRound,
   Plus,
   RotateCcw,
   Search,
@@ -11,10 +12,12 @@ import {
   Sparkles,
   Trash2,
   UserCheck,
+  X,
 } from "lucide-react";
 import { CameraView, type CameraViewHandle } from "../components/CameraView";
 import { api } from "../lib/api";
 import type {
+  AuthUser,
   EnrollFrameResponse,
   Group,
   Organization,
@@ -24,6 +27,7 @@ import type {
 } from "../types/api";
 
 interface EnrollmentPageProps {
+  currentUser: AuthUser;
   organization: Organization;
   groups: Group[];
   persons: Person[];
@@ -72,6 +76,7 @@ const POSES: { key: PoseLabel; title: string; shortLabel: string; instruction: s
 const TOTAL_POSES = POSES.length;
 
 export function EnrollmentPage({
+  currentUser,
   organization,
   groups,
   persons,
@@ -111,6 +116,17 @@ export function EnrollmentPage({
   const [posePreviews, setPosePreviews] = useState<Partial<Record<PoseLabel, string>>>({});
   const [completedBanner, setCompletedBanner] = useState<string | null>(null);
 
+  // Revocación segura (individual o en lote)
+  const [selectedForRevoke, setSelectedForRevoke] = useState<number[]>([]);
+  const [revokeTargets, setRevokeTargets] = useState<Person[] | null>(null);
+  const [revokeSecret, setRevokeSecret] = useState("");
+  const [revokeReason, setRevokeReason] = useState("");
+  const [revokeError, setRevokeError] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState(false);
+
+  const canManagePersons = ["superadmin", "org_admin", "operator"].includes(currentUser.role);
+  const canDeletePersons = ["superadmin", "org_admin"].includes(currentUser.role);
+
   const activePerson = persons.find((p) => p.id === activePersonId) ?? null;
   const currentPose = POSES[poseIndex] ?? POSES[0];
 
@@ -134,6 +150,8 @@ export function EnrollmentPage({
     setActivePersonId(null);
     setAutoCapture(false);
     setCompletedBanner(null);
+    setSelectedForRevoke([]);
+    setRevokeTargets(null);
     revokeAllPreviews();
   }, [
     organization.id,
@@ -309,16 +327,46 @@ export function EnrollmentPage({
     return () => window.clearInterval(timer);
   }, [activePerson, autoCapture, cameraReady, currentPose.key, submitCapture]);
 
-  async function handleRevokeBiometrics(person: Person) {
-    if (!window.confirm(`¿Revocar y eliminar los vectores biométricos de ${person.full_name}?`)) {
-      return;
+  function openRevokeModal(targets: Person[]) {
+    setRevokeTargets(targets);
+    setRevokeSecret("");
+    setRevokeReason("");
+    setRevokeError(null);
+  }
+
+  async function handleConfirmRevoke(e: FormEvent) {
+    e.preventDefault();
+    if (!revokeTargets || revokeTargets.length === 0) return;
+    setRevoking(true);
+    setRevokeError(null);
+    try {
+      const targetIds = revokeTargets.map((p) => p.id);
+      const res = await api.revokeBiometricsBatch({
+        person_ids: targetIds,
+        authorization_secret: revokeSecret,
+        reason: revokeReason.trim() || undefined,
+      });
+      if (activePersonId !== null && targetIds.includes(activePersonId)) {
+        setEnrollStatus(null);
+        revokeAllPreviews();
+      }
+      setSelectedForRevoke((prev) => prev.filter((id) => !targetIds.includes(id)));
+      setRevokeTargets(null);
+      await onRefreshPersons();
+      setCompletedBanner(
+        `Biometría revocada para ${res.revoked_persons_count} persona(s) (${res.deleted_embeddings} vectores eliminados). Autorizado por: ${res.authorized_by_name ?? "Administrador"}.`
+      );
+    } catch (err) {
+      setRevokeError(err instanceof Error ? err.message : "No se pudo autorizar la revocación.");
+    } finally {
+      setRevoking(false);
     }
-    await api.revokeBiometrics(person.id);
-    if (activePersonId === person.id) {
-      setEnrollStatus(null);
-      revokeAllPreviews();
-    }
-    await onRefreshPersons();
+  }
+
+  function toggleRevokeSelection(personId: number) {
+    setSelectedForRevoke((prev) =>
+      prev.includes(personId) ? prev.filter((id) => id !== personId) : [...prev, personId]
+    );
   }
 
   async function handleDeletePerson(person: Person) {
@@ -353,14 +401,16 @@ export function EnrollmentPage({
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setShowCreateForm((v) => !v)}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
-        >
-          <Plus className="w-4 h-4" />
-          Nueva Persona
-        </button>
+        {canManagePersons && (
+          <button
+            type="button"
+            onClick={() => setShowCreateForm((v) => !v)}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
+          >
+            <Plus className="w-4 h-4" />
+            Nueva Persona
+          </button>
+        )}
       </div>
 
       {completedBanner && (
@@ -516,6 +566,25 @@ export function EnrollmentPage({
             />
           </div>
 
+          {selectedForRevoke.length > 0 && (
+            <div className="flex items-center justify-between gap-2 rounded-xl bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-xs">
+              <span className="text-amber-200">
+                {selectedForRevoke.length} seleccionado(s) con biometría
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const targets = persons.filter((p) => selectedForRevoke.includes(p.id));
+                  if (targets.length > 0) openRevokeModal(targets);
+                }}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-semibold bg-amber-600 hover:bg-amber-500 text-white"
+              >
+                <ShieldAlert className="w-3.5 h-3.5" />
+                Revocar lote
+              </button>
+            </div>
+          )}
+
           <div className="space-y-2.5 max-h-[640px] overflow-y-auto pr-1">
             {filteredPersons.length === 0 ? (
               <p className="text-sm text-slate-500 py-10 text-center">
@@ -524,6 +593,7 @@ export function EnrollmentPage({
             ) : (
               filteredPersons.map((p) => {
                 const isSelected = activePersonId === p.id;
+                const isChecked = selectedForRevoke.includes(p.id);
                 return (
                   <div
                     key={p.id}
@@ -535,6 +605,15 @@ export function EnrollmentPage({
                   >
                     <div className="flex items-center justify-between gap-3">
                       <div className="flex items-center gap-3 min-w-0">
+                        {p.embeddings_count > 0 && (
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => toggleRevokeSelection(p.id)}
+                            className="rounded border-slate-600 bg-slate-800 text-amber-500 shrink-0"
+                            title="Seleccionar para revocación en lote"
+                          />
+                        )}
                         {p.avatar_base64 ? (
                           <img
                             src={p.avatar_base64}
@@ -583,36 +662,40 @@ export function EnrollmentPage({
                       </div>
 
                       <div className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          disabled={!p.biometric_consent}
-                          onClick={() => startEnrollmentFor(p)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white"
-                        >
-                          <Camera className="w-3.5 h-3.5" />
-                          Enrolar
-                        </button>
+                        {canManagePersons && (
+                          <button
+                            type="button"
+                            disabled={!p.biometric_consent}
+                            onClick={() => startEnrollmentFor(p)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white"
+                          >
+                            <Camera className="w-3.5 h-3.5" />
+                            Enrolar
+                          </button>
+                        )}
 
                         {p.embeddings_count > 0 && (
                           <button
                             type="button"
-                            onClick={() => void handleRevokeBiometrics(p)}
+                            onClick={() => openRevokeModal([p])}
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-slate-800 hover:bg-amber-600/20 text-amber-300 border border-slate-700"
-                            title="Revocar biometría"
+                            title="Revocar biometría (requiere contraseña)"
                           >
                             <ShieldAlert className="w-3.5 h-3.5" />
                             Revocar
                           </button>
                         )}
 
-                        <button
-                          type="button"
-                          onClick={() => void handleDeletePerson(p)}
-                          className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
-                          title="Eliminar persona"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        {canDeletePersons && (
+                          <button
+                            type="button"
+                            onClick={() => void handleDeletePerson(p)}
+                            className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
+                            title="Eliminar persona"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -868,6 +951,96 @@ export function EnrollmentPage({
           )}
         </div>
       </div>
+
+      {/* Modal de autorización para revocar registros biométricos */}
+      {revokeTargets && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <form
+            onSubmit={handleConfirmRevoke}
+            className="w-full max-w-md bg-slate-900 border border-amber-500/40 rounded-2xl p-6 space-y-4 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-300">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-base">Autorizar revocación biométrica</h3>
+                  <p className="text-xs text-slate-400">
+                    {revokeTargets.length === 1
+                      ? revokeTargets[0].full_name
+                      : `${revokeTargets.length} personas seleccionadas`}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRevokeTargets(null)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-slate-800/60 border border-slate-800 p-3 text-xs text-slate-300 max-h-28 overflow-y-auto space-y-1">
+              {revokeTargets.map((t) => (
+                <p key={t.id}>
+                  • <strong>{t.full_name}</strong> ({t.external_id})
+                </p>
+              ))}
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Contraseña de seguridad (Admin, Superadmin o Clave Delegada)
+              </label>
+              <input
+                type="password"
+                required
+                autoFocus
+                value={revokeSecret}
+                onChange={(e) => setRevokeSecret(e.target.value)}
+                placeholder="Ingresa contraseña de autorización"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">Motivo (opcional)</label>
+              <input
+                type="text"
+                value={revokeReason}
+                onChange={(e) => setRevokeReason(e.target.value)}
+                placeholder="Ej. Re-enrolamiento o baja del padrón"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              />
+            </div>
+
+            {revokeError && (
+              <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+                {revokeError}
+              </p>
+            )}
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setRevokeTargets(null)}
+                className="px-4 py-2 rounded-lg text-sm bg-slate-800 hover:bg-slate-700"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                disabled={revoking}
+                className="px-4 py-2 rounded-lg text-sm font-semibold bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white"
+              >
+                {revoking ? "Validando..." : "Confirmar revocación"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 OrgMode = Literal["enterprise", "education"]
 PersonRole = Literal["employee", "student", "teacher", "admin"]
+UserRole = Literal["superadmin", "org_admin", "teacher", "operator"]
 PoseLabel = Literal["frontal", "left", "right", "up", "down", "smile"]
 SessionType = Literal["workday", "class"]
 SessionStatus = Literal["open", "closed"]
@@ -15,12 +16,19 @@ CaptureMode = Literal["kiosk_individual", "group_scan", "manual"]
 
 
 # --- Organizaciones ---
+class OrgAdminBootstrap(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=160)
+    email: str = Field(..., min_length=4, max_length=160)
+    password: str = Field(..., min_length=6, max_length=120)
+
+
 class OrganizationCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
     mode: OrgMode = "enterprise"
     late_tolerance_minutes: int = Field(default=15, ge=0, le=180)
     cooldown_seconds: int = Field(default=60, ge=5, le=3600)
     store_avatar_by_default: bool = True
+    admin_user: OrgAdminBootstrap | None = None
 
 
 class OrganizationUpdate(BaseModel):
@@ -148,10 +156,32 @@ class EnrollFrameResponse(BaseModel):
     avatar_saved: bool = False
 
 
+class BiometricsRevokeRequest(BaseModel):
+    authorization_secret: str = Field(..., min_length=1, max_length=120)
+    reason: str | None = Field(default=None, max_length=255)
+
+
 class BiometricsRevokeResponse(BaseModel):
     person_id: int
     deleted_embeddings: int
     avatar_cleared: bool
+    authorized_by_name: str | None = None
+    authorization_method: str | None = None
+    delegated_credential_label: str | None = None
+
+
+class BatchBiometricsRevokeRequest(BaseModel):
+    person_ids: list[int] = Field(..., min_length=1)
+    authorization_secret: str = Field(..., min_length=1, max_length=120)
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class BatchBiometricsRevokeResponse(BaseModel):
+    revoked_persons_count: int
+    deleted_embeddings: int
+    authorized_by_name: str | None = None
+    authorization_method: str
+    delegated_credential_label: str | None = None
 
 
 # --- Sesiones y Eventos de Asistencia ---
@@ -238,3 +268,94 @@ class HealthResponse(BaseModel):
     organizations_count: int
     persons_count: int
     embeddings_count: int
+
+
+# --- Autenticación, Usuarios, Credenciales Delegadas y Auditoría ---
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=160)
+    password: str = Field(..., min_length=1, max_length=120)
+
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    full_name: str
+    role: str
+    organization_id: int | None
+    organization_name: str | None = None
+    organization_mode: str | None = None
+    is_active: bool
+    created_by_user_id: int | None
+    created_at: datetime
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserRead
+
+
+class UserCreate(BaseModel):
+    email: str = Field(..., min_length=4, max_length=160)
+    full_name: str = Field(..., min_length=2, max_length=160)
+    password: str = Field(..., min_length=6, max_length=120)
+    role: UserRole = "operator"
+    organization_id: int | None = None
+
+
+class UserUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=2, max_length=160)
+    password: str | None = Field(default=None, min_length=6, max_length=120)
+    role: UserRole | None = None
+    is_active: bool | None = None
+
+
+class DelegatedCredentialCreate(BaseModel):
+    organization_id: int | None = None
+    label: str = Field(..., min_length=2, max_length=120)
+    assigned_to_user_id: int | None = None
+    assigned_to_name: str | None = Field(default=None, max_length=160)
+    custom_secret: str | None = Field(default=None, min_length=6, max_length=120)
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+    allowed_operations: list[str] = Field(default_factory=lambda: ["revoke_biometrics"])
+
+
+class DelegatedCredentialRead(BaseModel):
+    id: int
+    organization_id: int
+    label: str
+    secret_prefix: str
+    created_by_user_id: int | None
+    created_by_name: str | None = None
+    assigned_to_user_id: int | None
+    assigned_to_name: str
+    allowed_operations: list[str]
+    status: str
+    expires_at: datetime | None
+    created_at: datetime
+    revoked_at: datetime | None
+
+
+class DelegatedCredentialCreateResponse(BaseModel):
+    credential: DelegatedCredentialRead
+    plain_secret: str
+
+
+class AuditLogRead(BaseModel):
+    id: int
+    organization_id: int | None
+    action: str
+    target_type: str
+    target_id: int | None
+    target_summary: str | None
+    executed_by_user_id: int | None
+    executed_by_name: str | None = None
+    authorized_by_user_id: int | None
+    authorized_by_name: str | None = None
+    delegated_credential_id: int | None
+    delegated_credential_prefix: str | None = None
+    delegated_assigned_to_name: str | None = None
+    details: str | None
+    created_at: datetime

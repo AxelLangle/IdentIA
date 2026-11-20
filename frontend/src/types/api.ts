@@ -1,5 +1,6 @@
 export type OrgMode = "enterprise" | "education";
 export type PersonRole = "employee" | "student" | "teacher" | "admin";
+export type UserRole = "superadmin" | "org_admin" | "teacher" | "operator";
 export type PoseLabel = "frontal" | "left" | "right" | "up" | "down" | "smile";
 export type ActionMode = "auto" | "check_in" | "check_out" | "present";
 export type SessionStatus = "open" | "closed";
@@ -151,4 +152,70 @@ export interface HealthResponse {
   organizations_count: number;
   persons_count: number;
   embeddings_count: number;
+}
+
+export interface AuthUser {
+  id: number;
+  email: string;
+  full_name: string;
+  role: UserRole;
+  organization_id: number | null;
+  organization_name: string | null;
+  organization_mode: OrgMode | null;
+  is_active: boolean;
+  created_by_user_id: number | null;
+  created_at: string;
+}
+
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  user: AuthUser;
+}
+
+export interface DelegatedCredential {
+  id: number;
+  organization_id: number;
+  label: string;
+  secret_prefix: string;
+  created_by_user_id: number | null;
+  created_by_name: string | null;
+  assigned_to_user_id: number | null;
+  assigned_to_name: string;
+  allowed_operations: string[];
+  status: "active" | "revoked" | "expired";
+  expires_at: string | null;
+  created_at: string;
+  revoked_at: string | null;
+}
+
+export interface DelegatedCredentialCreated {
+  credential: DelegatedCredential;
+  plain_secret: string;
+}
+
+export interface AuditLogEntry {
+  id: number;
+  organization_id: number | null;
+  action: string;
+  target_type: string;
+  target_id: number | null;
+  target_summary: string | null;
+  executed_by_user_id: number | null;
+  executed_by_name: string | null;
+  authorized_by_user_id: number | null;
+  authorized_by_name: string | null;
+  delegated_credential_id: number | null;
+  delegated_credential_prefix: string | null;
+  delegated_assigned_to_name: string | null;
+  details: string | null;
+  created_at: string;
+}
+
+export interface BatchBiometricsRevokeResponse {
+  revoked_persons_count: number;
+  deleted_embeddings: number;
+  authorized_by_name: string | null;
+  authorization_method: string;
+  delegated_credential_label: string | null;
 }
