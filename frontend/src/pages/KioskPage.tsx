@@ -6,16 +6,19 @@ import type {
   ActionMode,
   AttendanceEvent,
   AttendanceSession,
+  AuthUser,
   Group,
   Organization,
   RecognizeFrameResponse,
 } from "../types/api";
 
 interface KioskPageProps {
+  currentUser: AuthUser;
   organization: Organization;
   groups: Group[];
   sessions: AttendanceSession[];
   events: AttendanceEvent[];
+  initialSessionId?: number | null;
   onRefreshEvents: () => Promise<void>;
 }
 
@@ -40,20 +43,25 @@ function playSuccessBeep() {
 }
 
 export function KioskPage({
+  currentUser,
   organization,
   groups,
   sessions,
   events,
+  initialSessionId,
   onRefreshEvents,
 }: KioskPageProps) {
   const cameraRef = useRef<CameraViewHandle | null>(null);
   const inFlightRef = useRef(false);
+  const isTeacher = currentUser.role === "teacher";
 
   const [cameraReady, setCameraReady] = useState(false);
   const [kioskActive, setKioskActive] = useState(true);
   const [soundEnabled, setSoundEnabled] = useState(true);
 
-  const [selectedSessionId, setSelectedSessionId] = useState<string>("");
+  const [selectedSessionId, setSelectedSessionId] = useState<string>(
+    initialSessionId ? String(initialSessionId) : ""
+  );
   const [selectedGroupId, setSelectedGroupId] = useState<string>("");
   const [actionMode, setActionMode] = useState<ActionMode>(
     organization.mode === "education" ? "present" : "auto"
@@ -63,16 +71,32 @@ export function KioskPage({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const openSessions = sessions.filter((s) => s.status === "open");
+  const selectedSession =
+    openSessions.find((s) => String(s.id) === selectedSessionId) ?? null;
 
   useEffect(() => {
     setActionMode(organization.mode === "education" ? "present" : "auto");
-    setSelectedSessionId("");
+    setSelectedSessionId(initialSessionId ? String(initialSessionId) : "");
     setSelectedGroupId("");
     setLastResult(null);
   }, [organization.id, organization.mode]);
 
+  useEffect(() => {
+    if (initialSessionId) {
+      setSelectedSessionId(String(initialSessionId));
+      setErrorMsg(null);
+    }
+  }, [initialSessionId]);
+
+  useEffect(() => {
+    if (isTeacher && !selectedSessionId && openSessions.length > 0) {
+      setSelectedSessionId(String(openSessions[0].id));
+    }
+  }, [isTeacher, openSessions, selectedSessionId]);
+
   const runRecognitionStep = useCallback(async () => {
     if (!kioskActive || !cameraReady || inFlightRef.current) return;
+    if (isTeacher && !selectedSessionId) return;
     const cam = cameraRef.current;
     if (!cam) return;
 
@@ -103,6 +127,7 @@ export function KioskPage({
   }, [
     actionMode,
     cameraReady,
+    isTeacher,
     kioskActive,
     onRefreshEvents,
     organization.id,
@@ -200,7 +225,10 @@ export function KioskPage({
             onChange={(e) => setSelectedSessionId(e.target.value)}
             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
-            <option value="">Automática del día</option>
+            {!isTeacher && <option value="">Automática del día</option>}
+            {isTeacher && openSessions.length === 0 && (
+              <option value="">Sin sesiones abiertas</option>
+            )}
             {openSessions.map((s) => (
               <option key={s.id} value={s.id}>
                 {s.title}
@@ -213,7 +241,7 @@ export function KioskPage({
           <label className="block text-xs text-slate-400 mb-1">Alcance por grupo</label>
           <select
             value={selectedGroupId}
-            disabled={Boolean(selectedSessionId)}
+            disabled={isTeacher || Boolean(selectedSessionId)}
             onChange={(e) => setSelectedGroupId(e.target.value)}
             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
           >
@@ -248,6 +276,33 @@ export function KioskPage({
           </select>
         </div>
       </div>
+
+      {isTeacher && !selectedSession && (
+        <div className="rounded-xl bg-amber-500/15 border border-amber-500/40 px-4 py-3 text-sm text-amber-200">
+          Para tomar asistencia como docente, primero abre una de tus materias desde{" "}
+          <strong>Mi Agenda Docente</strong> (o selecciona una sesión abierta arriba).
+        </div>
+      )}
+
+      {selectedSession && selectedSession.subject_name && (
+        <div className="rounded-xl bg-indigo-500/15 border border-indigo-500/40 px-4 py-2.5 text-xs text-indigo-200 flex flex-wrap items-center gap-3">
+          <span>
+            Materia: <strong>{selectedSession.subject_name}</strong>
+            {selectedSession.subject_code ? ` (${selectedSession.subject_code})` : ""}
+          </span>
+          {selectedSession.group_name && (
+            <span>
+              · Grupo: <strong>{selectedSession.group_name}</strong>
+            </span>
+          )}
+          {selectedSession.career_name && <span>· {selectedSession.career_name}</span>}
+          {selectedSession.teacher_name && (
+            <span>
+              · Docente: <strong>{selectedSession.teacher_name}</strong>
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {/* Cámara + banner de respuesta */}
