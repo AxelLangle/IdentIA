@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -81,7 +81,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        Base.metadata.create_all(bind=active_engine)
+        if not inspect(active_engine).has_table("alembic_version"):
+            Base.metadata.create_all(bind=active_engine)
         with active_session_factory() as db:
             seed_initial_data(db)
 
