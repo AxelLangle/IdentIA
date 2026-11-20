@@ -128,7 +128,8 @@ npm run build
 - **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, grupos, sesiones y exportación CSV).
 - **Bloque A (Completa):** Compensación de contraluz/sombras LAB, bloqueo de contraluz en registro, asistente guiado de 6 poses con validación geométrica y manual de uso.
 - **Bloque B (Completa en `feat/bloque-b-rbac-seguridad`):** Autenticación JWT, aislamiento multi-organización (`superadmin`, `org_admin`, `teacher`, `operator`), revocación individual/lote con contraseñas delegadas hasheadas (`scrypt`), bitácora de auditoría y migraciones Alembic.
-- **Bloques C–D (En curso desde `develop`):** Modelo educativo completo (carreras/grupos/materias/horarios/profesores) y turnos empresariales.
+- **Bloque C (Completa en `feat/bloque-c-modelo-educativo`):** Modelo educativo completo (`Career`, `Group` académico, `Subject`, `CourseAssignment`, `ClassSchedule`), herencia automática de materias por grupo, portal docente con aislamiento estricto ("Tu clase ahora" en 1 clic), estadísticas por asignatura y consolidadas por grupo, y migración `0002_education_domain`.
+- **Bloque D (Siguiente desde `develop`):** Turnos empresariales (`WorkShift`, asignación de empleados y reglas de puntualidad/salida anticipada).
 - **Siguiente:** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
 
 ---
