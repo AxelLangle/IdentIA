@@ -18,6 +18,7 @@ import { CameraView, type CameraViewHandle } from "../components/CameraView";
 import { api } from "../lib/api";
 import type {
   AuthUser,
+  CourseAssignment,
   EnrollFrameResponse,
   Group,
   Organization,
@@ -124,6 +125,9 @@ export function EnrollmentPage({
   const [revokeError, setRevokeError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState(false);
 
+  // Materias heredadas por grupo (modo educación)
+  const [courses, setCourses] = useState<CourseAssignment[]>([]);
+
   const canManagePersons = ["superadmin", "org_admin", "operator"].includes(currentUser.role);
   const canDeletePersons = ["superadmin", "org_admin"].includes(currentUser.role);
 
@@ -143,6 +147,25 @@ export function EnrollmentPage({
       revokeAllPreviews();
     };
   }, [revokeAllPreviews]);
+
+  useEffect(() => {
+    if (organization.mode !== "education" || currentUser.role === "teacher") {
+      setCourses([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .listCourses(organization.id)
+      .then((list) => {
+        if (!cancelled) setCourses(list);
+      })
+      .catch(() => {
+        if (!cancelled) setCourses([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser.role, organization.id, organization.mode]);
 
   useEffect(() => {
     setRole(organization.mode === "education" ? "student" : "employee");
@@ -490,7 +513,11 @@ export function EnrollmentPage({
 
           {groups.length > 0 && (
             <div>
-              <p className="text-xs text-slate-400 mb-2">Asignar a grupos / departamentos</p>
+              <p className="text-xs text-slate-400 mb-2">
+                {organization.mode === "education"
+                  ? "Asignar a grupo académico (heredará automáticamente sus materias)"
+                  : "Asignar a grupos / departamentos"}
+              </p>
               <div className="flex flex-wrap gap-2">
                 {groups.map((g) => {
                   const selected = selectedGroupIds.includes(g.id);
@@ -506,6 +533,7 @@ export function EnrollmentPage({
                       }`}
                     >
                       {g.name}
+                      {g.career_name ? ` · ${g.career_name}` : ""}
                     </button>
                   );
                 })}
@@ -594,6 +622,11 @@ export function EnrollmentPage({
               filteredPersons.map((p) => {
                 const isSelected = activePersonId === p.id;
                 const isChecked = selectedForRevoke.includes(p.id);
+                const personGroups = groups.filter((g) => p.group_ids.includes(g.id));
+                const inheritedCourses =
+                  organization.mode === "education"
+                    ? courses.filter((c) => p.group_ids.includes(c.group_id))
+                    : [];
                 return (
                   <div
                     key={p.id}
@@ -629,6 +662,9 @@ export function EnrollmentPage({
                           <p className="font-semibold text-sm truncate">{p.full_name}</p>
                           <p className="text-xs text-slate-400">
                             {p.external_id} · {p.role}
+                            {personGroups.length > 0
+                              ? ` · ${personGroups.map((g) => g.name).join(", ")}`
+                              : ""}
                           </p>
                         </div>
                       </div>
@@ -645,6 +681,24 @@ export function EnrollmentPage({
                         {p.embeddings_count}/{TOTAL_POSES} poses
                       </span>
                     </div>
+
+                    {inheritedCourses.length > 0 && (
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                        <span className="text-slate-400">
+                          Hereda {inheritedCourses.length} materia
+                          {inheritedCourses.length === 1 ? "" : "s"}:
+                        </span>
+                        {inheritedCourses.map((c) => (
+                          <span
+                            key={c.id}
+                            className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/20"
+                            title={c.subject_name}
+                          >
+                            {c.subject_code}
+                          </span>
+                        ))}
+                      </div>
+                    )}
 
                     <div className="flex flex-wrap items-center justify-between gap-2 mt-3 pt-2.5 border-t border-slate-800/80">
                       <div className="text-[11px] text-slate-400">
