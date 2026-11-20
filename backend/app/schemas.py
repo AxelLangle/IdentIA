@@ -58,6 +58,17 @@ class GroupCreate(BaseModel):
     code: str = Field(..., min_length=1, max_length=40)
     schedule_start: str = Field(default="08:00", pattern=r"^\d{2}:\d{2}$")
     schedule_end: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
+    career_id: int | None = None
+    semester: str | None = Field(default=None, max_length=40)
+
+
+class GroupUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    code: str | None = Field(default=None, min_length=1, max_length=40)
+    schedule_start: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    schedule_end: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    career_id: int | None = None
+    semester: str | None = Field(default=None, max_length=40)
 
 
 class GroupRead(BaseModel):
@@ -65,12 +76,16 @@ class GroupRead(BaseModel):
 
     id: int
     organization_id: int
+    career_id: int | None = None
+    career_name: str | None = None
     name: str
     code: str
+    semester: str | None = None
     schedule_start: str
     schedule_end: str
     created_at: datetime
     members_count: int = 0
+    courses_count: int = 0
 
 
 # --- Personas y Enrolamiento ---
@@ -188,6 +203,8 @@ class BatchBiometricsRevokeResponse(BaseModel):
 class SessionCreate(BaseModel):
     organization_id: int
     group_id: int | None = None
+    course_assignment_id: int | None = None
+    schedule_id: int | None = None
     title: str = Field(..., min_length=2, max_length=160)
     session_date: date | None = None
     session_type: SessionType | None = None
@@ -201,6 +218,12 @@ class SessionRead(BaseModel):
     organization_id: int
     group_id: int | None
     group_name: str | None = None
+    course_assignment_id: int | None = None
+    schedule_id: int | None = None
+    subject_name: str | None = None
+    subject_code: str | None = None
+    career_name: str | None = None
+    teacher_name: str | None = None
     title: str
     session_date: date
     session_type: str
@@ -359,3 +382,218 @@ class AuditLogRead(BaseModel):
     delegated_assigned_to_name: str | None = None
     details: str | None
     created_at: datetime
+
+
+# --- Modelo Educativo Completo (Bloque C) ---
+class CareerCreate(BaseModel):
+    organization_id: int
+    name: str = Field(..., min_length=2, max_length=140)
+    code: str = Field(..., min_length=1, max_length=40)
+    description: str | None = Field(default=None, max_length=255)
+
+
+class CareerUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=140)
+    code: str | None = Field(default=None, min_length=1, max_length=40)
+    description: str | None = Field(default=None, max_length=255)
+
+
+class CareerRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    organization_id: int
+    name: str
+    code: str
+    description: str | None
+    created_at: datetime
+    groups_count: int = 0
+    subjects_count: int = 0
+
+
+class SubjectCreate(BaseModel):
+    organization_id: int
+    career_id: int | None = None
+    name: str = Field(..., min_length=2, max_length=140)
+    code: str = Field(..., min_length=1, max_length=40)
+
+
+class SubjectRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    organization_id: int
+    career_id: int | None = None
+    career_name: str | None = None
+    name: str
+    code: str
+    created_at: datetime
+
+
+class ClassScheduleCreate(BaseModel):
+    day_of_week: int = Field(..., ge=0, le=6)
+    start_time: str = Field(..., pattern=r"^\d{2}:\d{2}$")
+    end_time: str = Field(..., pattern=r"^\d{2}:\d{2}$")
+    classroom: str | None = Field(default=None, max_length=80)
+
+
+class ClassScheduleRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    course_assignment_id: int
+    day_of_week: int
+    start_time: str
+    end_time: str
+    classroom: str | None = None
+    created_at: datetime
+
+
+class CourseAssignmentCreate(BaseModel):
+    organization_id: int
+    group_id: int
+    subject_id: int
+    teacher_user_id: int | None = None
+    term: str | None = Field(default=None, max_length=60)
+    schedules: list[ClassScheduleCreate] = Field(default_factory=list)
+
+
+class CourseAssignmentUpdate(BaseModel):
+    teacher_user_id: int | None = None
+    term: str | None = Field(default=None, max_length=60)
+    is_active: bool | None = None
+
+
+class CourseAssignmentRead(BaseModel):
+    id: int
+    organization_id: int
+    group_id: int
+    group_name: str
+    group_code: str
+    career_id: int | None = None
+    career_name: str | None = None
+    subject_id: int
+    subject_name: str
+    subject_code: str
+    teacher_user_id: int | None = None
+    teacher_name: str | None = None
+    teacher_email: str | None = None
+    term: str | None = None
+    is_active: bool
+    students_count: int = 0
+    schedules: list[ClassScheduleRead] = Field(default_factory=list)
+    created_at: datetime
+
+
+class GenerateSessionsRequest(BaseModel):
+    organization_id: int | None = None
+    target_date: date | None = None
+    course_assignment_id: int | None = None
+
+
+class GenerateSessionsResponse(BaseModel):
+    target_date: date
+    created_count: int
+    existing_count: int
+    sessions: list[SessionRead] = Field(default_factory=list)
+
+
+class StartCourseSessionRequest(BaseModel):
+    schedule_id: int | None = None
+    session_date: date | None = None
+
+
+class TeacherAgendaSlot(BaseModel):
+    schedule_id: int
+    course_assignment_id: int
+    subject_name: str
+    subject_code: str
+    group_id: int
+    group_name: str
+    group_code: str
+    career_name: str | None = None
+    day_of_week: int
+    start_time: str
+    end_time: str
+    classroom: str | None = None
+    slot_status: Literal["in_progress", "upcoming", "finished"]
+    students_count: int = 0
+    session: SessionRead | None = None
+
+
+class TeacherAgendaResponse(BaseModel):
+    target_date: date
+    current_time: str
+    current_slot: TeacherAgendaSlot | None = None
+    today_slots: list[TeacherAgendaSlot] = Field(default_factory=list)
+    courses: list[CourseAssignmentRead] = Field(default_factory=list)
+
+
+class SubjectAttendanceStat(BaseModel):
+    course_assignment_id: int
+    subject_id: int
+    subject_name: str
+    subject_code: str
+    group_id: int
+    group_name: str
+    group_code: str
+    career_name: str | None = None
+    teacher_name: str | None = None
+    sessions_count: int
+    enrolled_students: int
+    expected_records: int
+    present_count: int
+    on_time_count: int
+    late_count: int
+    manual_count: int
+    absent_count: int
+    attendance_rate: float
+
+
+class StudentGroupAttendanceStat(BaseModel):
+    person_id: int
+    external_id: str
+    full_name: str
+    expected_records: int
+    present_count: int
+    on_time_count: int
+    late_count: int
+    absent_count: int
+    attendance_rate: float
+
+
+class GroupAttendanceStat(BaseModel):
+    group_id: int
+    group_name: str
+    group_code: str
+    career_id: int | None = None
+    career_name: str | None = None
+    semester: str | None = None
+    subjects_count: int
+    students_count: int
+    total_sessions: int
+    total_expected: int
+    total_present: int
+    total_on_time: int
+    total_late: int
+    total_absent: int
+    overall_attendance_rate: float
+    students_breakdown: list[StudentGroupAttendanceStat] = Field(default_factory=list)
+
+
+class AcademicStatsSummary(BaseModel):
+    total_careers: int
+    total_groups: int
+    total_subjects: int
+    total_courses: int
+    total_sessions: int
+    overall_attendance_rate: float
+
+
+class AcademicStatsResponse(BaseModel):
+    organization_id: int
+    date_from: date | None = None
+    date_to: date | None = None
+    summary: AcademicStatsSummary
+    by_subject: list[SubjectAttendanceStat] = Field(default_factory=list)
+    by_group: list[GroupAttendanceStat] = Field(default_factory=list)
