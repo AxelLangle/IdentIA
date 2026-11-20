@@ -2,13 +2,15 @@ from datetime import date, datetime
 import time
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
 from app.db import get_db
 from app.models import (
     AttendanceEvent,
     AttendanceSession,
+    ClassSchedule,
+    CourseAssignment,
     FaceEmbedding,
     Group,
     Organization,
@@ -27,6 +29,11 @@ from app.schemas import (
     SessionRead,
 )
 from app.security import assert_org_access, get_current_user, resolve_org_scope
+from app.services.academic_service import (
+    assert_session_teacher_access,
+    get_teacher_course_ids,
+    serialize_sessions_batch,
+)
 from app.services.attendance_service import (
     export_events_csv,
     get_or_create_active_session,
@@ -60,27 +67,6 @@ def _serialize_event(
     )
 
 
-def _serialize_session(
-    session: AttendanceSession,
-    group_name: str | None,
-    events_count: int,
-) -> SessionRead:
-    return SessionRead(
-        id=session.id,
-        organization_id=session.organization_id,
-        group_id=session.group_id,
-        group_name=group_name,
-        title=session.title,
-        session_date=session.session_date,
-        session_type=session.session_type,
-        expected_start_time=session.expected_start_time,
-        status=session.status,
-        created_at=session.created_at,
-        closed_at=session.closed_at,
-        events_count=events_count,
-    )
-
-
 @router.get("/sessions", response_model=list[SessionRead])
 def list_sessions(
     organization_id: int | None = Query(default=None),
@@ -94,32 +80,15 @@ def list_sessions(
         .where(AttendanceSession.organization_id == scoped_org_id)
         .order_by(AttendanceSession.id.desc())
     )
+    if current_user.role == "teacher":
+        teacher_courses = get_teacher_course_ids(db, current_user.id)
+        if not teacher_courses:
+            return []
+        stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
     if status_filter:
         stmt = stmt.where(AttendanceSession.status == status_filter)
-    sessions = db.scalars(stmt).all()
-
-    group_names = {
-        g.id: g.name
-        for g in db.scalars(
-            select(Group).where(Group.organization_id == scoped_org_id)
-        ).all()
-    }
-    event_counts = {
-        sid: cnt
-        for sid, cnt in db.execute(
-            select(AttendanceEvent.session_id, func.count(AttendanceEvent.id))
-            .group_by(AttendanceEvent.session_id)
-        ).all()
-    }
-
-    return [
-        _serialize_session(
-            s,
-            group_names.get(s.group_id) if s.group_id else None,
-            event_counts.get(s.id, 0),
-        )
-        for s in sessions
-    ]
+    sessions = list(db.scalars(stmt).all())
+    return serialize_sessions_batch(db, sessions, scoped_org_id)
 
 
 @router.post("/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED)
@@ -133,20 +102,51 @@ def create_session(
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    group_name: str | None = None
+    if current_user.role == "teacher" and payload.course_assignment_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Un docente debe abrir sesiones vinculadas a una de sus asignaturas.",
+        )
+
+    resolved_group_id = payload.group_id
     expected_start = payload.expected_start_time
-    if payload.group_id is not None:
-        group = db.get(Group, payload.group_id)
+    session_type = payload.session_type or ("class" if org.mode == "education" else "workday")
+
+    if payload.course_assignment_id is not None:
+        assignment = db.scalars(
+            select(CourseAssignment)
+            .options(selectinload(CourseAssignment.group))
+            .where(CourseAssignment.id == payload.course_assignment_id)
+        ).first()
+        if assignment is None or assignment.organization_id != org.id:
+            raise HTTPException(status_code=404, detail="Asignación de materia no encontrada.")
+        if current_user.role == "teacher" and assignment.teacher_user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No puedes crear sesiones para una materia de otro profesor.",
+            )
+        resolved_group_id = assignment.group_id
+        session_type = "class"
+        if payload.schedule_id is not None:
+            schedule = db.get(ClassSchedule, payload.schedule_id)
+            if schedule is None or schedule.course_assignment_id != assignment.id:
+                raise HTTPException(status_code=404, detail="Horario no encontrado para la materia.")
+            if expected_start is None:
+                expected_start = schedule.start_time
+        elif expected_start is None and assignment.group is not None:
+            expected_start = assignment.group.schedule_start
+    elif resolved_group_id is not None:
+        group = db.get(Group, resolved_group_id)
         if group is None or group.organization_id != org.id:
             raise HTTPException(status_code=404, detail="Grupo no encontrado en la organización.")
-        group_name = group.name
         if expected_start is None:
             expected_start = group.schedule_start
 
-    session_type = payload.session_type or ("class" if org.mode == "education" else "workday")
     session = AttendanceSession(
         organization_id=org.id,
-        group_id=payload.group_id,
+        group_id=resolved_group_id,
+        course_assignment_id=payload.course_assignment_id,
+        schedule_id=payload.schedule_id,
         title=payload.title.strip(),
         session_date=payload.session_date or date.today(),
         session_type=session_type,
@@ -156,7 +156,7 @@ def create_session(
     db.add(session)
     db.commit()
     db.refresh(session)
-    return _serialize_session(session, group_name, 0)
+    return serialize_sessions_batch(db, [session], org.id)[0]
 
 
 @router.post("/sessions/{session_id}/close", response_model=SessionRead)
@@ -169,6 +169,7 @@ def close_session(
     if session is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
     assert_org_access(current_user, session.organization_id)
+    assert_session_teacher_access(db, current_user, session)
 
     if session.status != "closed":
         session.status = "closed"
@@ -176,11 +177,7 @@ def close_session(
         db.commit()
         db.refresh(session)
 
-    group = db.get(Group, session.group_id) if session.group_id else None
-    count = db.scalar(
-        select(func.count(AttendanceEvent.id)).where(AttendanceEvent.session_id == session.id)
-    ) or 0
-    return _serialize_session(session, group.name if group else None, count)
+    return serialize_sessions_batch(db, [session], session.organization_id)[0]
 
 
 @router.post("/attendance/recognize-frame", response_model=RecognizeFrameResponse)
@@ -213,9 +210,15 @@ async def recognize_frame(
         session = db.get(AttendanceSession, session_id)
         if session is None or session.organization_id != org.id:
             raise HTTPException(status_code=404, detail="Sesión no encontrada en la organización.")
+        assert_session_teacher_access(db, current_user, session)
         if session.status != "open":
             raise HTTPException(status_code=400, detail="La sesión seleccionada ya está cerrada.")
     else:
+        if current_user.role == "teacher":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes seleccionar una sesión de tu asignatura para tomar asistencia.",
+            )
         try:
             session = get_or_create_active_session(db, org, group_id=group_id)
         except ValueError as exc:
@@ -394,6 +397,17 @@ def list_events(
     db: Session = Depends(get_db),
 ) -> list[AttendanceEventRead]:
     scoped_org_id = resolve_org_scope(current_user, organization_id)
+    teacher_courses: set[int] | None = None
+    if current_user.role == "teacher":
+        if session_id is not None:
+            target_sess = db.get(AttendanceSession, session_id)
+            if target_sess is None or target_sess.organization_id != scoped_org_id:
+                raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+            assert_session_teacher_access(db, current_user, target_sess)
+        teacher_courses = get_teacher_course_ids(db, current_user.id)
+        if not teacher_courses:
+            return []
+
     stmt = (
         select(AttendanceEvent, Person, AttendanceSession)
         .join(Person, Person.id == AttendanceEvent.person_id)
@@ -402,6 +416,8 @@ def list_events(
         .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
         .limit(limit)
     )
+    if teacher_courses is not None:
+        stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
     if session_id is not None:
         stmt = stmt.where(AttendanceEvent.session_id == session_id)
     if person_id is not None:
@@ -421,12 +437,27 @@ def create_manual_attendance(
     if session is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
     assert_org_access(current_user, session.organization_id)
+    assert_session_teacher_access(db, current_user, session)
+
     person = db.get(Person, payload.person_id)
     if person is None or person.organization_id != session.organization_id:
         raise HTTPException(
             status_code=404,
             detail="Persona no encontrada en la organización de la sesión.",
         )
+
+    if current_user.role == "teacher" and session.group_id is not None:
+        in_group = db.scalars(
+            select(PersonGroup).where(
+                PersonGroup.person_id == person.id,
+                PersonGroup.group_id == session.group_id,
+            )
+        ).first()
+        if in_group is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El alumno no pertenece al grupo de esta sesión.",
+            )
 
     event = AttendanceEvent(
         session_id=session.id,
@@ -452,17 +483,32 @@ def export_attendance_csv(
     db: Session = Depends(get_db),
 ) -> Response:
     scoped_org_id = resolve_org_scope(current_user, organization_id)
-    stmt = (
-        select(AttendanceEvent, Person, AttendanceSession)
-        .join(Person, Person.id == AttendanceEvent.person_id)
-        .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
-        .where(AttendanceSession.organization_id == scoped_org_id)
-        .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
-    )
-    if session_id is not None:
-        stmt = stmt.where(AttendanceEvent.session_id == session_id)
+    teacher_courses: set[int] | None = None
+    if current_user.role == "teacher":
+        if session_id is not None:
+            target_sess = db.get(AttendanceSession, session_id)
+            if target_sess is None or target_sess.organization_id != scoped_org_id:
+                raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+            assert_session_teacher_access(db, current_user, target_sess)
+        teacher_courses = get_teacher_course_ids(db, current_user.id)
 
-    rows = db.execute(stmt).all()
+    if teacher_courses is not None and not teacher_courses:
+        rows = []
+    else:
+        stmt = (
+            select(AttendanceEvent, Person, AttendanceSession)
+            .join(Person, Person.id == AttendanceEvent.person_id)
+            .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
+            .where(AttendanceSession.organization_id == scoped_org_id)
+            .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
+        )
+        if teacher_courses is not None:
+            stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
+        if session_id is not None:
+            stmt = stmt.where(AttendanceEvent.session_id == session_id)
+
+        rows = db.execute(stmt).all()
+
     csv_content = export_events_csv([(ev, per, ses) for ev, per, ses in rows])
     return Response(
         content=csv_content.encode("utf-8"),
