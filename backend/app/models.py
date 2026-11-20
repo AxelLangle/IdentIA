@@ -35,6 +35,15 @@ class Organization(Base):
     groups: Mapped[list["Group"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
+    careers: Mapped[list["Career"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+    subjects: Mapped[list["Subject"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+    course_assignments: Mapped[list["CourseAssignment"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
     users: Mapped[list["User"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
@@ -52,6 +61,26 @@ class Organization(Base):
     )
 
 
+class Career(Base):
+    __tablename__ = "careers"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "code", name="uq_career_org_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(140), nullable=False)
+    code: Mapped[str] = mapped_column(String(40), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
+
+    organization: Mapped["Organization"] = relationship(back_populates="careers")
+    groups: Mapped[list["Group"]] = relationship(back_populates="career")
+    subjects: Mapped[list["Subject"]] = relationship(back_populates="career")
+
+
 class Group(Base):
     __tablename__ = "groups"
 
@@ -59,17 +88,97 @@ class Group(Base):
     organization_id: Mapped[int] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    career_id: Mapped[int | None] = mapped_column(
+        ForeignKey("careers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     code: Mapped[str] = mapped_column(String(40), nullable=False)
+    semester: Mapped[str | None] = mapped_column(String(40), nullable=True)
     schedule_start: Mapped[str] = mapped_column(String(5), nullable=False, default="08:00")
     schedule_end: Mapped[str] = mapped_column(String(5), nullable=False, default="17:00")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
 
     organization: Mapped["Organization"] = relationship(back_populates="groups")
+    career: Mapped["Career | None"] = relationship(back_populates="groups")
     person_links: Mapped[list["PersonGroup"]] = relationship(
         back_populates="group", cascade="all, delete-orphan"
     )
+    course_assignments: Mapped[list["CourseAssignment"]] = relationship(
+        back_populates="group", cascade="all, delete-orphan"
+    )
     sessions: Mapped[list["AttendanceSession"]] = relationship(back_populates="group")
+
+
+class Subject(Base):
+    __tablename__ = "subjects"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "code", name="uq_subject_org_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    career_id: Mapped[int | None] = mapped_column(
+        ForeignKey("careers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(140), nullable=False)
+    code: Mapped[str] = mapped_column(String(40), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
+
+    organization: Mapped["Organization"] = relationship(back_populates="subjects")
+    career: Mapped["Career | None"] = relationship(back_populates="subjects")
+    course_assignments: Mapped[list["CourseAssignment"]] = relationship(
+        back_populates="subject", cascade="all, delete-orphan"
+    )
+
+
+class CourseAssignment(Base):
+    __tablename__ = "course_assignments"
+    __table_args__ = (
+        UniqueConstraint("group_id", "subject_id", name="uq_course_group_subject"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    subject_id: Mapped[int] = mapped_column(
+        ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    teacher_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    term: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
+
+    organization: Mapped["Organization"] = relationship(back_populates="course_assignments")
+    group: Mapped["Group"] = relationship(back_populates="course_assignments")
+    subject: Mapped["Subject"] = relationship(back_populates="course_assignments")
+    teacher: Mapped["User | None"] = relationship(foreign_keys=[teacher_user_id])
+    schedules: Mapped[list["ClassSchedule"]] = relationship(
+        back_populates="course_assignment", cascade="all, delete-orphan"
+    )
+
+
+class ClassSchedule(Base):
+    __tablename__ = "class_schedules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    course_assignment_id: Mapped[int] = mapped_column(
+        ForeignKey("course_assignments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    day_of_week: Mapped[int] = mapped_column(Integer, nullable=False)  # 0=Lunes .. 6=Domingo
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    classroom: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
+
+    course_assignment: Mapped["CourseAssignment"] = relationship(back_populates="schedules")
 
 
 class Person(Base):
@@ -150,6 +259,12 @@ class AttendanceSession(Base):
     group_id: Mapped[int | None] = mapped_column(
         ForeignKey("groups.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    course_assignment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("course_assignments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    schedule_id: Mapped[int | None] = mapped_column(
+        ForeignKey("class_schedules.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     session_date: Mapped[date] = mapped_column(Date, nullable=False)
     session_type: Mapped[str] = mapped_column(String(20), nullable=False, default="workday")
@@ -160,6 +275,8 @@ class AttendanceSession(Base):
 
     organization: Mapped["Organization"] = relationship(back_populates="sessions")
     group: Mapped["Group | None"] = relationship(back_populates="sessions")
+    course_assignment: Mapped["CourseAssignment | None"] = relationship()
+    schedule: Mapped["ClassSchedule | None"] = relationship()
     events: Mapped[list["AttendanceEvent"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
