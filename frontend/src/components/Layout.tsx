@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import {
   Activity,
+  BookOpen,
   Building2,
   CalendarClock,
   GraduationCap,
@@ -12,7 +13,14 @@ import {
 } from "lucide-react";
 import type { AuthUser, HealthResponse, Organization, UserRole } from "../types/api";
 
-export type NavTab = "dashboard" | "kiosk" | "enrollment" | "sessions" | "security";
+export type NavTab =
+  | "dashboard"
+  | "kiosk"
+  | "enrollment"
+  | "sessions"
+  | "academic"
+  | "teacher_portal"
+  | "security";
 
 interface LayoutProps {
   activeTab: NavTab;
@@ -45,12 +53,31 @@ export function Layout({
   children,
 }: LayoutProps) {
   const canViewSecurity = currentUser.role === "superadmin" || currentUser.role === "org_admin";
+  const isEducation = selectedOrg?.mode === "education";
+  const isTeacher = currentUser.role === "teacher";
 
   const navItems: { id: NavTab; label: string; icon: typeof LayoutDashboard; visible: boolean }[] = [
-    { id: "dashboard", label: "Dashboard", icon: LayoutDashboard, visible: true },
+    {
+      id: "teacher_portal",
+      label: "Mi Agenda Docente",
+      icon: BookOpen,
+      visible: isEducation && isTeacher,
+    },
+    { id: "dashboard", label: "Dashboard", icon: LayoutDashboard, visible: !isTeacher },
     { id: "kiosk", label: "Kiosco en vivo", icon: ScanFace, visible: true },
-    { id: "enrollment", label: "Personas y Registro", icon: Users, visible: true },
-    { id: "sessions", label: "Grupos y Sesiones", icon: CalendarClock, visible: true },
+    { id: "enrollment", label: "Personas y Registro", icon: Users, visible: !isTeacher },
+    {
+      id: "academic",
+      label: "Estructura Académica",
+      icon: GraduationCap,
+      visible: isEducation && canViewSecurity,
+    },
+    {
+      id: "sessions",
+      label: isTeacher ? "Mis Sesiones" : "Grupos y Sesiones",
+      icon: CalendarClock,
+      visible: true,
+    },
     { id: "security", label: "Seguridad y Usuarios", icon: ShieldCheck, visible: canViewSecurity },
   ];
 
