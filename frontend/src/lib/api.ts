@@ -1,13 +1,18 @@
 import type {
+  AcademicStatsResponse,
   ActionMode,
   AttendanceEvent,
   AttendanceSession,
   AuditLogEntry,
   AuthUser,
   BatchBiometricsRevokeResponse,
+  Career,
+  ClassSchedule,
+  CourseAssignment,
   DelegatedCredential,
   DelegatedCredentialCreated,
   EnrollFrameResponse,
+  GenerateSessionsResponse,
   Group,
   HealthResponse,
   LoginResponse,
@@ -17,6 +22,8 @@ import type {
   PersonRole,
   PoseLabel,
   RecognizeFrameResponse,
+  Subject,
+  TeacherAgendaResponse,
   UserRole,
 } from "../types/api";
 
@@ -191,9 +198,27 @@ export const api = {
     code: string;
     schedule_start: string;
     schedule_end: string;
+    career_id?: number | null;
+    semester?: string | null;
   }) =>
     requestJson<Group>("/api/groups", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  updateGroup: (
+    groupId: number,
+    data: Partial<{
+      name: string;
+      code: string;
+      schedule_start: string;
+      schedule_end: string;
+      career_id: number | null;
+      semester: string | null;
+    }>
+  ) =>
+    requestJson<Group>(`/api/groups/${groupId}`, {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     }),
@@ -279,6 +304,8 @@ export const api = {
   createSession: (data: {
     organization_id: number;
     group_id?: number | null;
+    course_assignment_id?: number | null;
+    schedule_id?: number | null;
     title: string;
     expected_start_time?: string | null;
   }) =>
@@ -355,5 +382,167 @@ export const api = {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+  },
+
+  // --- Modelo Educativo Completo (Bloque C) ---
+  listCareers: (organizationId: number) =>
+    requestJson<Career[]>(`/api/academic/careers?organization_id=${organizationId}`),
+  createCareer: (data: {
+    organization_id: number;
+    name: string;
+    code: string;
+    description?: string | null;
+  }) =>
+    requestJson<Career>("/api/academic/careers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  updateCareer: (
+    careerId: number,
+    data: Partial<{ name: string; code: string; description: string | null }>
+  ) =>
+    requestJson<Career>(`/api/academic/careers/${careerId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  deleteCareer: (careerId: number) =>
+    requestJson<void>(`/api/academic/careers/${careerId}`, { method: "DELETE" }),
+
+  listSubjects: (organizationId: number, careerId?: number | null) => {
+    const params = new URLSearchParams({ organization_id: String(organizationId) });
+    if (careerId !== undefined && careerId !== null) params.set("career_id", String(careerId));
+    return requestJson<Subject[]>(`/api/academic/subjects?${params.toString()}`);
+  },
+  createSubject: (data: {
+    organization_id: number;
+    career_id?: number | null;
+    name: string;
+    code: string;
+  }) =>
+    requestJson<Subject>("/api/academic/subjects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  deleteSubject: (subjectId: number) =>
+    requestJson<void>(`/api/academic/subjects/${subjectId}`, { method: "DELETE" }),
+
+  listCourses: (
+    organizationId: number,
+    groupId?: number | null,
+    teacherUserId?: number | null
+  ) => {
+    const params = new URLSearchParams({ organization_id: String(organizationId) });
+    if (groupId !== undefined && groupId !== null) params.set("group_id", String(groupId));
+    if (teacherUserId !== undefined && teacherUserId !== null) {
+      params.set("teacher_user_id", String(teacherUserId));
+    }
+    return requestJson<CourseAssignment[]>(`/api/academic/courses?${params.toString()}`);
+  },
+  createCourse: (data: {
+    organization_id: number;
+    group_id: number;
+    subject_id: number;
+    teacher_user_id?: number | null;
+    term?: string | null;
+    schedules: {
+      day_of_week: number;
+      start_time: string;
+      end_time: string;
+      classroom?: string | null;
+    }[];
+  }) =>
+    requestJson<CourseAssignment>("/api/academic/courses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  updateCourse: (
+    courseId: number,
+    data: Partial<{ teacher_user_id: number | null; term: string | null; is_active: boolean }>
+  ) =>
+    requestJson<CourseAssignment>(`/api/academic/courses/${courseId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  deleteCourse: (courseId: number) =>
+    requestJson<void>(`/api/academic/courses/${courseId}`, { method: "DELETE" }),
+
+  addCourseSchedule: (
+    courseId: number,
+    data: {
+      day_of_week: number;
+      start_time: string;
+      end_time: string;
+      classroom?: string | null;
+    }
+  ) =>
+    requestJson<ClassSchedule>(`/api/academic/courses/${courseId}/schedules`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  deleteSchedule: (scheduleId: number) =>
+    requestJson<void>(`/api/academic/schedules/${scheduleId}`, { method: "DELETE" }),
+
+  getStudentCourses: (personId: number) =>
+    requestJson<CourseAssignment[]>(`/api/academic/students/${personId}/courses`),
+
+  generateAcademicSessions: (data: {
+    organization_id: number;
+    target_date?: string | null;
+    course_assignment_id?: number | null;
+  }) =>
+    requestJson<GenerateSessionsResponse>("/api/academic/sessions/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+
+  startCourseSession: (
+    courseId: number,
+    data?: { schedule_id?: number | null; session_date?: string | null }
+  ) =>
+    requestJson<AttendanceSession>(`/api/academic/courses/${courseId}/start-session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data ?? {}),
+    }),
+
+  getTeacherAgenda: (params: {
+    organization_id: number;
+    target_date?: string | null;
+    current_time?: string | null;
+    teacher_user_id?: number | null;
+  }) => {
+    const qs = new URLSearchParams({ organization_id: String(params.organization_id) });
+    if (params.target_date) qs.set("target_date", params.target_date);
+    if (params.current_time) qs.set("current_time", params.current_time);
+    if (params.teacher_user_id !== undefined && params.teacher_user_id !== null) {
+      qs.set("teacher_user_id", String(params.teacher_user_id));
+    }
+    return requestJson<TeacherAgendaResponse>(`/api/academic/teacher/agenda?${qs.toString()}`);
+  },
+
+  getAcademicStats: (params: {
+    organization_id: number;
+    date_from?: string | null;
+    date_to?: string | null;
+    career_id?: number | null;
+    group_id?: number | null;
+  }) => {
+    const qs = new URLSearchParams({ organization_id: String(params.organization_id) });
+    if (params.date_from) qs.set("date_from", params.date_from);
+    if (params.date_to) qs.set("date_to", params.date_to);
+    if (params.career_id !== undefined && params.career_id !== null) {
+      qs.set("career_id", String(params.career_id));
+    }
+    if (params.group_id !== undefined && params.group_id !== null) {
+      qs.set("group_id", String(params.group_id));
+    }
+    return requestJson<AcademicStatsResponse>(`/api/academic/stats?${qs.toString()}`);
   },
 };
