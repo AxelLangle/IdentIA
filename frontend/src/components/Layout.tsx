@@ -40,6 +40,7 @@ const ROLE_LABELS: Record<UserRole, string> = {
   superadmin: "Superadmin",
   org_admin: "Admin Org",
   teacher: "Profesor",
+  supervisor: "Supervisor",
   operator: "Operador",
 };
 
@@ -79,7 +80,7 @@ export function Layout({
       id: "enterprise_shifts",
       label: "Turnos y Jornadas",
       icon: Briefcase,
-      visible: isEnterprise && canViewSecurity,
+      visible: isEnterprise && (canViewSecurity || currentUser.role === "supervisor"),
     },
     {
       id: "sessions",
