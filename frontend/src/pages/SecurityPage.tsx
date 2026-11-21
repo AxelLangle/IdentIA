@@ -26,6 +26,14 @@ interface SecurityPageProps {
 
 type SecuritySubTab = "users" | "credentials" | "audit";
 
+const USER_ROLE_LABELS: Record<UserRole, string> = {
+  superadmin: "Superadmin Global",
+  org_admin: "Admin de Organización",
+  supervisor: "Supervisor",
+  teacher: "Profesor",
+  operator: "Operador / Kiosco",
+};
+
 export function SecurityPage({ currentUser, organization }: SecurityPageProps) {
   const [subTab, setSubTab] = useState<SecuritySubTab>("users");
   const [users, setUsers] = useState<AuthUser[]>([]);
@@ -77,6 +85,14 @@ export function SecurityPage({ currentUser, organization }: SecurityPageProps) {
     setRevealedSecret(null);
     void loadSecurityData();
   }, [loadSecurityData]);
+
+  useEffect(() => {
+    setNewRole((prev) => {
+      if (organization.mode === "enterprise" && prev === "teacher") return "supervisor";
+      if (organization.mode === "education" && prev === "supervisor") return "teacher";
+      return prev;
+    });
+  }, [organization.mode]);
 
   async function handleCreateUser(e: FormEvent) {
     e.preventDefault();
@@ -269,8 +285,12 @@ export function SecurityPage({ currentUser, organization }: SecurityPageProps) {
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               >
                 <option value="org_admin">Admin de Organización</option>
+                {organization.mode === "enterprise" ? (
+                  <option value="supervisor">Supervisor</option>
+                ) : (
+                  <option value="teacher">Profesor</option>
+                )}
                 <option value="operator">Operador / Kiosco</option>
-                <option value="teacher">Profesor</option>
                 {currentUser.role === "superadmin" && (
                   <option value="superadmin">Superadmin Global</option>
                 )}
@@ -305,7 +325,7 @@ export function SecurityPage({ currentUser, organization }: SecurityPageProps) {
                       <p className="font-medium">{u.full_name}</p>
                       <p className="text-xs text-slate-400">{u.email}</p>
                     </td>
-                    <td className="py-3 px-3 text-xs">{u.role}</td>
+                    <td className="py-3 px-3 text-xs">{USER_ROLE_LABELS[u.role] ?? u.role}</td>
                     <td className="py-3 px-3">
                       <span
                         className={`px-2 py-0.5 rounded-full text-[11px] font-medium ${
@@ -397,7 +417,7 @@ export function SecurityPage({ currentUser, organization }: SecurityPageProps) {
                   <option value="">Nombre manual (otro subordinado)</option>
                   {orgSubordinates.map((u) => (
                     <option key={u.id} value={u.id}>
-                      {u.full_name} ({u.role})
+                      {u.full_name} ({USER_ROLE_LABELS[u.role] ?? u.role})
                     </option>
                   ))}
                 </select>
