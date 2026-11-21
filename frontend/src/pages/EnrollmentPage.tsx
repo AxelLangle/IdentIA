@@ -16,7 +16,11 @@ import {
 } from "lucide-react";
 import { CameraView, type CameraViewHandle } from "../components/CameraView";
 import { PasswordInput } from "../components/PasswordInput";
-import { comparePeriodsNatural, getPeriodMeta } from "../lib/academicPeriods";
+import {
+  comparePeriodsNatural,
+  formatGroupPeriodLabel,
+  getPeriodMeta,
+} from "../lib/academicPeriods";
 import { api } from "../lib/api";
 import type {
   AuthUser,
@@ -268,7 +272,7 @@ export function EnrollmentPage({
         });
       }
       const bucket = careerMap.get(cKey)!;
-      const pKey = g.semester?.trim() || "Sin periodo";
+      const pKey = formatGroupPeriodLabel(g.semester, g.period_type) ?? "Sin periodo";
       const list = bucket.periods.get(pKey) ?? [];
       list.push(g);
       bucket.periods.set(pKey, list);
@@ -912,7 +916,14 @@ export function EnrollmentPage({
                             {p.external_id} · {p.role}
                             {personGroups.length > 0
                               ? ` · ${personGroups
-                                  .map((g) => `${g.name}${g.semester ? ` (${g.semester})` : ""}`)
+                                  .map(
+                                    (g) =>
+                                      `${g.name}${
+                                        g.semester
+                                          ? ` (${formatGroupPeriodLabel(g.semester, g.period_type)})`
+                                          : ""
+                                      }`
+                                  )
                                   .join(", ")}`
                               : ""}
                           </p>
