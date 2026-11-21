@@ -1,3 +1,4 @@
+/* Hoja de estilos principal con Tailwind CSS v4 y tipografía base del sistema */
 @import "tailwindcss";
 
 @layer base {
