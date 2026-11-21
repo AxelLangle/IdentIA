@@ -1,3 +1,9 @@
+/**
+ * Módulo de Padrón de Personas y Asistente Guiado de Enrolamiento Facial (6 poses).
+ * Permite registrar empleados o alumnos vinculados a departamentos/grupos escolares,
+ * capturar las 6 poses faciales con validación geométrica e iluminación en vivo
+ * (modo manual o auto-captura por estabilidad) y revocar biometría de forma auditable.
+ */
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangle,
@@ -14,541 +20,627 @@ import {
   UserCheck,
   X,
 } from "lucide-react";
-import { CameraView, type CameraViewHandle } from "../components/CameraView";
-import { PasswordInput } from "../components/PasswordInput";
+import { VistaCamara, type ControlVistaCamara } from "../components/CameraView";
+import { EntradaContrasena } from "../components/PasswordInput";
 import {
-  comparePeriodsNatural,
-  formatGroupPeriodLabel,
-  getPeriodMeta,
+  compararPeriodosNatural,
+  formatearEtiquetaPeriodoGrupo,
+  obtenerMetadatosPeriodo,
 } from "../lib/academicPeriods";
-import { api } from "../lib/api";
+import { clienteApi } from "../lib/api";
 import type {
-  AuthUser,
-  CourseAssignment,
-  EnrollFrameResponse,
-  Group,
-  Organization,
-  Person,
-  PersonRole,
-  PoseLabel,
-  WorkShift,
+  AsignacionCurso,
+  EtiquetaPose,
+  Grupo,
+  Organizacion,
+  Persona,
+  RespuestaEnrolarFrame,
+  RolPersona,
+  TurnoLaboral,
+  UsuarioAutenticado,
 } from "../types/api";
 
-interface EnrollmentPageProps {
-  currentUser: AuthUser;
-  organization: Organization;
-  groups: Group[];
-  persons: Person[];
-  onRefreshPersons: () => Promise<void>;
+/** Propiedades recibidas por `PaginaEnrolamiento`. */
+interface PropiedadesPaginaEnrolamiento {
+  /** Usuario autenticado para determinar permisos de alta y eliminación. */
+  usuarioActual: UsuarioAutenticado;
+  /** Organización activa sobre la cual se administra el padrón. */
+  organizacion: Organizacion;
+  /** Lista de grupos escolares o áreas disponibles para asociar. */
+  grupos: Grupo[];
+  /** Personas actualmente cargadas en el padrón de la organización. */
+  personas: Persona[];
+  /** Callback para recargar la lista de personas y contadores tras enrolar o revocar. */
+  alRecargarPersonas: () => Promise<void>;
 }
 
-const POSES: { key: PoseLabel; title: string; shortLabel: string; instruction: string }[] = [
+/** Catálogo ordenado de las 6 poses requeridas para un perfil facial robusto. */
+const POSES_REQUERIDAS: {
+  clave: EtiquetaPose;
+  titulo: string;
+  etiquetaCorta: string;
+  instruccion: string;
+}[] = [
   {
-    key: "frontal",
-    title: "1. Frontal",
-    shortLabel: "Frontal",
-    instruction: "Mira directamente al centro de la cámara con rostro nivelado.",
+    clave: "frontal",
+    titulo: "1. Frontal",
+    etiquetaCorta: "Frontal",
+    instruccion: "Mira directamente al centro de la cámara con rostro nivelado.",
   },
   {
-    key: "left",
-    title: "2. Izquierda",
-    shortLabel: "Izquierda",
-    instruction: "Gira suavemente la cabeza hacia tu izquierda manteniendo los ojos visibles.",
+    clave: "left",
+    titulo: "2. Izquierda",
+    etiquetaCorta: "Izquierda",
+    instruccion: "Gira suavemente la cabeza hacia tu izquierda manteniendo los ojos visibles.",
   },
   {
-    key: "right",
-    title: "3. Derecha",
-    shortLabel: "Derecha",
-    instruction: "Gira suavemente la cabeza hacia tu derecha manteniendo los ojos visibles.",
+    clave: "right",
+    titulo: "3. Derecha",
+    etiquetaCorta: "Derecha",
+    instruccion: "Gira suavemente la cabeza hacia tu derecha manteniendo los ojos visibles.",
   },
   {
-    key: "up",
-    title: "4. Arriba",
-    shortLabel: "Arriba",
-    instruction: "Levanta ligeramente el mentón mirando un poco hacia arriba.",
+    clave: "up",
+    titulo: "4. Arriba",
+    etiquetaCorta: "Arriba",
+    instruccion: "Levanta ligeramente el mentón mirando un poco hacia arriba.",
   },
   {
-    key: "down",
-    title: "5. Abajo",
-    shortLabel: "Abajo",
-    instruction: "Inclina suavemente la cabeza mirando ligeramente hacia abajo.",
+    clave: "down",
+    titulo: "5. Abajo",
+    etiquetaCorta: "Abajo",
+    instruccion: "Inclina suavemente la cabeza mirando ligeramente hacia abajo.",
   },
   {
-    key: "smile",
-    title: "6. Sonrisa",
-    shortLabel: "Sonrisa",
-    instruction: "Mira al frente y sonríe de forma marcada y natural.",
+    clave: "smile",
+    titulo: "6. Sonrisa",
+    etiquetaCorta: "Sonrisa",
+    instruccion: "Mira al frente y sonríe de forma marcada y natural.",
   },
 ];
 
-const TOTAL_POSES = POSES.length;
+/** Número total de poses requeridas por perfil biométrico. */
+const TOTAL_POSES = POSES_REQUERIDAS.length;
 
-export function EnrollmentPage({
-  currentUser,
-  organization,
-  groups,
-  persons,
-  onRefreshPersons,
-}: EnrollmentPageProps) {
-  const cameraRef = useRef<CameraViewHandle | null>(null);
-  const inFlightRef = useRef(false);
-  const pauseUntilRef = useRef(0);
-  const stabilityRef = useRef(0);
-  const previewsRef = useRef<Partial<Record<PoseLabel, string>>>({});
+/**
+ * Renderiza el directorio buscable de personas junto con el asistente interactivo
+ * de captura de 6 poses y el modal de revocación protegida por contraseña.
+ */
+export function PaginaEnrolamiento({
+  usuarioActual,
+  organizacion,
+  grupos,
+  personas,
+  alRecargarPersonas,
+}: PropiedadesPaginaEnrolamiento) {
+  const referenciaCamara = useRef<ControlVistaCamara | null>(null);
+  const peticionEnCursoRef = useRef(false);
+  const pausarHastaRef = useRef(0);
+  const contadorEstabilidadRef = useRef(0);
+  const vistasPreviasRef = useRef<Partial<Record<EtiquetaPose, string>>>({});
 
-  const [search, setSearch] = useState("");
-  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [busqueda, establecerBusqueda] = useState("");
+  const [mostrarFormularioAlta, establecerMostrarFormularioAlta] = useState(false);
 
-  // Formulario alta
-  const [externalId, setExternalId] = useState("");
-  const [fullName, setFullName] = useState("");
-  const [email, setEmail] = useState("");
-  const [role, setRole] = useState<PersonRole>(
-    organization.mode === "education" ? "student" : "employee"
+  // Estado del formulario de alta en el padrón.
+  const [identificadorExterno, establecerIdentificadorExterno] = useState("");
+  const [nombreCompleto, establecerNombreCompleto] = useState("");
+  const [correo, establecerCorreo] = useState("");
+  const [rolPersona, establecerRolPersona] = useState<RolPersona>(
+    organizacion.modo === "education" ? "student" : "employee"
   );
-  const [selectedGroupIds, setSelectedGroupIds] = useState<number[]>([]);
-  const [biometricConsent, setBiometricConsent] = useState(true);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-
-  // Asistente de enrolamiento
-  const [activePersonId, setActivePersonId] = useState<number | null>(null);
-  const [poseIndex, setPoseIndex] = useState(0);
-  const [storeAvatar, setStoreAvatar] = useState(organization.store_avatar_by_default);
-  const [cameraReady, setCameraReady] = useState(false);
-  const [capturing, setCapturing] = useState(false);
-  const [autoCapture, setAutoCapture] = useState(false);
-  const [stabilityCount, setStabilityCount] = useState(0);
-  const [enrollStatus, setEnrollStatus] = useState<EnrollFrameResponse | null>(null);
-  const [enrollError, setEnrollError] = useState<string | null>(null);
-  const [posePreviews, setPosePreviews] = useState<Partial<Record<PoseLabel, string>>>({});
-  const [completedBanner, setCompletedBanner] = useState<string | null>(null);
-
-  // Revocación segura (individual o en lote)
-  const [selectedForRevoke, setSelectedForRevoke] = useState<number[]>([]);
-  const [revokeTargets, setRevokeTargets] = useState<Person[] | null>(null);
-  const [revokeSecret, setRevokeSecret] = useState("");
-  const [revokeReason, setRevokeReason] = useState("");
-  const [revokeError, setRevokeError] = useState<string | null>(null);
-  const [revoking, setRevoking] = useState(false);
-
-  // Materias heredadas y filtros por grupo/carrera/periodo (modo educación) y turnos (empresa)
-  const [courses, setCourses] = useState<CourseAssignment[]>([]);
-  const [workShifts, setWorkShifts] = useState<WorkShift[]>([]);
-  const [selectedWorkShiftId, setSelectedWorkShiftId] = useState<string>("");
-  const [formCareerFilter, setFormCareerFilter] = useState<string>("");
-  const [listGroupFilter, setListGroupFilter] = useState<string>("");
-  const [listShiftFilter, setListShiftFilter] = useState<string>("");
-
-  const canManagePersons = ["superadmin", "org_admin", "supervisor", "operator"].includes(
-    currentUser.role
+  const [idsGruposSeleccionados, establecerIdsGruposSeleccionados] = useState<number[]>(
+    []
   );
-  const canDeletePersons = ["superadmin", "org_admin"].includes(currentUser.role);
+  const [consentimientoBiometrico, establecerConsentimientoBiometrico] = useState(true);
+  const [errorFormulario, establecerErrorFormulario] = useState<string | null>(null);
+  const [creandoPersona, establecerCreandoPersona] = useState(false);
 
-  const activePerson = persons.find((p) => p.id === activePersonId) ?? null;
-  const currentPose = POSES[poseIndex] ?? POSES[0];
+  // Estado del asistente de enrolamiento guiado.
+  const [idPersonaActiva, establecerIdPersonaActiva] = useState<number | null>(null);
+  const [indicePose, establecerIndicePose] = useState(0);
+  const [guardarAvatar, establecerGuardarAvatar] = useState(
+    organizacion.guardar_avatar_por_defecto
+  );
+  const [camaraLista, establecerCamaraLista] = useState(false);
+  const [capturando, establecerCapturando] = useState(false);
+  const [capturaAutomatica, establecerCapturaAutomatica] = useState(false);
+  const [conteoEstabilidad, establecerConteoEstabilidad] = useState(0);
+  const [estadoEnrolamiento, establecerEstadoEnrolamiento] =
+    useState<RespuestaEnrolarFrame | null>(null);
+  const [errorEnrolamiento, establecerErrorEnrolamiento] = useState<string | null>(null);
+  const [vistasPreviasPose, establecerVistasPreviasPose] = useState<
+    Partial<Record<EtiquetaPose, string>>
+  >({});
+  const [bannerCompletado, establecerBannerCompletado] = useState<string | null>(null);
 
-  const revokeAllPreviews = useCallback(() => {
-    Object.values(previewsRef.current).forEach((url) => {
+  // Estado del modal de revocación individual o por lote.
+  const [seleccionadasRevocar, establecerSeleccionadasRevocar] = useState<number[]>([]);
+  const [objetivosRevocar, establecerObjetivosRevocar] = useState<Persona[] | null>(null);
+  const [secretoRevocacion, establecerSecretoRevocacion] = useState("");
+  const [motivoRevocacion, establecerMotivoRevocacion] = useState("");
+  const [errorRevocacion, establecerErrorRevocacion] = useState<string | null>(null);
+  const [revocando, establecerRevocando] = useState(false);
+
+  // Asignaciones académicas heredadas, turnos laborales y filtros auxiliares.
+  const [cursos, establecerCursos] = useState<AsignacionCurso[]>([]);
+  const [turnosLaborales, establecerTurnosLaborales] = useState<TurnoLaboral[]>([]);
+  const [idTurnoSeleccionado, establecerIdTurnoSeleccionado] = useState<string>("");
+  const [filtroCarreraFormulario, establecerFiltroCarreraFormulario] = useState<string>("");
+  const [filtroGrupoLista, establecerFiltroGrupoLista] = useState<string>("");
+  const [filtroTurnoLista, establecerFiltroTurnoLista] = useState<string>("");
+
+  const puedeGestionarPersonas = [
+    "superadmin",
+    "org_admin",
+    "supervisor",
+    "operator",
+  ].includes(usuarioActual.rol);
+  const puedeEliminarPersonas = ["superadmin", "org_admin"].includes(usuarioActual.rol);
+
+  const personaActiva =
+    personas.find((persona) => persona.id === idPersonaActiva) ?? null;
+  const poseActual = POSES_REQUERIDAS[indicePose] ?? POSES_REQUERIDAS[0];
+
+  /** Libera las URL temporales (`blob:`) creadas para previsualizar poses en RAM. */
+  const revocarTodasVistasPrevias = useCallback(() => {
+    Object.values(vistasPreviasRef.current).forEach((url) => {
       if (url) URL.revokeObjectURL(url);
     });
-    previewsRef.current = {};
-    setPosePreviews({});
+    vistasPreviasRef.current = {};
+    establecerVistasPreviasPose({});
   }, []);
 
   useEffect(() => {
     return () => {
-      revokeAllPreviews();
+      revocarTodasVistasPrevias();
     };
-  }, [revokeAllPreviews]);
+  }, [revocarTodasVistasPrevias]);
 
+  // Carga materias asignadas a los grupos en organizaciones educativas.
   useEffect(() => {
-    if (organization.mode !== "education" || currentUser.role === "teacher") {
-      setCourses([]);
+    if (organizacion.modo !== "education" || usuarioActual.rol === "teacher") {
+      establecerCursos([]);
       return;
     }
-    let cancelled = false;
-    api
-      .listCourses(organization.id)
-      .then((list) => {
-        if (!cancelled) setCourses(list);
+    let cancelado = false;
+    clienteApi
+      .listarCursos(organizacion.id)
+      .then((lista) => {
+        if (!cancelado) establecerCursos(lista);
       })
       .catch(() => {
-        if (!cancelled) setCourses([]);
+        if (!cancelado) establecerCursos([]);
       });
     return () => {
-      cancelled = true;
+      cancelado = true;
     };
-  }, [currentUser.role, organization.id, organization.mode]);
+  }, [usuarioActual.rol, organizacion.id, organizacion.modo]);
 
+  // Carga turnos disponibles en organizaciones empresariales.
   useEffect(() => {
-    if (organization.mode !== "enterprise") {
-      setWorkShifts([]);
+    if (organizacion.modo !== "enterprise") {
+      establecerTurnosLaborales([]);
       return;
     }
-    let cancelled = false;
-    api
-      .listWorkShifts(organization.id)
-      .then((list) => {
-        if (!cancelled) setWorkShifts(list);
+    let cancelado = false;
+    clienteApi
+      .listarTurnosLaborales(organizacion.id)
+      .then((lista) => {
+        if (!cancelado) establecerTurnosLaborales(lista);
       })
       .catch(() => {
-        if (!cancelled) setWorkShifts([]);
+        if (!cancelado) establecerTurnosLaborales([]);
       });
     return () => {
-      cancelled = true;
+      cancelado = true;
     };
-  }, [organization.id, organization.mode]);
+  }, [organizacion.id, organizacion.modo]);
 
+  // Reinicia estados locales al cambiar de organización activa.
   useEffect(() => {
-    setRole(organization.mode === "education" ? "student" : "employee");
-    setStoreAvatar(organization.store_avatar_by_default);
-    setActivePersonId(null);
-    setAutoCapture(false);
-    setCompletedBanner(null);
-    setSelectedForRevoke([]);
-    setRevokeTargets(null);
-    setSelectedWorkShiftId("");
-    setFormCareerFilter("");
-    setListGroupFilter("");
-    setListShiftFilter("");
-    revokeAllPreviews();
+    establecerRolPersona(organizacion.modo === "education" ? "student" : "employee");
+    establecerGuardarAvatar(organizacion.guardar_avatar_por_defecto);
+    establecerIdPersonaActiva(null);
+    establecerCapturaAutomatica(false);
+    establecerBannerCompletado(null);
+    establecerSeleccionadasRevocar([]);
+    establecerObjetivosRevocar(null);
+    establecerIdTurnoSeleccionado("");
+    establecerFiltroCarreraFormulario("");
+    establecerFiltroGrupoLista("");
+    establecerFiltroTurnoLista("");
+    revocarTodasVistasPrevias();
   }, [
-    organization.id,
-    organization.mode,
-    organization.store_avatar_by_default,
-    revokeAllPreviews,
+    organizacion.id,
+    organizacion.modo,
+    organizacion.guardar_avatar_por_defecto,
+    revocarTodasVistasPrevias,
   ]);
 
-  const filteredPersons = persons.filter((p) => {
-    if (listGroupFilter && !p.group_ids.includes(Number(listGroupFilter))) {
+  const personasFiltradas = personas.filter((persona) => {
+    if (filtroGrupoLista && !persona.ids_grupos.includes(Number(filtroGrupoLista))) {
       return false;
     }
-    if (organization.mode === "enterprise" && listShiftFilter) {
-      if (listShiftFilter === "__none__" && p.effective_work_shift_id !== null) {
+    if (organizacion.modo === "enterprise" && filtroTurnoLista) {
+      if (
+        filtroTurnoLista === "__none__" &&
+        persona.id_turno_laboral_efectivo !== null
+      ) {
         return false;
       }
       if (
-        listShiftFilter !== "__none__" &&
-        String(p.effective_work_shift_id ?? "") !== listShiftFilter
+        filtroTurnoLista !== "__none__" &&
+        String(persona.id_turno_laboral_efectivo ?? "") !== filtroTurnoLista
       ) {
         return false;
       }
     }
-    const q = search.trim().toLowerCase();
-    if (!q) return true;
-    return p.full_name.toLowerCase().includes(q) || p.external_id.toLowerCase().includes(q);
+    const consulta = busqueda.trim().toLowerCase();
+    if (!consulta) return true;
+    return (
+      persona.nombre_completo.toLowerCase().includes(consulta) ||
+      persona.identificador_externo.toLowerCase().includes(consulta)
+    );
   });
 
-  // Agrupación de grupos académicos por Carrera -> Periodo
-  const careerFilterOptions = Array.from(
+  // Agrupación jerárquica Carrera -> Periodo -> Grupos para el selector escolar.
+  const opcionesFiltroCarrera = Array.from(
     new Map(
-      groups
-        .filter((g) => g.career_id !== null && g.career_name)
-        .map((g) => [String(g.career_id), g.career_name!])
+      grupos
+        .filter((grupo) => grupo.id_carrera !== null && grupo.nombre_carrera)
+        .map((grupo) => [String(grupo.id_carrera), grupo.nombre_carrera!])
     ).entries()
-  ).sort((a, b) => a[1].localeCompare(b[1], "es"));
+  ).sort((primerPar, segundoPar) => primerPar[1].localeCompare(segundoPar[1], "es"));
 
-  const groupedAcademicBuckets = (() => {
-    const filtered = formCareerFilter
-      ? groups.filter((g) =>
-          formCareerFilter === "__none__"
-            ? g.career_id === null
-            : String(g.career_id) === formCareerFilter
+  const cubetasAcademicasAgrupadas = (() => {
+    const gruposFiltrados = filtroCarreraFormulario
+      ? grupos.filter((grupo) =>
+          filtroCarreraFormulario === "__none__"
+            ? grupo.id_carrera === null
+            : String(grupo.id_carrera) === filtroCarreraFormulario
         )
-      : groups;
+      : grupos;
 
-    const careerMap = new Map<
+    const mapaCarreras = new Map<
       string,
-      { careerLabel: string; periodType: string; periods: Map<string, Group[]> }
+      { etiquetaCarrera: string; tipoPeriodo: string; periodos: Map<string, Grupo[]> }
     >();
 
-    for (const g of filtered) {
-      const cKey = g.career_id !== null ? String(g.career_id) : "__none__";
-      const cLabel = g.career_name ?? "Sin carrera asignada";
-      if (!careerMap.has(cKey)) {
-        careerMap.set(cKey, {
-          careerLabel: cLabel,
-          periodType: g.period_type,
-          periods: new Map(),
+    for (const grupo of gruposFiltrados) {
+      const claveCarrera =
+        grupo.id_carrera !== null ? String(grupo.id_carrera) : "__none__";
+      const etiquetaCarrera = grupo.nombre_carrera ?? "Sin carrera asignada";
+      if (!mapaCarreras.has(claveCarrera)) {
+        mapaCarreras.set(claveCarrera, {
+          etiquetaCarrera,
+          tipoPeriodo: grupo.tipo_periodo,
+          periodos: new Map(),
         });
       }
-      const bucket = careerMap.get(cKey)!;
-      const pKey = formatGroupPeriodLabel(g.semester, g.period_type) ?? "Sin periodo";
-      const list = bucket.periods.get(pKey) ?? [];
-      list.push(g);
-      bucket.periods.set(pKey, list);
+      const cubeta = mapaCarreras.get(claveCarrera)!;
+      const clavePeriodo =
+        formatearEtiquetaPeriodoGrupo(grupo.semestre, grupo.tipo_periodo) ??
+        "Sin periodo";
+      const listaPeriodo = cubeta.periodos.get(clavePeriodo) ?? [];
+      listaPeriodo.push(grupo);
+      cubeta.periodos.set(clavePeriodo, listaPeriodo);
     }
 
-    return Array.from(careerMap.entries())
-      .sort(([kA, a], [kB, b]) => {
-        if (kA === "__none__") return 1;
-        if (kB === "__none__") return -1;
-        return a.careerLabel.localeCompare(b.careerLabel, "es");
+    return Array.from(mapaCarreras.entries())
+      .sort(([claveA, cubetaA], [claveB, cubetaB]) => {
+        if (claveA === "__none__") return 1;
+        if (claveB === "__none__") return -1;
+        return cubetaA.etiquetaCarrera.localeCompare(cubetaB.etiquetaCarrera, "es");
       })
-      .map(([careerKey, bucket]) => ({
-        careerKey,
-        careerLabel: bucket.careerLabel,
-        periodMeta: getPeriodMeta(bucket.periodType),
-        periods: Array.from(bucket.periods.entries())
-          .sort(([pA], [pB]) => {
-            if (pA === "Sin periodo") return 1;
-            if (pB === "Sin periodo") return -1;
-            return comparePeriodsNatural(pA, pB);
+      .map(([claveCarrera, cubeta]) => ({
+        claveCarrera,
+        etiquetaCarrera: cubeta.etiquetaCarrera,
+        metadatosPeriodo: obtenerMetadatosPeriodo(cubeta.tipoPeriodo),
+        periodos: Array.from(cubeta.periodos.entries())
+          .sort(([periodoA], [periodoB]) => {
+            if (periodoA === "Sin periodo") return 1;
+            if (periodoB === "Sin periodo") return -1;
+            return compararPeriodosNatural(periodoA, periodoB);
           })
-          .map(([periodLabel, periodGroups]) => ({
-            periodLabel,
-            groups: [...periodGroups].sort((x, y) =>
-              x.name.localeCompare(y.name, "es", { numeric: true })
+          .map(([etiquetaPeriodo, gruposPeriodo]) => ({
+            etiquetaPeriodo,
+            grupos: [...gruposPeriodo].sort((grupoA, grupoB) =>
+              grupoA.nombre.localeCompare(grupoB.nombre, "es", { numeric: true })
             ),
           })),
       }));
   })();
 
-  function startEnrollmentFor(person: Person) {
-    revokeAllPreviews();
-    stabilityRef.current = 0;
-    setStabilityCount(0);
-    setCompletedBanner(null);
-    setActivePersonId(person.id);
-    setAutoCapture(false);
-    setEnrollStatus(null);
-    setEnrollError(null);
-    const nextMissing = POSES.findIndex((pose) => !person.poses_completed.includes(pose.key));
-    setPoseIndex(nextMissing === -1 ? 0 : nextMissing);
+  /** Inicia el asistente de enrolamiento posicionándolo en la primera pose faltante. */
+  function iniciarEnrolamientoPara(persona: Persona) {
+    revocarTodasVistasPrevias();
+    contadorEstabilidadRef.current = 0;
+    establecerConteoEstabilidad(0);
+    establecerBannerCompletado(null);
+    establecerIdPersonaActiva(persona.id);
+    establecerCapturaAutomatica(false);
+    establecerEstadoEnrolamiento(null);
+    establecerErrorEnrolamiento(null);
+    const siguienteFaltante = POSES_REQUERIDAS.findIndex(
+      (pose) => !persona.poses_completadas.includes(pose.clave)
+    );
+    establecerIndicePose(siguienteFaltante === -1 ? 0 : siguienteFaltante);
   }
 
-  function finishEnrollment() {
-    if (!activePerson) return;
-    const personName = activePerson.full_name;
-    const count = activePerson.poses_completed.length;
-    setAutoCapture(false);
-    setActivePersonId(null);
-    setEnrollStatus(null);
-    setEnrollError(null);
-    stabilityRef.current = 0;
-    setStabilityCount(0);
-    revokeAllPreviews();
-    setCompletedBanner(
-      `Enrolamiento de ${personName} finalizado (${count}/${TOTAL_POSES} poses guardadas en memoria vectorial).`
+  /** Cierra el asistente tras completar las poses y muestra confirmación en pantalla. */
+  function finalizarEnrolamiento() {
+    if (!personaActiva) return;
+    const nombrePersona = personaActiva.nombre_completo;
+    const cantidad = personaActiva.poses_completadas.length;
+    establecerCapturaAutomatica(false);
+    establecerIdPersonaActiva(null);
+    establecerEstadoEnrolamiento(null);
+    establecerErrorEnrolamiento(null);
+    contadorEstabilidadRef.current = 0;
+    establecerConteoEstabilidad(0);
+    revocarTodasVistasPrevias();
+    establecerBannerCompletado(
+      `Enrolamiento de ${nombrePersona} finalizado (${cantidad}/${TOTAL_POSES} poses guardadas en memoria vectorial).`
     );
   }
 
-  async function handleCreatePerson(e: FormEvent) {
-    e.preventDefault();
-    setFormError(null);
-    setCreating(true);
+  /** Registra una persona en el padrón y abre el enrolamiento si otorgó consentimiento. */
+  async function manejarCrearPersona(evento: FormEvent) {
+    evento.preventDefault();
+    establecerErrorFormulario(null);
+    establecerCreandoPersona(true);
     try {
-      const created = await api.createPerson({
-        organization_id: organization.id,
-        external_id: externalId.trim(),
-        full_name: fullName.trim(),
-        email: email.trim() || null,
-        role,
-        biometric_consent: biometricConsent,
-        group_ids: selectedGroupIds,
-        work_shift_id:
-          organization.mode === "enterprise" && selectedWorkShiftId
-            ? Number(selectedWorkShiftId)
+      const personaCreada = await clienteApi.crearPersona({
+        id_organizacion: organizacion.id,
+        identificador_externo: identificadorExterno.trim(),
+        nombre_completo: nombreCompleto.trim(),
+        correo: correo.trim() || null,
+        rol: rolPersona,
+        consentimiento_biometrico: consentimientoBiometrico,
+        ids_grupos: idsGruposSeleccionados,
+        id_turno_laboral:
+          organizacion.modo === "enterprise" && idTurnoSeleccionado
+            ? Number(idTurnoSeleccionado)
             : null,
       });
-      setExternalId("");
-      setFullName("");
-      setEmail("");
-      setSelectedGroupIds([]);
-      setSelectedWorkShiftId("");
-      setShowCreateForm(false);
-      await onRefreshPersons();
-      if (created.biometric_consent) {
-        startEnrollmentFor(created);
+      establecerIdentificadorExterno("");
+      establecerNombreCompleto("");
+      establecerCorreo("");
+      establecerIdsGruposSeleccionados([]);
+      establecerIdTurnoSeleccionado("");
+      establecerMostrarFormularioAlta(false);
+      await alRecargarPersonas();
+      if (personaCreada.consentimiento_biometrico) {
+        iniciarEnrolamientoPara(personaCreada);
       }
-    } catch (err) {
-      setFormError(err instanceof Error ? err.message : "No se pudo crear el registro.");
+    } catch (errorAlta) {
+      establecerErrorFormulario(
+        errorAlta instanceof Error ? errorAlta.message : "No se pudo crear el registro."
+      );
     } finally {
-      setCreating(false);
+      establecerCreandoPersona(false);
     }
   }
 
-  const saveMemoryPreview = useCallback((poseKey: PoseLabel, blob: Blob) => {
-    const prevUrl = previewsRef.current[poseKey];
-    if (prevUrl) URL.revokeObjectURL(prevUrl);
-    const nextUrl = URL.createObjectURL(blob);
-    previewsRef.current = { ...previewsRef.current, [poseKey]: nextUrl };
-    setPosePreviews({ ...previewsRef.current });
-  }, []);
+  /** Guarda en memoria del navegador una vista previa temporal de la pose capturada. */
+  const guardarVistaPreviaMemoria = useCallback(
+    (clavePose: EtiquetaPose, archivoBlob: Blob) => {
+      const urlPrevia = vistasPreviasRef.current[clavePose];
+      if (urlPrevia) URL.revokeObjectURL(urlPrevia);
+      const nuevaUrl = URL.createObjectURL(archivoBlob);
+      vistasPreviasRef.current = { ...vistasPreviasRef.current, [clavePose]: nuevaUrl };
+      establecerVistasPreviasPose({ ...vistasPreviasRef.current });
+    },
+    []
+  );
 
-  const submitCapture = useCallback(
-    async (poseKey: PoseLabel, dryRun: boolean) => {
-      if (!activePerson || !cameraReady || inFlightRef.current) return;
-      const cam = cameraRef.current;
-      if (!cam) return;
+  /**
+   * Envía un fotograma para validación geométrica (`soloValidacion=true`) o registro
+   * definitivo del embedding facial. En modo automático confirma al reunir 2 frames estables.
+   */
+  const enviarCapturaPose = useCallback(
+    async (clavePose: EtiquetaPose, soloValidacion: boolean) => {
+      if (!personaActiva || !camaraLista || peticionEnCursoRef.current) return;
+      const camara = referenciaCamara.current;
+      if (!camara) return;
 
-      inFlightRef.current = true;
-      if (!dryRun) setCapturing(true);
-      setEnrollError(null);
+      peticionEnCursoRef.current = true;
+      if (!soloValidacion) establecerCapturando(true);
+      establecerErrorEnrolamiento(null);
       try {
-        const blob = await cam.captureBlob();
-        if (!blob) return;
+        const archivoBlob = await camara.capturarBlob();
+        if (!archivoBlob) return;
 
-        const res = await api.enrollFrame(
-          activePerson.id,
-          blob,
-          poseKey,
-          storeAvatar,
-          dryRun
+        const respuesta = await clienteApi.enrolarFrame(
+          personaActiva.id,
+          archivoBlob,
+          clavePose,
+          guardarAvatar,
+          soloValidacion
         );
-        setEnrollStatus(res);
+        establecerEstadoEnrolamiento(respuesta);
 
-        if (dryRun) {
-          if (res.pose_valid) {
-            stabilityRef.current += 1;
-            setStabilityCount(stabilityRef.current);
-            if (stabilityRef.current >= 2) {
-              stabilityRef.current = 0;
-              setStabilityCount(0);
-              setCapturing(true);
-              const commitRes = await api.enrollFrame(
-                activePerson.id,
-                blob,
-                poseKey,
-                storeAvatar,
+        if (soloValidacion) {
+          if (respuesta.pose_valida) {
+            contadorEstabilidadRef.current += 1;
+            establecerConteoEstabilidad(contadorEstabilidadRef.current);
+            if (contadorEstabilidadRef.current >= 2) {
+              contadorEstabilidadRef.current = 0;
+              establecerConteoEstabilidad(0);
+              establecerCapturando(true);
+              const respuestaGuardado = await clienteApi.enrolarFrame(
+                personaActiva.id,
+                archivoBlob,
+                clavePose,
+                guardarAvatar,
                 false
               );
-              setEnrollStatus(commitRes);
-              if (commitRes.accepted) {
-                saveMemoryPreview(poseKey, blob);
-                pauseUntilRef.current = Date.now() + 1100;
-                await onRefreshPersons();
-                const nextMissingIdx = POSES.findIndex(
-                  (p) => !commitRes.poses_completed.includes(p.key)
+              establecerEstadoEnrolamiento(respuestaGuardado);
+              if (respuestaGuardado.aceptado) {
+                guardarVistaPreviaMemoria(clavePose, archivoBlob);
+                pausarHastaRef.current = Date.now() + 1100;
+                await alRecargarPersonas();
+                const siguienteIndice = POSES_REQUERIDAS.findIndex(
+                  (pose) => !respuestaGuardado.poses_completadas.includes(pose.clave)
                 );
-                if (nextMissingIdx !== -1) {
-                  setPoseIndex(nextMissingIdx);
+                if (siguienteIndice !== -1) {
+                  establecerIndicePose(siguienteIndice);
                 } else {
-                  setAutoCapture(false);
+                  establecerCapturaAutomatica(false);
                 }
               }
             }
           } else {
-            stabilityRef.current = 0;
-            setStabilityCount(0);
+            contadorEstabilidadRef.current = 0;
+            establecerConteoEstabilidad(0);
           }
           return;
         }
 
-        if (res.accepted) {
-          saveMemoryPreview(poseKey, blob);
-          pauseUntilRef.current = Date.now() + 900;
-          await onRefreshPersons();
-          const nextMissingIdx = POSES.findIndex(
-            (p) => !res.poses_completed.includes(p.key)
+        if (respuesta.aceptado) {
+          guardarVistaPreviaMemoria(clavePose, archivoBlob);
+          pausarHastaRef.current = Date.now() + 900;
+          await alRecargarPersonas();
+          const siguienteIndice = POSES_REQUERIDAS.findIndex(
+            (pose) => !respuesta.poses_completadas.includes(pose.clave)
           );
-          if (nextMissingIdx !== -1) {
-            setPoseIndex(nextMissingIdx);
+          if (siguienteIndice !== -1) {
+            establecerIndicePose(siguienteIndice);
           } else {
-            setAutoCapture(false);
+            establecerCapturaAutomatica(false);
           }
         }
-      } catch (err) {
-        setEnrollError(err instanceof Error ? err.message : "Error al enviar captura.");
-        setAutoCapture(false);
-        stabilityRef.current = 0;
-        setStabilityCount(0);
+      } catch (errorCaptura) {
+        establecerErrorEnrolamiento(
+          errorCaptura instanceof Error
+            ? errorCaptura.message
+            : "Error al enviar captura."
+        );
+        establecerCapturaAutomatica(false);
+        contadorEstabilidadRef.current = 0;
+        establecerConteoEstabilidad(0);
       } finally {
-        inFlightRef.current = false;
-        setCapturing(false);
+        peticionEnCursoRef.current = false;
+        establecerCapturando(false);
       }
     },
-    [activePerson, cameraReady, onRefreshPersons, saveMemoryPreview, storeAvatar]
+    [
+      personaActiva,
+      camaraLista,
+      alRecargarPersonas,
+      guardarVistaPreviaMemoria,
+      guardarAvatar,
+    ]
   );
 
+  // Sondeo periódico automático para modo de auto-captura guiada.
   useEffect(() => {
-    if (!autoCapture || !activePerson || !cameraReady) return;
-    const timer = window.setInterval(() => {
-      if (Date.now() < pauseUntilRef.current) return;
-      void submitCapture(currentPose.key, true);
+    if (!capturaAutomatica || !personaActiva || !camaraLista) return;
+    const temporizador = window.setInterval(() => {
+      if (Date.now() < pausarHastaRef.current) return;
+      void enviarCapturaPose(poseActual.clave, true);
     }, 450);
-    return () => window.clearInterval(timer);
-  }, [activePerson, autoCapture, cameraReady, currentPose.key, submitCapture]);
+    return () => window.clearInterval(temporizador);
+  }, [personaActiva, capturaAutomatica, camaraLista, poseActual.clave, enviarCapturaPose]);
 
-  function openRevokeModal(targets: Person[]) {
-    setRevokeTargets(targets);
-    setRevokeSecret("");
-    setRevokeReason("");
-    setRevokeError(null);
+  /** Abre el modal de confirmación con contraseña para revocar vectores biométricos. */
+  function abrirModalRevocacion(objetivos: Persona[]) {
+    establecerObjetivosRevocar(objetivos);
+    establecerSecretoRevocacion("");
+    establecerMotivoRevocacion("");
+    establecerErrorRevocacion(null);
   }
 
-  async function handleConfirmRevoke(e: FormEvent) {
-    e.preventDefault();
-    if (!revokeTargets || revokeTargets.length === 0) return;
-    setRevoking(true);
-    setRevokeError(null);
+  /** Ejecuta la revocación biométrica auditable validada con secreto de admin o delegado. */
+  async function manejarConfirmarRevocacion(evento: FormEvent) {
+    evento.preventDefault();
+    if (!objetivosRevocar || objetivosRevocar.length === 0) return;
+    establecerRevocando(true);
+    establecerErrorRevocacion(null);
     try {
-      const targetIds = revokeTargets.map((p) => p.id);
-      const res = await api.revokeBiometricsBatch({
-        person_ids: targetIds,
-        authorization_secret: revokeSecret,
-        reason: revokeReason.trim() || undefined,
+      const idsObjetivo = objetivosRevocar.map((persona) => persona.id);
+      const respuesta = await clienteApi.revocarBiometriaLote({
+        ids_personas: idsObjetivo,
+        secreto_autorizacion: secretoRevocacion,
+        motivo: motivoRevocacion.trim() || undefined,
       });
-      if (activePersonId !== null && targetIds.includes(activePersonId)) {
-        setEnrollStatus(null);
-        revokeAllPreviews();
+      if (idPersonaActiva !== null && idsObjetivo.includes(idPersonaActiva)) {
+        establecerEstadoEnrolamiento(null);
+        revocarTodasVistasPrevias();
       }
-      setSelectedForRevoke((prev) => prev.filter((id) => !targetIds.includes(id)));
-      setRevokeTargets(null);
-      await onRefreshPersons();
-      setCompletedBanner(
-        `Biometría revocada para ${res.revoked_persons_count} persona(s) (${res.deleted_embeddings} vectores eliminados). Autorizado por: ${res.authorized_by_name ?? "Administrador"}.`
+      establecerSeleccionadasRevocar((previas) =>
+        previas.filter((id) => !idsObjetivo.includes(id))
       );
-    } catch (err) {
-      setRevokeError(err instanceof Error ? err.message : "No se pudo autorizar la revocación.");
+      establecerObjetivosRevocar(null);
+      await alRecargarPersonas();
+      establecerBannerCompletado(
+        `Biometría revocada para ${respuesta.cantidad_personas_revocadas} persona(s) (${respuesta.vectores_eliminados} vectores eliminados). Autorizado por: ${
+          respuesta.nombre_autorizador ?? "Administrador"
+        }.`
+      );
+    } catch (errorAutorizacion) {
+      establecerErrorRevocacion(
+        errorAutorizacion instanceof Error
+          ? errorAutorizacion.message
+          : "No se pudo autorizar la revocación."
+      );
     } finally {
-      setRevoking(false);
+      establecerRevocando(false);
     }
   }
 
-  function toggleRevokeSelection(personId: number) {
-    setSelectedForRevoke((prev) =>
-      prev.includes(personId) ? prev.filter((id) => id !== personId) : [...prev, personId]
+  /** Marca o desmarca una persona dentro de la selección múltiple de revocación. */
+  function alternarSeleccionRevocar(idPersona: number) {
+    establecerSeleccionadasRevocar((previas) =>
+      previas.includes(idPersona)
+        ? previas.filter((id) => id !== idPersona)
+        : [...previas, idPersona]
     );
   }
 
-  async function handleDeletePerson(person: Person) {
-    if (!window.confirm(`¿Eliminar permanentemente a ${person.full_name}?`)) return;
-    await api.deletePerson(person.id);
-    if (activePersonId === person.id) {
-      setActivePersonId(null);
-      setAutoCapture(false);
-      revokeAllPreviews();
+  /** Elimina permanentemente a una persona del padrón organizacional. */
+  async function manejarEliminarPersona(persona: Persona) {
+    if (!window.confirm(`¿Eliminar permanentemente a ${persona.nombre_completo}?`)) return;
+    await clienteApi.eliminarPersona(persona.id);
+    if (idPersonaActiva === persona.id) {
+      establecerIdPersonaActiva(null);
+      establecerCapturaAutomatica(false);
+      revocarTodasVistasPrevias();
     }
-    await onRefreshPersons();
+    await alRecargarPersonas();
   }
 
-  function toggleGroupSelection(gid: number) {
-    setSelectedGroupIds((prev) =>
-      prev.includes(gid) ? prev.filter((id) => id !== gid) : [...prev, gid]
+  /** Agrega o quita un grupo en el formulario de alta de persona. */
+  function alternarSeleccionGrupo(idGrupo: number) {
+    establecerIdsGruposSeleccionados((previos) =>
+      previos.includes(idGrupo)
+        ? previos.filter((id) => id !== idGrupo)
+        : [...previos, idGrupo]
     );
   }
 
-  const completedCount = activePerson?.poses_completed.length ?? 0;
-  const allPosesDone = completedCount >= TOTAL_POSES;
-  const progressPct = Math.round((completedCount / TOTAL_POSES) * 100);
+  const cantidadCompletadas = personaActiva?.poses_completadas.length ?? 0;
+  const todasPosesCompletas = cantidadCompletadas >= TOTAL_POSES;
+  const porcentajeProgreso = Math.round((cantidadCompletadas / TOTAL_POSES) * 100);
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Personas y Registro Biométrico</h2>
+          <h2 className="text-2xl font-bold tracking-tight">
+            Personas y Registro Biométrico
+          </h2>
           <p className="text-sm text-slate-400">
-            Asistente guiado de {TOTAL_POSES} poses con validación geométrica e iluminación (sin
-            guardar fotos crudas)
+            Asistente guiado de {TOTAL_POSES} poses con validación geométrica e iluminación
+            (sin guardar fotos crudas)
           </p>
         </div>
 
-        {canManagePersons && (
+        {puedeGestionarPersonas && (
           <button
             type="button"
-            onClick={() => setShowCreateForm((v) => !v)}
+            onClick={() => establecerMostrarFormularioAlta((visible) => !visible)}
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
           >
             <Plus className="w-4 h-4" />
@@ -557,15 +649,15 @@ export function EnrollmentPage({
         )}
       </div>
 
-      {completedBanner && (
+      {bannerCompletado && (
         <div className="rounded-2xl bg-emerald-500/15 border border-emerald-500/40 px-4 py-3 flex items-center justify-between gap-3 text-sm text-emerald-200">
           <div className="flex items-center gap-2.5">
             <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-            <span>{completedBanner}</span>
+            <span>{bannerCompletado}</span>
           </div>
           <button
             type="button"
-            onClick={() => setCompletedBanner(null)}
+            onClick={() => establecerBannerCompletado(null)}
             className="text-xs text-emerald-300 hover:underline shrink-0"
           >
             Ocultar
@@ -573,22 +665,24 @@ export function EnrollmentPage({
         </div>
       )}
 
-      {showCreateForm && (
+      {mostrarFormularioAlta && (
         <form
-          onSubmit={handleCreatePerson}
+          onSubmit={manejarCrearPersona}
           className="bg-slate-900 border border-indigo-500/40 rounded-2xl p-5 space-y-4"
         >
           <h3 className="font-semibold text-base">Registrar Persona</h3>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div>
               <label className="block text-xs text-slate-400 mb-1">
-                {organization.mode === "education" ? "Matrícula / ID" : "Núm. Empleado / ID"}
+                {organizacion.modo === "education"
+                  ? "Matrícula / ID"
+                  : "Núm. Empleado / ID"}
               </label>
               <input
                 type="text"
                 required
-                value={externalId}
-                onChange={(e) => setExternalId(e.target.value)}
+                value={identificadorExterno}
+                onChange={(evento) => establecerIdentificadorExterno(evento.target.value)}
                 placeholder="Ej. A-2025-01"
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
@@ -599,19 +693,21 @@ export function EnrollmentPage({
               <input
                 type="text"
                 required
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
+                value={nombreCompleto}
+                onChange={(evento) => establecerNombreCompleto(evento.target.value)}
                 placeholder="Nombre y apellidos"
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
             </div>
 
             <div>
-              <label className="block text-xs text-slate-400 mb-1">Correo (opcional)</label>
+              <label className="block text-xs text-slate-400 mb-1">
+                Correo (opcional)
+              </label>
               <input
                 type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                value={correo}
+                onChange={(evento) => establecerCorreo(evento.target.value)}
                 placeholder="correo@ejemplo.com"
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
@@ -620,8 +716,10 @@ export function EnrollmentPage({
             <div>
               <label className="block text-xs text-slate-400 mb-1">Rol</label>
               <select
-                value={role}
-                onChange={(e) => setRole(e.target.value as PersonRole)}
+                value={rolPersona}
+                onChange={(evento) =>
+                  establecerRolPersona(evento.target.value as RolPersona)
+                }
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               >
                 <option value="employee">Empleado</option>
@@ -632,71 +730,79 @@ export function EnrollmentPage({
             </div>
           </div>
 
-          {groups.length > 0 && (
+          {grupos.length > 0 && (
             <div className="space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-xs text-slate-400">
-                  {organization.mode === "education"
+                  {organizacion.modo === "education"
                     ? "Asignar a grupo académico (ordenado por carrera y periodo; heredará sus materias)"
                     : "Asignar a grupos / departamentos"}
                 </p>
-                {organization.mode === "education" && careerFilterOptions.length > 1 && (
-                  <select
-                    value={formCareerFilter}
-                    onChange={(e) => setFormCareerFilter(e.target.value)}
-                    className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
-                  >
-                    <option value="">Todas las carreras</option>
-                    {careerFilterOptions.map(([id, name]) => (
-                      <option key={id} value={id}>
-                        {name}
-                      </option>
-                    ))}
-                    {groups.some((g) => g.career_id === null) && (
-                      <option value="__none__">Sin carrera asignada</option>
-                    )}
-                  </select>
-                )}
+                {organizacion.modo === "education" &&
+                  opcionesFiltroCarrera.length > 1 && (
+                    <select
+                      value={filtroCarreraFormulario}
+                      onChange={(evento) =>
+                        establecerFiltroCarreraFormulario(evento.target.value)
+                      }
+                      className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
+                    >
+                      <option value="">Todas las carreras</option>
+                      {opcionesFiltroCarrera.map(([idCarrera, nombreCarrera]) => (
+                        <option key={idCarrera} value={idCarrera}>
+                          {nombreCarrera}
+                        </option>
+                      ))}
+                      {grupos.some((grupo) => grupo.id_carrera === null) && (
+                        <option value="__none__">Sin carrera asignada</option>
+                      )}
+                    </select>
+                  )}
               </div>
 
-              {organization.mode === "education" ? (
+              {organizacion.modo === "education" ? (
                 <div className="space-y-3 max-h-60 overflow-y-auto pr-1">
-                  {groupedAcademicBuckets.map((careerBucket) => (
+                  {cubetasAcademicasAgrupadas.map((cubetaCarrera) => (
                     <div
-                      key={careerBucket.careerKey}
+                      key={cubetaCarrera.claveCarrera}
                       className="rounded-xl bg-slate-800/40 border border-slate-800 p-3 space-y-2"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <p className="text-xs font-semibold text-indigo-300">
-                          {careerBucket.careerLabel}
+                          {cubetaCarrera.etiquetaCarrera}
                         </p>
                         <span className="text-[10px] text-slate-400">
-                          Sistema {careerBucket.periodMeta.label.toLowerCase()}
+                          Sistema {cubetaCarrera.metadatosPeriodo.etiqueta.toLowerCase()}
                         </span>
                       </div>
 
                       <div className="space-y-2">
-                        {careerBucket.periods.map((periodBucket) => (
-                          <div key={periodBucket.periodLabel} className="space-y-1">
+                        {cubetaCarrera.periodos.map((cubetaPeriodo) => (
+                          <div
+                            key={cubetaPeriodo.etiquetaPeriodo}
+                            className="space-y-1"
+                          >
                             <p className="text-[11px] font-medium text-slate-400">
-                              {periodBucket.periodLabel}
+                              {cubetaPeriodo.etiquetaPeriodo}
                             </p>
                             <div className="flex flex-wrap gap-1.5">
-                              {periodBucket.groups.map((g) => {
-                                const selected = selectedGroupIds.includes(g.id);
+                              {cubetaPeriodo.grupos.map((grupo) => {
+                                const seleccionado = idsGruposSeleccionados.includes(
+                                  grupo.id
+                                );
                                 return (
                                   <button
-                                    key={g.id}
+                                    key={grupo.id}
                                     type="button"
-                                    onClick={() => toggleGroupSelection(g.id)}
+                                    onClick={() => alternarSeleccionGrupo(grupo.id)}
                                     className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                                      selected
+                                      seleccionado
                                         ? "bg-indigo-600 border-indigo-500 text-white"
                                         : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
                                     }`}
                                   >
-                                    {g.name}
-                                    {g.default_classroom ? ` · ${g.default_classroom}` : ""}
+                                    {grupo.nombre}
+                                    {grupo.aula_defecto ? ` · ${grupo.aula_defecto}` : ""}
                                   </button>
                                 );
                               })}
@@ -709,21 +815,23 @@ export function EnrollmentPage({
                 </div>
               ) : (
                 <div className="flex flex-wrap gap-2">
-                  {groups.map((g) => {
-                    const selected = selectedGroupIds.includes(g.id);
+                  {grupos.map((grupo) => {
+                    const seleccionado = idsGruposSeleccionados.includes(grupo.id);
                     return (
                       <button
-                        key={g.id}
+                        key={grupo.id}
                         type="button"
-                        onClick={() => toggleGroupSelection(g.id)}
+                        onClick={() => alternarSeleccionGrupo(grupo.id)}
                         className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                          selected
+                          seleccionado
                             ? "bg-indigo-600 border-indigo-500 text-white"
                             : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
                         }`}
                       >
-                        {g.name}
-                        {g.default_work_shift_code ? ` · ${g.default_work_shift_code}` : ""}
+                        {grupo.nombre}
+                        {grupo.codigo_turno_laboral_defecto
+                          ? ` · ${grupo.codigo_turno_laboral_defecto}`
+                          : ""}
                       </button>
                     );
                   })}
@@ -732,98 +840,101 @@ export function EnrollmentPage({
             </div>
           )}
 
-          {organization.mode === "enterprise" && workShifts.some((s) => s.is_active) && (
-            <div className="sm:max-w-sm">
-              <label className="block text-xs text-slate-400 mb-1">
-                Turno laboral directo (opcional)
-              </label>
-              <select
-                value={selectedWorkShiftId}
-                onChange={(e) => setSelectedWorkShiftId(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-              >
-                <option value="">Heredar de departamento / Sin turno</option>
-                {workShifts
-                  .filter((sh) => sh.is_active)
-                  .map((sh) => (
-                    <option key={sh.id} value={sh.id}>
-                      {sh.name} ({sh.start_time}–{sh.end_time}
-                      {sh.crosses_midnight ? " 🌙" : ""})
-                    </option>
-                  ))}
-              </select>
-            </div>
-          )}
+          {organizacion.modo === "enterprise" &&
+            turnosLaborales.some((turno) => turno.esta_activo) && (
+              <div className="sm:max-w-sm">
+                <label className="block text-xs text-slate-400 mb-1">
+                  Turno laboral directo (opcional)
+                </label>
+                <select
+                  value={idTurnoSeleccionado}
+                  onChange={(evento) => establecerIdTurnoSeleccionado(evento.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                >
+                  <option value="">Heredar de departamento / Sin turno</option>
+                  {turnosLaborales
+                    .filter((turno) => turno.esta_activo)
+                    .map((turno) => (
+                      <option key={turno.id} value={turno.id}>
+                        {turno.nombre} ({turno.hora_inicio}–{turno.hora_fin}
+                        {turno.cruza_medianoche ? " 🌙" : ""})
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
 
           <label className="flex items-start gap-2.5 text-xs text-slate-300 bg-slate-800/60 border border-slate-700 rounded-xl p-3 cursor-pointer">
             <input
               type="checkbox"
-              checked={biometricConsent}
-              onChange={(e) => setBiometricConsent(e.target.checked)}
+              checked={consentimientoBiometrico}
+              onChange={(evento) =>
+                establecerConsentimientoBiometrico(evento.target.checked)
+              }
               className="mt-0.5 rounded border-slate-600 bg-slate-800 text-indigo-600"
             />
             <span>
-              <strong>Consentimiento biométrico informado:</strong> La persona autoriza generar sus
-              vectores matemáticos faciales. Las capturas de cámara se procesan en memoria RAM y no
-              se almacenan fotografías crudas en el servidor.
+              <strong>Consentimiento biométrico informado:</strong> La persona autoriza
+              generar sus vectores matemáticos faciales. Las capturas de cámara se
+              procesan en memoria RAM y no se almacenan fotografías crudas en el servidor.
             </span>
           </label>
 
-          {formError && (
+          {errorFormulario && (
             <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
-              {formError}
+              {errorFormulario}
             </p>
           )}
 
           <div className="flex justify-end gap-2">
             <button
               type="button"
-              onClick={() => setShowCreateForm(false)}
+              onClick={() => establecerMostrarFormularioAlta(false)}
               className="px-4 py-2 rounded-lg text-sm bg-slate-800 hover:bg-slate-700"
             >
               Cancelar
             </button>
             <button
               type="submit"
-              disabled={creating}
+              disabled={creandoPersona}
               className="px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50"
             >
-              {creating ? "Guardando..." : "Guardar y continuar"}
+              {creandoPersona ? "Guardando..." : "Guardar y continuar"}
             </button>
           </div>
         </form>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Lista del padrón */}
+        {/* Lista buscable del padrón organizacional */}
         <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           <div className="flex flex-col sm:flex-row gap-2">
             <div className="relative flex-1">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                value={busqueda}
+                onChange={(evento) => establecerBusqueda(evento.target.value)}
                 placeholder="Buscar por nombre o matrícula/ID..."
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
             </div>
-            {organization.mode === "education" && groups.length > 0 && (
+            {organizacion.modo === "education" && grupos.length > 0 && (
               <select
-                value={listGroupFilter}
-                onChange={(e) => setListGroupFilter(e.target.value)}
+                value={filtroGrupoLista}
+                onChange={(evento) => establecerFiltroGrupoLista(evento.target.value)}
                 className="sm:w-48 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
               >
                 <option value="">Todos los grupos</option>
-                {groupedAcademicBuckets.map((cb) =>
-                  cb.periods.map((pb) => (
+                {cubetasAcademicasAgrupadas.map((cubetaCarrera) =>
+                  cubetaCarrera.periodos.map((cubetaPeriodo) => (
                     <optgroup
-                      key={`${cb.careerKey}-${pb.periodLabel}`}
-                      label={`${cb.careerLabel} — ${pb.periodLabel}`}
+                      key={`${cubetaCarrera.claveCarrera}-${cubetaPeriodo.etiquetaPeriodo}`}
+                      label={`${cubetaCarrera.etiquetaCarrera} — ${cubetaPeriodo.etiquetaPeriodo}`}
                     >
-                      {pb.groups.map((g) => (
-                        <option key={g.id} value={g.id}>
-                          {g.name}
+                      {cubetaPeriodo.grupos.map((grupo) => (
+                        <option key={grupo.id} value={grupo.id}>
+                          {grupo.nombre}
                         </option>
                       ))}
                     </optgroup>
@@ -831,33 +942,35 @@ export function EnrollmentPage({
                 )}
               </select>
             )}
-            {organization.mode === "enterprise" && workShifts.length > 0 && (
+            {organizacion.modo === "enterprise" && turnosLaborales.length > 0 && (
               <select
-                value={listShiftFilter}
-                onChange={(e) => setListShiftFilter(e.target.value)}
+                value={filtroTurnoLista}
+                onChange={(evento) => establecerFiltroTurnoLista(evento.target.value)}
                 className="sm:w-48 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
               >
                 <option value="">Todos los turnos</option>
                 <option value="__none__">Sin turno asignado</option>
-                {workShifts.map((sh) => (
-                  <option key={sh.id} value={sh.id}>
-                    {sh.name} ({sh.code})
+                {turnosLaborales.map((turno) => (
+                  <option key={turno.id} value={turno.id}>
+                    {turno.nombre} ({turno.codigo})
                   </option>
                 ))}
               </select>
             )}
           </div>
 
-          {selectedForRevoke.length > 0 && (
+          {seleccionadasRevocar.length > 0 && (
             <div className="flex items-center justify-between gap-2 rounded-xl bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-xs">
               <span className="text-amber-200">
-                {selectedForRevoke.length} seleccionado(s) con biometría
+                {seleccionadasRevocar.length} seleccionado(s) con biometría
               </span>
               <button
                 type="button"
                 onClick={() => {
-                  const targets = persons.filter((p) => selectedForRevoke.includes(p.id));
-                  if (targets.length > 0) openRevokeModal(targets);
+                  const objetivos = personas.filter((persona) =>
+                    seleccionadasRevocar.includes(persona.id)
+                  );
+                  if (objetivos.length > 0) abrirModalRevocacion(objetivos);
                 }}
                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-semibold bg-amber-600 hover:bg-amber-500 text-white"
               >
@@ -868,61 +981,68 @@ export function EnrollmentPage({
           )}
 
           <div className="space-y-2.5 max-h-[640px] overflow-y-auto pr-1">
-            {filteredPersons.length === 0 ? (
+            {personasFiltradas.length === 0 ? (
               <p className="text-sm text-slate-500 py-10 text-center">
                 No hay personas registradas que coincidan con la búsqueda.
               </p>
             ) : (
-              filteredPersons.map((p) => {
-                const isSelected = activePersonId === p.id;
-                const isChecked = selectedForRevoke.includes(p.id);
-                const personGroups = groups.filter((g) => p.group_ids.includes(g.id));
-                const inheritedCourses =
-                  organization.mode === "education"
-                    ? courses.filter((c) => p.group_ids.includes(c.group_id))
+              personasFiltradas.map((persona) => {
+                const estaSeleccionada = idPersonaActiva === persona.id;
+                const estaMarcada = seleccionadasRevocar.includes(persona.id);
+                const gruposPersona = grupos.filter((grupo) =>
+                  persona.ids_grupos.includes(grupo.id)
+                );
+                const cursosHeredados =
+                  organizacion.modo === "education"
+                    ? cursos.filter((curso) => persona.ids_grupos.includes(curso.id_grupo))
                     : [];
                 return (
                   <div
-                    key={p.id}
+                    key={persona.id}
                     className={`p-3.5 rounded-xl border transition-colors ${
-                      isSelected
+                      estaSeleccionada
                         ? "bg-indigo-600/10 border-indigo-500/50"
                         : "bg-slate-800/40 border-slate-800 hover:border-slate-700"
                     }`}
                   >
                     <div className="flex items-center justify-between gap-3">
                       <div className="flex items-center gap-3 min-w-0">
-                        {p.embeddings_count > 0 && (
+                        {persona.cantidad_vectores > 0 && (
                           <input
                             type="checkbox"
-                            checked={isChecked}
-                            onChange={() => toggleRevokeSelection(p.id)}
+                            checked={estaMarcada}
+                            onChange={() => alternarSeleccionRevocar(persona.id)}
                             className="rounded border-slate-600 bg-slate-800 text-amber-500 shrink-0"
                             title="Seleccionar para revocación en lote"
                           />
                         )}
-                        {p.avatar_base64 ? (
+                        {persona.avatar_base64 ? (
                           <img
-                            src={p.avatar_base64}
-                            alt={p.full_name}
+                            src={persona.avatar_base64}
+                            alt={persona.nombre_completo}
                             className="w-10 h-10 rounded-full object-cover border border-slate-700 shrink-0"
                           />
                         ) : (
                           <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center text-sm font-bold text-slate-300 shrink-0">
-                            {p.full_name.slice(0, 1).toUpperCase()}
+                            {persona.nombre_completo.slice(0, 1).toUpperCase()}
                           </div>
                         )}
                         <div className="min-w-0">
-                          <p className="font-semibold text-sm truncate">{p.full_name}</p>
+                          <p className="font-semibold text-sm truncate">
+                            {persona.nombre_completo}
+                          </p>
                           <p className="text-xs text-slate-400">
-                            {p.external_id} · {p.role}
-                            {personGroups.length > 0
-                              ? ` · ${personGroups
+                            {persona.identificador_externo} · {persona.rol}
+                            {gruposPersona.length > 0
+                              ? ` · ${gruposPersona
                                   .map(
-                                    (g) =>
-                                      `${g.name}${
-                                        g.semester
-                                          ? ` (${formatGroupPeriodLabel(g.semester, g.period_type)})`
+                                    (grupo) =>
+                                      `${grupo.nombre}${
+                                        grupo.semestre
+                                          ? ` (${formatearEtiquetaPeriodoGrupo(
+                                              grupo.semestre,
+                                              grupo.tipo_periodo
+                                            )})`
                                           : ""
                                       }`
                                   )
@@ -934,47 +1054,50 @@ export function EnrollmentPage({
 
                       <span
                         className={`px-2.5 py-1 rounded-full text-xs font-medium shrink-0 ${
-                          p.embeddings_count >= TOTAL_POSES
+                          persona.cantidad_vectores >= TOTAL_POSES
                             ? "bg-emerald-500/15 text-emerald-300"
-                            : p.embeddings_count > 0
+                            : persona.cantidad_vectores > 0
                               ? "bg-amber-500/15 text-amber-300"
                               : "bg-slate-800 text-slate-400"
                         }`}
                       >
-                        {p.embeddings_count}/{TOTAL_POSES} poses
+                        {persona.cantidad_vectores}/{TOTAL_POSES} poses
                       </span>
                     </div>
 
-                    {organization.mode === "enterprise" && p.effective_work_shift_name && (
-                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
-                        <span className="text-slate-400">Turno:</span>
-                        <span
-                          className={`px-2 py-0.5 rounded border ${
-                            p.shift_source === "direct"
-                              ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/25"
-                              : "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
-                          }`}
-                        >
-                          {p.effective_work_shift_name}
-                          {p.effective_work_shift_code ? ` (${p.effective_work_shift_code})` : ""} ·{" "}
-                          {p.shift_source === "direct" ? "directo" : "heredado"}
-                        </span>
-                      </div>
-                    )}
+                    {organizacion.modo === "enterprise" &&
+                      persona.nombre_turno_laboral_efectivo && (
+                        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                          <span className="text-slate-400">Turno:</span>
+                          <span
+                            className={`px-2 py-0.5 rounded border ${
+                              persona.origen_turno === "direct"
+                                ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/25"
+                                : "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
+                            }`}
+                          >
+                            {persona.nombre_turno_laboral_efectivo}
+                            {persona.codigo_turno_laboral_efectivo
+                              ? ` (${persona.codigo_turno_laboral_efectivo})`
+                              : ""}{" "}
+                            · {persona.origen_turno === "direct" ? "directo" : "heredado"}
+                          </span>
+                        </div>
+                      )}
 
-                    {inheritedCourses.length > 0 && (
+                    {cursosHeredados.length > 0 && (
                       <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
                         <span className="text-slate-400">
-                          Hereda {inheritedCourses.length} materia
-                          {inheritedCourses.length === 1 ? "" : "s"}:
+                          Hereda {cursosHeredados.length} materia
+                          {cursosHeredados.length === 1 ? "" : "s"}:
                         </span>
-                        {inheritedCourses.map((c) => (
+                        {cursosHeredados.map((curso) => (
                           <span
-                            key={c.id}
+                            key={curso.id}
                             className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/20"
-                            title={c.subject_name}
+                            title={curso.nombre_materia}
                           >
-                            {c.subject_code}
+                            {curso.codigo_materia}
                           </span>
                         ))}
                       </div>
@@ -982,25 +1105,29 @@ export function EnrollmentPage({
 
                     <div className="flex flex-wrap items-center justify-between gap-2 mt-3 pt-2.5 border-t border-slate-800/80">
                       <div className="text-[11px] text-slate-400">
-                        {!p.biometric_consent ? (
-                          <span className="text-amber-400">Sin consentimiento biométrico</span>
-                        ) : p.needs_reenroll ? (
+                        {!persona.consentimiento_biometrico ? (
+                          <span className="text-amber-400">
+                            Sin consentimiento biométrico
+                          </span>
+                        ) : persona.requiere_reenrolamiento ? (
                           <span className="text-amber-300">
                             Actualiza rostro (nueva normalización)
                           </span>
-                        ) : p.embeddings_count >= TOTAL_POSES ? (
-                          <span className="text-emerald-300">Registro biométrico completo</span>
+                        ) : persona.cantidad_vectores >= TOTAL_POSES ? (
+                          <span className="text-emerald-300">
+                            Registro biométrico completo
+                          </span>
                         ) : (
                           <span>Listo para captura</span>
                         )}
                       </div>
 
                       <div className="flex items-center gap-1.5">
-                        {canManagePersons && (
+                        {puedeGestionarPersonas && (
                           <button
                             type="button"
-                            disabled={!p.biometric_consent}
-                            onClick={() => startEnrollmentFor(p)}
+                            disabled={!persona.consentimiento_biometrico}
+                            onClick={() => iniciarEnrolamientoPara(persona)}
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white"
                           >
                             <Camera className="w-3.5 h-3.5" />
@@ -1008,10 +1135,10 @@ export function EnrollmentPage({
                           </button>
                         )}
 
-                        {p.embeddings_count > 0 && (
+                        {persona.cantidad_vectores > 0 && (
                           <button
                             type="button"
-                            onClick={() => openRevokeModal([p])}
+                            onClick={() => abrirModalRevocacion([persona])}
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-slate-800 hover:bg-amber-600/20 text-amber-300 border border-slate-700"
                             title="Revocar biometría (requiere contraseña)"
                           >
@@ -1020,10 +1147,10 @@ export function EnrollmentPage({
                           </button>
                         )}
 
-                        {canDeletePersons && (
+                        {puedeEliminarPersonas && (
                           <button
                             type="button"
-                            onClick={() => void handleDeletePerson(p)}
+                            onClick={() => void manejarEliminarPersona(persona)}
                             className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
                             title="Eliminar persona"
                           >
@@ -1039,34 +1166,37 @@ export function EnrollmentPage({
           </div>
         </div>
 
-        {/* Asistente guiado de 6 poses */}
+        {/* Asistente interactivo de 6 poses */}
         <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-          {!activePerson ? (
+          {!personaActiva ? (
             <div className="h-full min-h-[420px] flex flex-col items-center justify-center text-center text-slate-400 p-6">
               <UserCheck className="w-12 h-12 text-indigo-400/70 mb-3" />
               <h3 className="font-semibold text-base text-slate-200">
                 Selecciona una persona para enrolar
               </h3>
               <p className="text-xs text-slate-500 max-w-sm mt-1">
-                Capturaremos {TOTAL_POSES} poses distintas verificadas en tiempo real para que el
-                reconocimiento sea preciso incluso con cambios de ángulo o luz.
+                Capturaremos {TOTAL_POSES} poses distintas verificadas en tiempo real para
+                que el reconocimiento sea preciso incluso con cambios de ángulo o luz.
               </p>
             </div>
           ) : (
             <>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <h3 className="font-semibold text-base">{activePerson.full_name}</h3>
+                  <h3 className="font-semibold text-base">
+                    {personaActiva.nombre_completo}
+                  </h3>
                   <p className="text-xs text-slate-400">
-                    Progreso: {completedCount} de {TOTAL_POSES} poses completadas ({progressPct}%)
+                    Progreso: {cantidadCompletadas} de {TOTAL_POSES} poses completadas (
+                    {porcentajeProgreso}%)
                   </p>
                 </div>
 
                 <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
                   <input
                     type="checkbox"
-                    checked={storeAvatar}
-                    onChange={(e) => setStoreAvatar(e.target.checked)}
+                    checked={guardarAvatar}
+                    onChange={(evento) => establecerGuardarAvatar(evento.target.checked)}
                     className="rounded border-slate-600 bg-slate-800 text-indigo-600"
                   />
                   Guardar avatar (frontal)
@@ -1077,14 +1207,14 @@ export function EnrollmentPage({
               <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
                 <div
                   className={`h-full transition-all duration-300 ${
-                    allPosesDone ? "bg-emerald-500" : "bg-indigo-500"
+                    todasPosesCompletas ? "bg-emerald-500" : "bg-indigo-500"
                   }`}
-                  style={{ width: `${progressPct}%` }}
+                  style={{ width: `${porcentajeProgreso}%` }}
                 />
               </div>
 
-              {/* Banner destacado cuando se completan las 6 poses */}
-              {allPosesDone && (
+              {/* Banner destacado cuando se completan todas las poses */}
+              {todasPosesCompletas && (
                 <div className="rounded-2xl bg-emerald-500/15 border border-emerald-500/40 p-4 flex flex-wrap items-center justify-between gap-3">
                   <div className="space-y-1">
                     <p className="font-semibold text-sm text-emerald-200 flex items-center gap-2">
@@ -1092,13 +1222,13 @@ export function EnrollmentPage({
                       ¡Enrolamiento biométrico completado ({TOTAL_POSES}/{TOTAL_POSES})!
                     </p>
                     <p className="text-xs text-emerald-200/80">
-                      Los vectores ya están almacenados sin guardar fotos crudas. Puedes repetir
-                      cualquier toma abajo o finalizar el registro.
+                      Los vectores ya están almacenados sin guardar fotos crudas. Puedes
+                      repetir cualquier toma abajo o finalizar el registro.
                     </p>
                   </div>
                   <button
                     type="button"
-                    onClick={finishEnrollment}
+                    onClick={finalizarEnrolamiento}
                     className="px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white shrink-0"
                   >
                     Finalizar enrolamiento
@@ -1106,119 +1236,122 @@ export function EnrollmentPage({
                 </div>
               )}
 
-              {/* Instrucción actual + estabilidad */}
+              {/* Instrucción guiada de la pose actual + medidor de estabilidad */}
               <div className="rounded-xl bg-indigo-500/10 border border-indigo-500/30 px-3.5 py-2.5 flex items-center justify-between gap-3 text-xs text-indigo-200">
                 <div>
-                  <strong>{currentPose.title}:</strong> {currentPose.instruction}
+                  <strong>{poseActual.titulo}:</strong> {poseActual.instruccion}
                 </div>
-                {autoCapture && (
+                {capturaAutomatica && (
                   <span className="px-2 py-0.5 rounded-full bg-indigo-600/40 text-[11px] font-semibold shrink-0">
-                    Estabilidad {stabilityCount}/2
+                    Estabilidad {conteoEstabilidad}/2
                   </span>
                 )}
               </div>
 
-              <CameraView
-                ref={cameraRef}
-                active={Boolean(activePerson)}
-                faceBox={enrollStatus?.face_box ?? null}
-                boxStatus={
-                  enrollStatus
-                    ? enrollStatus.accepted || enrollStatus.pose_valid
+              <VistaCamara
+                ref={referenciaCamara}
+                activa={Boolean(personaActiva)}
+                cuadroRostro={estadoEnrolamiento?.cuadro_rostro ?? null}
+                estadoCuadro={
+                  estadoEnrolamiento
+                    ? estadoEnrolamiento.aceptado || estadoEnrolamiento.pose_valida
                       ? "ok"
                       : "warning"
                     : "idle"
                 }
-                label={
-                  enrollStatus?.quality
-                    ? enrollStatus.pose_valid
-                      ? `Pose OK · ${currentPose.shortLabel}`
-                      : `Detectado: ${enrollStatus.quality.pose_hint}`
+                etiqueta={
+                  estadoEnrolamiento?.calidad
+                    ? estadoEnrolamiento.pose_valida
+                      ? `Pose OK · ${poseActual.etiquetaCorta}`
+                      : `Detectado: ${estadoEnrolamiento.calidad.pose_estimada}`
                     : undefined
                 }
-                onReadyChange={setCameraReady}
-                onError={setEnrollError}
+                alCambiarDisponibilidad={establecerCamaraLista}
+                alOcurrirError={establecerErrorEnrolamiento}
               />
 
               <div className="flex flex-wrap items-center gap-3">
                 <button
                   type="button"
-                  disabled={!cameraReady || capturing}
-                  onClick={() => void submitCapture(currentPose.key, false)}
+                  disabled={!camaraLista || capturando}
+                  onClick={() => void enviarCapturaPose(poseActual.clave, false)}
                   className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white"
                 >
                   <Camera className="w-4 h-4" />
-                  {capturing ? "Procesando..." : `Capturar ${currentPose.title}`}
+                  {capturando ? "Procesando..." : `Capturar ${poseActual.titulo}`}
                 </button>
 
                 <button
                   type="button"
-                  disabled={!cameraReady}
+                  disabled={!camaraLista}
                   onClick={() => {
-                    stabilityRef.current = 0;
-                    setStabilityCount(0);
-                    setAutoCapture((v) => !v);
+                    contadorEstabilidadRef.current = 0;
+                    establecerConteoEstabilidad(0);
+                    establecerCapturaAutomatica((activa) => !activa);
                   }}
                   className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                    autoCapture
+                    capturaAutomatica
                       ? "bg-amber-600 border-amber-500 text-white"
                       : "bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700"
                   }`}
                 >
                   <Sparkles className="w-4 h-4" />
-                  {autoCapture ? "Detener Auto" : "Auto-captura guiada"}
+                  {capturaAutomatica ? "Detener Auto" : "Auto-captura guiada"}
                 </button>
               </div>
 
-              {enrollError && (
+              {errorEnrolamiento && (
                 <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
-                  {enrollError}
+                  {errorEnrolamiento}
                 </p>
               )}
 
-              {enrollStatus && (
+              {estadoEnrolamiento && (
                 <div
                   className={`rounded-xl border px-3.5 py-2.5 text-xs ${
-                    enrollStatus.accepted || enrollStatus.pose_valid
+                    estadoEnrolamiento.aceptado || estadoEnrolamiento.pose_valida
                       ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-200"
                       : "bg-amber-500/10 border-amber-500/40 text-amber-200"
                   }`}
                 >
                   <div className="flex items-center gap-2 font-medium">
-                    {enrollStatus.quality?.backlight_detected && (
+                    {estadoEnrolamiento.calidad?.contraluz_detectado && (
                       <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0" />
                     )}
-                    <span>{enrollStatus.message}</span>
+                    <span>{estadoEnrolamiento.mensaje}</span>
                   </div>
-                  {enrollStatus.quality && (
+                  {estadoEnrolamiento.calidad && (
                     <p className="text-[11px] opacity-80 mt-0.5">
-                      Nitidez: {enrollStatus.quality.blur_score} · Brillo:{" "}
-                      {enrollStatus.quality.brightness} · Asimetría luz:{" "}
-                      {enrollStatus.quality.shadow_asymmetry} · Tamaño:{" "}
-                      {enrollStatus.quality.face_width}×{enrollStatus.quality.face_height}px
+                      Nitidez: {estadoEnrolamiento.calidad.puntaje_nitidez} · Brillo:{" "}
+                      {estadoEnrolamiento.calidad.brillo} · Asimetría luz:{" "}
+                      {estadoEnrolamiento.calidad.asimetria_sombra} · Tamaño:{" "}
+                      {estadoEnrolamiento.calidad.ancho_rostro}×
+                      {estadoEnrolamiento.calidad.alto_rostro}px
                     </p>
                   )}
                 </div>
               )}
 
-              {/* Revisión temporal de las 6 poses en memoria RAM */}
+              {/* Revisión temporal en RAM de las 6 poses */}
               <div className="space-y-2 pt-1">
                 <p className="text-xs text-slate-400">
-                  Revisión de tomas (vista temporal en navegador; pulsa Repetir si deseas rehacer
-                  alguna pose):
+                  Revisión de tomas (vista temporal en navegador; pulsa Repetir si deseas
+                  rehacer alguna pose):
                 </p>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-                  {POSES.map((pose, idx) => {
-                    const completed = activePerson.poses_completed.includes(pose.key);
-                    const selected = idx === poseIndex;
-                    const previewUrl = posePreviews[pose.key];
+                  {POSES_REQUERIDAS.map((pose, indice) => {
+                    const completada = personaActiva.poses_completadas.includes(
+                      pose.clave
+                    );
+                    const seleccionada = indice === indicePose;
+                    const urlPrevia = vistasPreviasPose[pose.clave];
                     return (
                       <div
-                        key={pose.key}
+                        key={pose.clave}
                         className={`rounded-xl border p-2.5 flex items-center justify-between gap-2 transition-colors ${
-                          selected
+                          seleccionada
                             ? "bg-indigo-600/15 border-indigo-400"
-                            : completed
+                            : completada
                               ? "bg-emerald-500/10 border-emerald-500/30"
                               : "bg-slate-800/50 border-slate-800"
                         }`}
@@ -1226,51 +1359,55 @@ export function EnrollmentPage({
                         <button
                           type="button"
                           onClick={() => {
-                            stabilityRef.current = 0;
-                            setStabilityCount(0);
-                            setPoseIndex(idx);
+                            contadorEstabilidadRef.current = 0;
+                            establecerConteoEstabilidad(0);
+                            establecerIndicePose(indice);
                           }}
                           className="flex items-center gap-2 min-w-0 text-left flex-1"
                         >
-                          {previewUrl ? (
+                          {urlPrevia ? (
                             <img
-                              src={previewUrl}
-                              alt={pose.shortLabel}
+                              src={urlPrevia}
+                              alt={pose.etiquetaCorta}
                               className="w-9 h-9 rounded-lg object-cover border border-slate-700 scale-x-[-1] shrink-0"
                             />
                           ) : (
                             <div
                               className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
-                                completed
+                                completada
                                   ? "bg-emerald-500/20 text-emerald-300"
                                   : "bg-slate-800 text-slate-500"
                               }`}
                             >
-                              {completed ? (
+                              {completada ? (
                                 <Check className="w-4 h-4" />
                               ) : (
-                                <span className="text-xs font-semibold">{idx + 1}</span>
+                                <span className="text-xs font-semibold">
+                                  {indice + 1}
+                                </span>
                               )}
                             </div>
                           )}
                           <div className="min-w-0">
-                            <p className="text-xs font-medium truncate">{pose.shortLabel}</p>
+                            <p className="text-xs font-medium truncate">
+                              {pose.etiquetaCorta}
+                            </p>
                             <p className="text-[10px] text-slate-400">
-                              {completed ? "Lista" : "Pendiente"}
+                              {completada ? "Lista" : "Pendiente"}
                             </p>
                           </div>
                         </button>
 
-                        {completed && (
+                        {completada && (
                           <button
                             type="button"
                             onClick={() => {
-                              stabilityRef.current = 0;
-                              setStabilityCount(0);
-                              setPoseIndex(idx);
+                              contadorEstabilidadRef.current = 0;
+                              establecerConteoEstabilidad(0);
+                              establecerIndicePose(indice);
                             }}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 shrink-0"
-                            title={`Repetir ${pose.shortLabel}`}
+                            title={`Repetir ${pose.etiquetaCorta}`}
                           >
                             <RotateCcw className="w-3 h-3" />
                             Repetir
@@ -1286,11 +1423,11 @@ export function EnrollmentPage({
         </div>
       </div>
 
-      {/* Modal de autorización para revocar registros biométricos */}
-      {revokeTargets && (
+      {/* Modal de autorización para revocación biométrica */}
+      {objetivosRevocar && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <form
-            onSubmit={handleConfirmRevoke}
+            onSubmit={manejarConfirmarRevocacion}
             className="w-full max-w-md bg-slate-900 border border-amber-500/40 rounded-2xl p-6 space-y-4 shadow-2xl"
           >
             <div className="flex items-start justify-between gap-3">
@@ -1299,17 +1436,19 @@ export function EnrollmentPage({
                   <KeyRound className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-base">Autorizar revocación biométrica</h3>
+                  <h3 className="font-semibold text-base">
+                    Autorizar revocación biométrica
+                  </h3>
                   <p className="text-xs text-slate-400">
-                    {revokeTargets.length === 1
-                      ? revokeTargets[0].full_name
-                      : `${revokeTargets.length} personas seleccionadas`}
+                    {objetivosRevocar.length === 1
+                      ? objetivosRevocar[0].nombre_completo
+                      : `${objetivosRevocar.length} personas seleccionadas`}
                   </p>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setRevokeTargets(null)}
+                onClick={() => establecerObjetivosRevocar(null)}
                 className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
@@ -1317,9 +1456,10 @@ export function EnrollmentPage({
             </div>
 
             <div className="rounded-xl bg-slate-800/60 border border-slate-800 p-3 text-xs text-slate-300 max-h-28 overflow-y-auto space-y-1">
-              {revokeTargets.map((t) => (
-                <p key={t.id}>
-                  • <strong>{t.full_name}</strong> ({t.external_id})
+              {objetivosRevocar.map((objetivo) => (
+                <p key={objetivo.id}>
+                  • <strong>{objetivo.nombre_completo}</strong> (
+                  {objetivo.identificador_externo})
                 </p>
               ))}
             </div>
@@ -1328,47 +1468,49 @@ export function EnrollmentPage({
               <label className="block text-xs text-slate-400 mb-1">
                 Contraseña de seguridad (Admin, Superadmin o Clave Delegada)
               </label>
-              <PasswordInput
+              <EntradaContrasena
                 required
                 autoFocus
-                value={revokeSecret}
-                onChange={(e) => setRevokeSecret(e.target.value)}
+                value={secretoRevocacion}
+                onChange={(evento) => establecerSecretoRevocacion(evento.target.value)}
                 placeholder="Ingresa contraseña de autorización"
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
               />
             </div>
 
             <div>
-              <label className="block text-xs text-slate-400 mb-1">Motivo (opcional)</label>
+              <label className="block text-xs text-slate-400 mb-1">
+                Motivo (opcional)
+              </label>
               <input
                 type="text"
-                value={revokeReason}
-                onChange={(e) => setRevokeReason(e.target.value)}
+                value={motivoRevocacion}
+                onChange={(evento) => establecerMotivoRevocacion(evento.target.value)}
                 placeholder="Ej. Re-enrolamiento o baja del padrón"
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
             </div>
 
-            {revokeError && (
+            {errorRevocacion && (
               <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
-                {revokeError}
+                {errorRevocacion}
               </p>
             )}
 
             <div className="flex justify-end gap-2 pt-1">
               <button
                 type="button"
-                onClick={() => setRevokeTargets(null)}
+                onClick={() => establecerObjetivosRevocar(null)}
                 className="px-4 py-2 rounded-lg text-sm bg-slate-800 hover:bg-slate-700"
               >
                 Cancelar
               </button>
               <button
                 type="submit"
-                disabled={revoking}
+                disabled={revocando}
                 className="px-4 py-2 rounded-lg text-sm font-semibold bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white"
               >
-                {revoking ? "Validando..." : "Confirmar revocación"}
+                {revocando ? "Validando..." : "Confirmar revocación"}
               </button>
             </div>
           </form>
