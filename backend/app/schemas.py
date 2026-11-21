@@ -12,8 +12,9 @@ SessionType = Literal["workday", "class"]
 SessionStatus = Literal["open", "closed"]
 ActionMode = Literal["auto", "check_in", "check_out", "present"]
 EventType = Literal["check_in", "check_out", "present"]
-EventStatus = Literal["on_time", "late", "manual"]
+EventStatus = Literal["on_time", "late", "early_exit", "manual"]
 CaptureMode = Literal["kiosk_individual", "group_scan", "manual"]
+ShiftSource = Literal["direct", "group", "none"]
 
 
 # --- Organizaciones ---
@@ -65,6 +66,7 @@ class GroupCreate(BaseModel):
     career_id: int | None = None
     semester: str | None = Field(default=None, max_length=40)
     default_classroom: str | None = Field(default=None, max_length=80)
+    default_work_shift_id: int | None = None
 
 
 class GroupUpdate(BaseModel):
@@ -75,6 +77,7 @@ class GroupUpdate(BaseModel):
     career_id: int | None = None
     semester: str | None = Field(default=None, max_length=40)
     default_classroom: str | None = Field(default=None, max_length=80)
+    default_work_shift_id: int | None = None
 
 
 class GroupRead(BaseModel):
@@ -88,6 +91,9 @@ class GroupRead(BaseModel):
     code: str
     semester: str | None = None
     default_classroom: str | None = None
+    default_work_shift_id: int | None = None
+    default_work_shift_name: str | None = None
+    default_work_shift_code: str | None = None
     period_type: str = "semestral"
     schedule_start: str
     schedule_end: str
@@ -105,6 +111,7 @@ class PersonCreate(BaseModel):
     role: PersonRole = "employee"
     biometric_consent: bool = False
     group_ids: list[int] = Field(default_factory=list)
+    work_shift_id: int | None = None
 
 
 class PersonUpdate(BaseModel):
@@ -114,6 +121,7 @@ class PersonUpdate(BaseModel):
     biometric_consent: bool | None = None
     is_active: bool | None = None
     group_ids: list[int] | None = None
+    work_shift_id: int | None = None
 
 
 class PersonRead(BaseModel):
@@ -129,6 +137,12 @@ class PersonRead(BaseModel):
     is_active: bool
     created_at: datetime
     group_ids: list[int] = Field(default_factory=list)
+    work_shift_id: int | None = None
+    work_shift_name: str | None = None
+    effective_work_shift_id: int | None = None
+    effective_work_shift_name: str | None = None
+    effective_work_shift_code: str | None = None
+    shift_source: ShiftSource = "none"
     embeddings_count: int = 0
     poses_completed: list[str] = Field(default_factory=list)
     needs_reenroll: bool = False
@@ -213,6 +227,7 @@ class SessionCreate(BaseModel):
     group_id: int | None = None
     course_assignment_id: int | None = None
     schedule_id: int | None = None
+    work_shift_id: int | None = None
     title: str = Field(..., min_length=2, max_length=160)
     session_date: date | None = None
     session_type: SessionType | None = None
@@ -228,6 +243,10 @@ class SessionRead(BaseModel):
     group_name: str | None = None
     course_assignment_id: int | None = None
     schedule_id: int | None = None
+    work_shift_id: int | None = None
+    work_shift_name: str | None = None
+    work_shift_code: str | None = None
+    work_shift_crosses_midnight: bool = False
     subject_name: str | None = None
     subject_code: str | None = None
     career_name: str | None = None
@@ -250,9 +269,14 @@ class AttendanceEventRead(BaseModel):
     person_name: str
     person_external_id: str
     person_avatar_base64: str | None = None
+    work_shift_id: int | None = None
+    work_shift_name: str | None = None
     event_type: str
     status: str
     confidence_score: float | None
+    worked_minutes: int | None = None
+    late_minutes: int | None = None
+    early_exit_minutes: int | None = None
     capture_mode: str
     timestamp: datetime
     notes: str | None = None
@@ -285,6 +309,9 @@ class RecognizeFrameResponse(BaseModel):
     attendance_action: Literal["recorded", "cooldown", "already_present", "invalid_sequence"] | None = None
     event: AttendanceEventRead | None = None
     worked_minutes: int | None = None
+    shift_name: str | None = None
+    late_minutes: int | None = None
+    early_exit_minutes: int | None = None
     session_id: int | None = None
     message: str
     latency_ms: float
@@ -616,3 +643,140 @@ class AcademicStatsResponse(BaseModel):
     summary: AcademicStatsSummary
     by_subject: list[SubjectAttendanceStat] = Field(default_factory=list)
     by_group: list[GroupAttendanceStat] = Field(default_factory=list)
+
+
+# --- Turnos Empresariales y Reglas de Jornada (Bloque D) ---
+class WorkShiftCreate(BaseModel):
+    organization_id: int
+    name: str = Field(..., min_length=2, max_length=120)
+    code: str = Field(..., min_length=1, max_length=40)
+    start_time: str = Field(..., pattern=r"^\d{2}:\d{2}$")
+    end_time: str = Field(..., pattern=r"^\d{2}:\d{2}$")
+    days_of_week: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
+    late_tolerance_minutes: int | None = Field(default=None, ge=0, le=180)
+    early_exit_tolerance_minutes: int = Field(default=10, ge=0, le=180)
+    is_active: bool = True
+
+
+class WorkShiftUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    code: str | None = Field(default=None, min_length=1, max_length=40)
+    start_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    end_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    days_of_week: list[int] | None = None
+    late_tolerance_minutes: int | None = Field(default=None, ge=0, le=180)
+    early_exit_tolerance_minutes: int | None = Field(default=None, ge=0, le=180)
+    is_active: bool | None = None
+
+
+class WorkShiftRead(BaseModel):
+    id: int
+    organization_id: int
+    name: str
+    code: str
+    start_time: str
+    end_time: str
+    crosses_midnight: bool
+    expected_duration_minutes: int
+    days_of_week: list[int] = Field(default_factory=list)
+    late_tolerance_minutes: int | None = None
+    effective_late_tolerance_minutes: int
+    early_exit_tolerance_minutes: int
+    is_active: bool
+    assigned_employees_count: int = 0
+    default_groups_count: int = 0
+    created_at: datetime
+
+
+class ShiftBulkAssignRequest(BaseModel):
+    person_ids: list[int] = Field(default_factory=list)
+    group_id: int | None = None
+    clear_shift: bool = False
+
+
+class ShiftBulkAssignResponse(BaseModel):
+    work_shift_id: int | None = None
+    work_shift_name: str | None = None
+    updated_count: int
+
+
+class GenerateShiftSessionsRequest(BaseModel):
+    organization_id: int | None = None
+    target_date: date | None = None
+    work_shift_id: int | None = None
+
+
+class StartShiftSessionRequest(BaseModel):
+    session_date: date | None = None
+
+
+class ShiftAttendanceStat(BaseModel):
+    work_shift_id: int | None = None
+    shift_name: str
+    shift_code: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    crosses_midnight: bool = False
+    days_of_week: list[int] = Field(default_factory=list)
+    employees_count: int
+    scheduled_days: int
+    present_days: int
+    on_time_days: int
+    late_days: int
+    early_exit_days: int
+    absent_days: int
+    missing_checkout_days: int
+    total_worked_minutes: int
+    avg_worked_minutes: float
+    attendance_rate: float
+    punctuality_rate: float
+
+
+class EmployeeAttendanceStat(BaseModel):
+    person_id: int
+    external_id: str
+    full_name: str
+    group_names: list[str] = Field(default_factory=list)
+    work_shift_id: int | None = None
+    shift_name: str | None = None
+    shift_code: str | None = None
+    shift_source: ShiftSource = "none"
+    scheduled_days: int
+    present_days: int
+    on_time_days: int
+    late_days: int
+    early_exit_days: int
+    absent_days: int
+    missing_checkout_days: int
+    total_late_minutes: int
+    total_early_exit_minutes: int
+    total_worked_minutes: int
+    attendance_rate: float
+    punctuality_rate: float
+
+
+class EnterpriseStatsSummary(BaseModel):
+    total_shifts: int
+    active_shifts: int
+    total_employees: int
+    assigned_employees: int
+    unassigned_employees: int
+    scheduled_employee_days: int
+    present_days: int
+    on_time_days: int
+    late_days: int
+    early_exit_days: int
+    absent_days: int
+    missing_checkout_days: int
+    total_worked_minutes: int
+    attendance_rate: float
+    punctuality_rate: float
+
+
+class EnterpriseStatsResponse(BaseModel):
+    organization_id: int
+    date_from: date
+    date_to: date
+    summary: EnterpriseStatsSummary
+    by_shift: list[ShiftAttendanceStat] = Field(default_factory=list)
+    by_employee: list[EmployeeAttendanceStat] = Field(default_factory=list)
