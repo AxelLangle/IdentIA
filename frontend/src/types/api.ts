@@ -36,6 +36,7 @@ export interface Group {
   default_work_shift_name: string | null;
   default_work_shift_code: string | null;
   period_type: string;
+  custom_period_type: AcademicPeriodType | null;
   schedule_start: string;
   schedule_end: string;
   created_at: string;
