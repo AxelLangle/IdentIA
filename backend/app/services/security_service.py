@@ -131,3 +131,41 @@ def verify_sensitive_authorization(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Contraseña de autorización inválida o sin permisos para esta operación.",
     )
+
+
+def verify_admin_password(
+    db: Session,
+    *,
+    current_user: User,
+    organization_id: int,
+    authorization_secret: str | None,
+) -> User:
+    """Valida exclusivamente la contraseña de un Superadmin o Admin de la organización."""
+    secret = (authorization_secret or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Se requiere la contraseña de administrador para cambiar el tipo de periodo.",
+        )
+
+    admin_candidates = list(
+        db.scalars(
+            select(User).where(
+                User.is_active.is_(True),
+                or_(
+                    User.role == "superadmin",
+                    (User.role == "org_admin") & (User.organization_id == organization_id),
+                ),
+            )
+        ).all()
+    )
+    admin_candidates.sort(key=lambda u: 0 if u.id == current_user.id else 1)
+
+    for admin in admin_candidates:
+        if verify_secret(secret, admin.password_hash):
+            return admin
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Contraseña de administrador inválida.",
+    )

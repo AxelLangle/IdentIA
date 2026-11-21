@@ -304,6 +304,25 @@ export function KioskPage({
         </div>
       )}
 
+      {selectedSession && selectedSession.work_shift_name && (
+        <div className="rounded-xl bg-indigo-500/15 border border-indigo-500/40 px-4 py-2.5 text-xs text-indigo-200 flex flex-wrap items-center gap-3">
+          <span>
+            Turno laboral: <strong>{selectedSession.work_shift_name}</strong>
+            {selectedSession.work_shift_code ? ` (${selectedSession.work_shift_code})` : ""}
+          </span>
+          {selectedSession.expected_start_time && (
+            <span>
+              · Entrada esperada: <strong>{selectedSession.expected_start_time}</strong>
+            </span>
+          )}
+          {selectedSession.work_shift_crosses_midnight && (
+            <span className="px-2 py-0.5 rounded-full bg-indigo-600/30 border border-indigo-400/30">
+              🌙 Turno nocturno (cruza medianoche)
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {/* Cámara + banner de respuesta */}
         <div className="lg:col-span-3 space-y-4">
@@ -347,6 +366,19 @@ export function KioskPage({
                     Estado: <span className="text-slate-200">{lastResult.match_status}</span>
                     {lastResult.confidence > 0 && (
                       <> · Similitud: {(lastResult.confidence * 100).toFixed(1)}%</>
+                    )}
+                    {lastResult.shift_name && <> · Turno: {lastResult.shift_name}</>}
+                    {lastResult.late_minutes !== null && lastResult.late_minutes > 0 && (
+                      <span className="text-amber-300">
+                        {" "}
+                        · Retardo: +{lastResult.late_minutes} min
+                      </span>
+                    )}
+                    {lastResult.early_exit_minutes !== null && lastResult.early_exit_minutes > 0 && (
+                      <span className="text-orange-300">
+                        {" "}
+                        · Salida anticipada: -{lastResult.early_exit_minutes} min
+                      </span>
                     )}
                     {lastResult.worked_minutes !== null && (
                       <> · Jornada: {lastResult.worked_minutes} min</>
@@ -414,7 +446,11 @@ export function KioskPage({
                           ? "A tiempo"
                           : ev.status === "late"
                             ? "Retardo"
-                            : "Manual"}
+                            : ev.status === "early_exit"
+                              ? "Salida anticipada"
+                              : "Manual"}
+                        {ev.work_shift_name ? ` · ${ev.work_shift_name}` : ""}
+                        {ev.worked_minutes !== null ? ` · ${ev.worked_minutes} min` : ""}
                       </p>
                     </div>
                   </div>

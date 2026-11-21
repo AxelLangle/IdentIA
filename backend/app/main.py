@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import Base, SessionLocal, engine as default_engine, get_db
 from app.models import FaceEmbedding, Group, Organization, Person, User
-from app.routers import academic, attendance, auth, organizations, persons, security
+from app.routers import academic, attendance, auth, enterprise, organizations, persons, security
 from app.schemas import HealthResponse
 from app.security import hash_secret
 from app.vision.engine import BiometricEngine
@@ -102,7 +102,7 @@ def create_app(
 
     application = FastAPI(
         title=settings.app_name,
-        version="0.4.0",
+        version="0.5.0",
         description="Motor biométrico y plataforma de asistencia multi-organización IdentIA.",
         lifespan=lifespan,
     )
@@ -121,6 +121,7 @@ def create_app(
     application.include_router(persons.router)
     application.include_router(attendance.router)
     application.include_router(academic.router)
+    application.include_router(enterprise.router)
 
     @application.get("/api/health", response_model=HealthResponse, tags=["system"])
     def health(db: Session = Depends(get_db)) -> HealthResponse:

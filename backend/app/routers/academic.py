@@ -44,7 +44,7 @@ from app.services.academic_service import (
     start_or_get_course_session,
     validate_schedule_times,
 )
-from app.services.security_service import record_audit_log
+from app.services.security_service import record_audit_log, verify_admin_password
 
 router = APIRouter(prefix="/api/academic", tags=["academic"])
 
@@ -215,6 +215,27 @@ def update_career(
     assert_org_access(current_user, career.organization_id)
 
     data = payload.model_dump(exclude_unset=True)
+    auth_secret = data.pop("authorization_secret", None)
+
+    if "period_type" in data and data["period_type"] != career.period_type:
+        auth_admin = verify_admin_password(
+            db,
+            current_user=current_user,
+            organization_id=career.organization_id,
+            authorization_secret=auth_secret,
+        )
+        record_audit_log(
+            db,
+            organization_id=career.organization_id,
+            action="change_career_period_type",
+            target_type="career",
+            target_id=career.id,
+            target_summary=f"{career.name} ({career.code})",
+            executed_by_user=current_user,
+            authorized_by_user=auth_admin,
+            details=f"Periodo carrera: {career.period_type or 'general'} -> {data['period_type'] or 'general'}",
+        )
+
     if "name" in data and data["name"] is not None:
         career.name = data["name"].strip()
     if "code" in data and data["code"] is not None:

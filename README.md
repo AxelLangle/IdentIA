@@ -127,10 +127,10 @@ npm run build
 - **Fase 0–1 (Completa):** Arquitectura unificada, repositorio limpio y motor biométrico ONNX YuNet + SFace con control de calidad.
 - **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, grupos, sesiones y exportación CSV).
 - **Bloque A (Completa):** Compensación de contraluz/sombras LAB, bloqueo de contraluz en registro, asistente guiado de 6 poses con validación geométrica y manual de uso.
-- **Bloque B (Completa en `feat/bloque-b-rbac-seguridad`):** Autenticación JWT, aislamiento multi-organización (`superadmin`, `org_admin`, `teacher`, `operator`), revocación individual/lote con contraseñas delegadas hasheadas (`scrypt`), bitácora de auditoría y migraciones Alembic.
-- **Bloque C (Completa en `feat/bloque-c-modelo-educativo`):** Modelo educativo completo (`Career`, `Group` académico, `Subject`, `CourseAssignment`, `ClassSchedule`), herencia automática de materias por grupo, portal docente con aislamiento estricto ("Tu clase ahora" en 1 clic), estadísticas por asignatura y consolidadas por grupo, y migración `0002_education_domain`.
-- **Bloque D (Siguiente desde `develop`):** Turnos empresariales (`WorkShift`, asignación de empleados y reglas de puntualidad/salida anticipada).
-- **Siguiente:** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
+- **Bloque B (Completa):** Autenticación JWT, aislamiento multi-organización (`superadmin`, `org_admin`, `teacher`, `operator`), revocación individual/lote con contraseñas delegadas hasheadas (`scrypt`), bitácora de auditoría y migraciones Alembic.
+- **Bloque C (Completa):** Modelo educativo completo (`Career`, `Group` académico con periodo/aula fija, `Subject`, `CourseAssignment`, `ClassSchedule`), periodos configurables, herencia automática de materias, portal docente con aislamiento estricto ("Tu clase ahora" en 1 clic), estadísticas por asignatura/grupo y migraciones `0002`/`0003`.
+- **Bloque D (Completa en `feat/bloque-d-turnos-empresa`):** Turnos empresariales (`WorkShift` diurno y nocturno con cruce de medianoche), asignación individual/lote y herencia por departamento, reglas de puntualidad/salida anticipada/inasistencias, estadísticas por turno/empleado y migración `0004_enterprise_work_shifts`.
+- **Fase 3 (Siguiente desde `develop`):** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
 
 ---
 

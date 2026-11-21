@@ -16,6 +16,7 @@ from app.models import (
     PersonGroup,
     Subject,
     User,
+    WorkShift,
 )
 from app.schemas import (
     AcademicStatsResponse,
@@ -133,7 +134,11 @@ def serialize_courses_batch(
         )
         career_id = c.group.career_id if c.group else None
         career = career_map.get(career_id) if career_id else None
-        effective_period = (career.period_type if career and career.period_type else None) or org_period_type
+        effective_period = (
+            (c.group.period_type if c.group else None)
+            or (career.period_type if career and career.period_type else None)
+            or org_period_type
+        )
         result.append(
             CourseAssignmentRead(
                 id=c.id,
@@ -199,6 +204,10 @@ def serialize_sessions_batch(
         c.id: c.name
         for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
     }
+    shift_map = {
+        sh.id: sh
+        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
+    }
 
     course_ids = [s.course_assignment_id for s in sessions if s.course_assignment_id is not None]
     course_map: dict[int, CourseAssignment] = {}
@@ -218,6 +227,7 @@ def serialize_sessions_batch(
     for s in sessions:
         group = group_map.get(s.group_id) if s.group_id else None
         course = course_map.get(s.course_assignment_id) if s.course_assignment_id else None
+        shift = shift_map.get(s.work_shift_id) if s.work_shift_id else None
         career_id = group.career_id if group else (course.group.career_id if course and course.group else None)
         if career_id is None and course and course.subject:
             career_id = course.subject.career_id
@@ -230,6 +240,10 @@ def serialize_sessions_batch(
                 group_name=group.name if group else (course.group.name if course and course.group else None),
                 course_assignment_id=s.course_assignment_id,
                 schedule_id=s.schedule_id,
+                work_shift_id=s.work_shift_id,
+                work_shift_name=shift.name if shift else None,
+                work_shift_code=shift.code if shift else None,
+                work_shift_crosses_midnight=shift.crosses_midnight if shift else False,
                 subject_name=course.subject.name if course and course.subject else None,
                 subject_code=course.subject.code if course and course.subject else None,
                 career_name=career_map.get(career_id) if career_id else None,
@@ -648,7 +662,9 @@ def compute_academic_stats(
         cid = course.group.career_id if course.group else None
         career_obj = career_obj_map.get(cid) if cid else None
         subj_period_type = (
-            career_obj.period_type if career_obj and career_obj.period_type else org_period_type
+            (course.group.period_type if course.group else None)
+            or (career_obj.period_type if career_obj and career_obj.period_type else None)
+            or org_period_type
         )
 
         by_subject.append(
@@ -735,7 +751,9 @@ def compute_academic_stats(
 
         grp_career = career_obj_map.get(g.career_id) if g.career_id else None
         grp_period_type = (
-            grp_career.period_type if grp_career and grp_career.period_type else org_period_type
+            g.period_type
+            or (grp_career.period_type if grp_career and grp_career.period_type else None)
+            or org_period_type
         )
         by_group.append(
             GroupAttendanceStat(

@@ -17,6 +17,7 @@ from app.models import (
     Person,
     PersonGroup,
     User,
+    WorkShift,
 )
 from app.routers import to_face_box_schema, to_quality_schema
 from app.schemas import (
@@ -39,6 +40,7 @@ from app.services.attendance_service import (
     get_or_create_active_session,
     record_recognized_attendance,
 )
+from app.services.enterprise_service import resolve_attendance_work_shift
 from app.vision.engine import bytes_to_embedding, decode_image_bytes, match_embedding
 from app.vision.quality import evaluate_face_quality
 
@@ -49,7 +51,16 @@ def _serialize_event(
     event: AttendanceEvent,
     person: Person,
     session: AttendanceSession,
+    shift_names: dict[int, str] | None = None,
 ) -> AttendanceEventRead:
+    resolved_shift_id = event.work_shift_id if event.work_shift_id is not None else session.work_shift_id
+    shift_name = (
+        shift_names.get(resolved_shift_id)
+        if shift_names is not None and resolved_shift_id is not None
+        else None
+    )
+    if shift_name is None and event.work_shift is not None:
+        shift_name = event.work_shift.name
     return AttendanceEventRead(
         id=event.id,
         session_id=event.session_id,
@@ -58,9 +69,14 @@ def _serialize_event(
         person_name=person.full_name,
         person_external_id=person.external_id,
         person_avatar_base64=person.avatar_base64,
+        work_shift_id=event.work_shift_id,
+        work_shift_name=shift_name,
         event_type=event.event_type,
         status=event.status,
         confidence_score=event.confidence_score,
+        worked_minutes=event.worked_minutes,
+        late_minutes=event.late_minutes,
+        early_exit_minutes=event.early_exit_minutes,
         capture_mode=event.capture_mode,
         timestamp=event.timestamp,
         notes=event.notes,
@@ -135,6 +151,20 @@ def create_session(
                 expected_start = schedule.start_time
         elif expected_start is None and assignment.group is not None:
             expected_start = assignment.group.schedule_start
+    elif payload.work_shift_id is not None:
+        work_shift = db.get(WorkShift, payload.work_shift_id)
+        if work_shift is None or work_shift.organization_id != org.id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
+            )
+        session_type = "workday"
+        if expected_start is None:
+            expected_start = work_shift.start_time
+        if resolved_group_id is not None:
+            group = db.get(Group, resolved_group_id)
+            if group is None or group.organization_id != org.id:
+                raise HTTPException(status_code=404, detail="Grupo no encontrado en la organización.")
     elif resolved_group_id is not None:
         group = db.get(Group, resolved_group_id)
         if group is None or group.organization_id != org.id:
@@ -147,6 +177,7 @@ def create_session(
         group_id=resolved_group_id,
         course_assignment_id=payload.course_assignment_id,
         schedule_id=payload.schedule_id,
+        work_shift_id=payload.work_shift_id,
         title=payload.title.strip(),
         session_date=payload.session_date or date.today(),
         session_type=session_type,
@@ -360,6 +391,16 @@ async def recognize_frame(
     )
     latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
+    serialized_event = None
+    if rec.event is not None:
+        event_session = db.get(AttendanceSession, rec.event.session_id) or session
+        ev_shift_names = (
+            {rec.event.work_shift_id: rec.shift_name}
+            if rec.event.work_shift_id is not None and rec.shift_name is not None
+            else None
+        )
+        serialized_event = _serialize_event(rec.event, person, event_session, ev_shift_names)
+
     return RecognizeFrameResponse(
         faces_detected=len(detections),
         match_status="matched",
@@ -379,9 +420,12 @@ async def recognize_frame(
             else None
         ),
         attendance_action=rec.action,
-        event=_serialize_event(rec.event, person, session) if rec.event else None,
+        event=serialized_event,
         worked_minutes=rec.worked_minutes,
-        session_id=session.id,
+        shift_name=rec.shift_name,
+        late_minutes=rec.late_minutes,
+        early_exit_minutes=rec.early_exit_minutes,
+        session_id=rec.event.session_id if rec.event else session.id,
         message=rec.message,
         latency_ms=latency_ms,
     )
@@ -424,7 +468,13 @@ def list_events(
         stmt = stmt.where(AttendanceEvent.person_id == person_id)
 
     rows = db.execute(stmt).all()
-    return [_serialize_event(ev, per, ses) for ev, per, ses in rows]
+    shift_names = {
+        sh.id: sh.name
+        for sh in db.scalars(
+            select(WorkShift).where(WorkShift.organization_id == scoped_org_id)
+        ).all()
+    }
+    return [_serialize_event(ev, per, ses, shift_names) for ev, per, ses in rows]
 
 
 @router.post("/attendance/manual", response_model=AttendanceEventRead, status_code=status.HTTP_201_CREATED)
@@ -459,9 +509,15 @@ def create_manual_attendance(
                 detail="El alumno no pertenece al grupo de esta sesión.",
             )
 
+    resolved_shift = (
+        resolve_attendance_work_shift(db, person, session)
+        if session.session_type == "workday"
+        else None
+    )
     event = AttendanceEvent(
         session_id=session.id,
         person_id=person.id,
+        work_shift_id=resolved_shift.id if resolved_shift else None,
         event_type=payload.event_type,
         status=payload.status,
         confidence_score=None,
@@ -472,7 +528,8 @@ def create_manual_attendance(
     db.add(event)
     db.commit()
     db.refresh(event)
-    return _serialize_event(event, person, session)
+    shift_names = {resolved_shift.id: resolved_shift.name} if resolved_shift else None
+    return _serialize_event(event, person, session, shift_names)
 
 
 @router.get("/attendance/export.csv")
@@ -509,7 +566,16 @@ def export_attendance_csv(
 
         rows = db.execute(stmt).all()
 
-    csv_content = export_events_csv([(ev, per, ses) for ev, per, ses in rows])
+    shift_names = {
+        sh.id: sh.name
+        for sh in db.scalars(
+            select(WorkShift).where(WorkShift.organization_id == scoped_org_id)
+        ).all()
+    }
+    csv_content = export_events_csv(
+        [(ev, per, ses) for ev, per, ses in rows],
+        shift_names=shift_names,
+    )
     return Response(
         content=csv_content.encode("utf-8"),
         media_type="text/csv; charset=utf-8",

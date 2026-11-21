@@ -3,7 +3,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import Career, CourseAssignment, Group, Organization, PersonGroup, User
+from app.models import Career, CourseAssignment, Group, Organization, PersonGroup, User, WorkShift
 from app.schemas import (
     GroupCreate,
     GroupRead,
@@ -20,7 +20,7 @@ from app.security import (
     resolve_org_scope,
 )
 from app.services.academic_service import get_teacher_group_ids
-from app.services.security_service import record_audit_log
+from app.services.security_service import record_audit_log, verify_admin_password
 
 router = APIRouter(prefix="/api", tags=["organizations"])
 
@@ -114,7 +114,33 @@ def update_organization(
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+    auth_secret = data.pop("authorization_secret", None)
+
+    if (
+        "academic_period_type" in data
+        and data["academic_period_type"] is not None
+        and data["academic_period_type"] != org.academic_period_type
+    ):
+        auth_admin = verify_admin_password(
+            db,
+            current_user=current_user,
+            organization_id=org.id,
+            authorization_secret=auth_secret,
+        )
+        record_audit_log(
+            db,
+            organization_id=org.id,
+            action="change_org_period_type",
+            target_type="organization",
+            target_id=org.id,
+            target_summary=org.name,
+            executed_by_user=current_user,
+            authorized_by_user=auth_admin,
+            details=f"Periodo general: {org.academic_period_type} -> {data['academic_period_type']}",
+        )
+
+    for field, value in data.items():
         setattr(org, field, value)
 
     db.commit()
@@ -131,6 +157,10 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
     career_map = {
         c.id: c
         for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
+    }
+    shift_map = {
+        sh.id: sh
+        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
     }
     counts_rows = db.execute(
         select(PersonGroup.group_id, func.count(PersonGroup.person_id)).group_by(PersonGroup.group_id)
@@ -150,8 +180,11 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
     result: list[GroupRead] = []
     for g in groups:
         career = career_map.get(g.career_id) if g.career_id else None
+        shift = shift_map.get(g.default_work_shift_id) if g.default_work_shift_id else None
         effective_period = (
-            career.period_type if career and career.period_type else org_period_type
+            g.period_type
+            or (career.period_type if career and career.period_type else None)
+            or org_period_type
         )
         result.append(
             GroupRead(
@@ -163,7 +196,11 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
                 code=g.code,
                 semester=g.semester,
                 default_classroom=g.default_classroom,
+                default_work_shift_id=g.default_work_shift_id,
+                default_work_shift_name=shift.name if shift else None,
+                default_work_shift_code=shift.code if shift else None,
                 period_type=effective_period,
+                custom_period_type=g.period_type,
                 schedule_start=g.schedule_start,
                 schedule_end=g.schedule_end,
                 created_at=g.created_at,
@@ -215,7 +252,20 @@ def create_group(
                 detail="Carrera no encontrada en la organización.",
             )
 
+    shift_for_defaults: WorkShift | None = None
+    if payload.default_work_shift_id is not None:
+        shift_for_defaults = db.get(WorkShift, payload.default_work_shift_id)
+        if shift_for_defaults is None or shift_for_defaults.organization_id != org.id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
+            )
+
     data = payload.model_dump()
+    if shift_for_defaults is not None:
+        # Mantener las columnas heredadas alineadas con el turno para evitar discrepancias
+        data["schedule_start"] = shift_for_defaults.start_time
+        data["schedule_end"] = shift_for_defaults.end_time
     if data.get("semester") is not None:
         data["semester"] = data["semester"].strip() or None
     if data.get("default_classroom") is not None:
@@ -241,6 +291,27 @@ def update_group(
     assert_org_access(current_user, group.organization_id)
 
     data = payload.model_dump(exclude_unset=True)
+    auth_secret = data.pop("authorization_secret", None)
+
+    if "period_type" in data and data["period_type"] != group.period_type:
+        auth_admin = verify_admin_password(
+            db,
+            current_user=current_user,
+            organization_id=group.organization_id,
+            authorization_secret=auth_secret,
+        )
+        record_audit_log(
+            db,
+            organization_id=group.organization_id,
+            action="change_group_period_type",
+            target_type="group",
+            target_id=group.id,
+            target_summary=f"{group.name} ({group.code})",
+            executed_by_user=current_user,
+            authorized_by_user=auth_admin,
+            details=f"Periodo grupo: {group.period_type or 'heredado'} -> {data['period_type'] or 'heredado'}",
+        )
+
     if "career_id" in data and data["career_id"] is not None:
         career = db.get(Career, data["career_id"])
         if career is None or career.organization_id != group.organization_id:
@@ -248,6 +319,17 @@ def update_group(
                 status_code=404,
                 detail="Carrera no encontrada en la organización.",
             )
+
+    if "default_work_shift_id" in data and data["default_work_shift_id"] is not None:
+        shift = db.get(WorkShift, data["default_work_shift_id"])
+        if shift is None or shift.organization_id != group.organization_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
+            )
+        # Sincronizar horario base heredado con el turno seleccionado
+        data["schedule_start"] = shift.start_time
+        data["schedule_end"] = shift.end_time
 
     for field, value in data.items():
         if field in ("semester", "default_classroom") and isinstance(value, str):

@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import FaceEmbedding, Group, Organization, Person, PersonGroup, User
+from app.models import FaceEmbedding, Group, Organization, Person, PersonGroup, User, WorkShift
 from app.routers import to_face_box_schema, to_quality_schema
 from app.schemas import (
     BatchBiometricsRevokeRequest,
@@ -30,6 +30,7 @@ from app.schemas import (
     PersonRead,
     PersonUpdate,
     PoseLabel,
+    ShiftSource,
 )
 from app.security import assert_org_access, get_current_user, require_roles, resolve_org_scope
 from app.services.academic_service import get_teacher_group_ids
@@ -51,29 +52,70 @@ router = APIRouter(prefix="/api", tags=["persons"])
 REQUIRED_POSES_COUNT = 6
 
 
-def _serialize_person(person: Person, current_model_version: str) -> PersonRead:
-    embeddings = person.embeddings
-    current_poses = [
-        e.pose_label for e in embeddings if e.model_version == current_model_version
-    ]
-    needs_reenroll = any(e.model_version != current_model_version for e in embeddings)
-    return PersonRead(
-        id=person.id,
-        organization_id=person.organization_id,
-        external_id=person.external_id,
-        full_name=person.full_name,
-        email=person.email,
-        role=person.role,
-        avatar_base64=person.avatar_base64,
-        biometric_consent=person.biometric_consent,
-        biometric_consent_at=person.biometric_consent_at,
-        is_active=person.is_active,
-        created_at=person.created_at,
-        group_ids=[link.group_id for link in person.group_links],
-        embeddings_count=len(current_poses),
-        poses_completed=current_poses,
-        needs_reenroll=needs_reenroll,
-    )
+def _serialize_persons_batch(
+    db: Session,
+    persons: list[Person],
+    organization_id: int,
+    current_model_version: str,
+) -> list[PersonRead]:
+    if not persons:
+        return []
+
+    shift_map = {
+        sh.id: sh
+        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
+    }
+    group_map = {
+        g.id: g
+        for g in db.scalars(select(Group).where(Group.organization_id == organization_id)).all()
+    }
+
+    serialized: list[PersonRead] = []
+    for person in persons:
+        embeddings = person.embeddings
+        current_poses = [
+            e.pose_label for e in embeddings if e.model_version == current_model_version
+        ]
+        needs_reenroll = any(e.model_version != current_model_version for e in embeddings)
+        group_ids = [link.group_id for link in person.group_links]
+
+        direct_shift = shift_map.get(person.work_shift_id) if person.work_shift_id else None
+        eff_shift = direct_shift
+        shift_source: ShiftSource = "direct" if direct_shift is not None else "none"
+        if eff_shift is None:
+            for gid in sorted(group_ids):
+                grp = group_map.get(gid)
+                if grp and grp.default_work_shift_id and grp.default_work_shift_id in shift_map:
+                    eff_shift = shift_map[grp.default_work_shift_id]
+                    shift_source = "group"
+                    break
+
+        serialized.append(
+            PersonRead(
+                id=person.id,
+                organization_id=person.organization_id,
+                external_id=person.external_id,
+                full_name=person.full_name,
+                email=person.email,
+                role=person.role,
+                avatar_base64=person.avatar_base64,
+                biometric_consent=person.biometric_consent,
+                biometric_consent_at=person.biometric_consent_at,
+                is_active=person.is_active,
+                created_at=person.created_at,
+                group_ids=group_ids,
+                work_shift_id=person.work_shift_id,
+                work_shift_name=direct_shift.name if direct_shift else None,
+                effective_work_shift_id=eff_shift.id if eff_shift else None,
+                effective_work_shift_name=eff_shift.name if eff_shift else None,
+                effective_work_shift_code=eff_shift.code if eff_shift else None,
+                shift_source=shift_source,
+                embeddings_count=len(current_poses),
+                poses_completed=current_poses,
+                needs_reenroll=needs_reenroll,
+            )
+        )
+    return serialized
 
 
 def _sync_person_groups(
@@ -110,6 +152,7 @@ def _sync_person_groups(
 def list_persons(
     organization_id: int | None = Query(default=None),
     group_id: int | None = Query(default=None),
+    work_shift_id: int | None = Query(default=None),
     search: str | None = Query(default=None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -141,14 +184,17 @@ def list_persons(
             (Person.full_name.ilike(pattern)) | (Person.external_id.ilike(pattern))
         )
 
-    persons = db.scalars(stmt).all()
-    return [_serialize_person(p, settings.model_version) for p in persons]
+    persons = list(db.scalars(stmt).all())
+    serialized = _serialize_persons_batch(db, persons, scoped_org_id, settings.model_version)
+    if work_shift_id is not None:
+        serialized = [p for p in serialized if p.effective_work_shift_id == work_shift_id]
+    return serialized
 
 
 @router.post("/persons", response_model=PersonRead, status_code=status.HTTP_201_CREATED)
 def create_person(
     payload: PersonCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> PersonRead:
     settings = get_settings()
@@ -157,8 +203,17 @@ def create_person(
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
+    if payload.work_shift_id is not None:
+        shift = db.get(WorkShift, payload.work_shift_id)
+        if shift is None or shift.organization_id != org.id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
+            )
+
     person = Person(
         organization_id=payload.organization_id,
+        work_shift_id=payload.work_shift_id,
         external_id=payload.external_id.strip(),
         full_name=payload.full_name.strip(),
         email=payload.email.strip() if payload.email else None,
@@ -185,14 +240,14 @@ def create_person(
         .options(selectinload(Person.embeddings), selectinload(Person.group_links))
         .where(Person.id == person.id)
     ).one()
-    return _serialize_person(loaded, settings.model_version)
+    return _serialize_persons_batch(db, [loaded], loaded.organization_id, settings.model_version)[0]
 
 
 @router.patch("/persons/{person_id}", response_model=PersonRead)
 def update_person(
     person_id: int,
     payload: PersonUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> PersonRead:
     settings = get_settings()
@@ -203,6 +258,14 @@ def update_person(
 
     data = payload.model_dump(exclude_unset=True)
     group_ids = data.pop("group_ids", None)
+
+    if "work_shift_id" in data and data["work_shift_id"] is not None:
+        shift = db.get(WorkShift, data["work_shift_id"])
+        if shift is None or shift.organization_id != person.organization_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
+            )
 
     if "biometric_consent" in data:
         new_consent = bool(data["biometric_consent"])
@@ -223,7 +286,7 @@ def update_person(
         .options(selectinload(Person.embeddings), selectinload(Person.group_links))
         .where(Person.id == person.id)
     ).one()
-    return _serialize_person(loaded, settings.model_version)
+    return _serialize_persons_batch(db, [loaded], loaded.organization_id, settings.model_version)[0]
 
 
 @router.delete("/persons/{person_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -248,7 +311,7 @@ async def enroll_frame(
     pose_label: PoseLabel = Form(...),
     store_avatar: bool | None = Form(default=None),
     dry_run: bool = Form(default=False),
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> EnrollFrameResponse:
     settings = get_settings()

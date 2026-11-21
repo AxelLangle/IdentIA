@@ -16,7 +16,11 @@ import {
 } from "lucide-react";
 import { CameraView, type CameraViewHandle } from "../components/CameraView";
 import { PasswordInput } from "../components/PasswordInput";
-import { comparePeriodsNatural, getPeriodMeta } from "../lib/academicPeriods";
+import {
+  comparePeriodsNatural,
+  formatGroupPeriodLabel,
+  getPeriodMeta,
+} from "../lib/academicPeriods";
 import { api } from "../lib/api";
 import type {
   AuthUser,
@@ -27,6 +31,7 @@ import type {
   Person,
   PersonRole,
   PoseLabel,
+  WorkShift,
 } from "../types/api";
 
 interface EnrollmentPageProps {
@@ -127,12 +132,17 @@ export function EnrollmentPage({
   const [revokeError, setRevokeError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState(false);
 
-  // Materias heredadas y filtros por grupo/carrera/periodo (modo educación)
+  // Materias heredadas y filtros por grupo/carrera/periodo (modo educación) y turnos (empresa)
   const [courses, setCourses] = useState<CourseAssignment[]>([]);
+  const [workShifts, setWorkShifts] = useState<WorkShift[]>([]);
+  const [selectedWorkShiftId, setSelectedWorkShiftId] = useState<string>("");
   const [formCareerFilter, setFormCareerFilter] = useState<string>("");
   const [listGroupFilter, setListGroupFilter] = useState<string>("");
+  const [listShiftFilter, setListShiftFilter] = useState<string>("");
 
-  const canManagePersons = ["superadmin", "org_admin", "operator"].includes(currentUser.role);
+  const canManagePersons = ["superadmin", "org_admin", "supervisor", "operator"].includes(
+    currentUser.role
+  );
   const canDeletePersons = ["superadmin", "org_admin"].includes(currentUser.role);
 
   const activePerson = persons.find((p) => p.id === activePersonId) ?? null;
@@ -172,6 +182,25 @@ export function EnrollmentPage({
   }, [currentUser.role, organization.id, organization.mode]);
 
   useEffect(() => {
+    if (organization.mode !== "enterprise") {
+      setWorkShifts([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .listWorkShifts(organization.id)
+      .then((list) => {
+        if (!cancelled) setWorkShifts(list);
+      })
+      .catch(() => {
+        if (!cancelled) setWorkShifts([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [organization.id, organization.mode]);
+
+  useEffect(() => {
     setRole(organization.mode === "education" ? "student" : "employee");
     setStoreAvatar(organization.store_avatar_by_default);
     setActivePersonId(null);
@@ -179,8 +208,10 @@ export function EnrollmentPage({
     setCompletedBanner(null);
     setSelectedForRevoke([]);
     setRevokeTargets(null);
+    setSelectedWorkShiftId("");
     setFormCareerFilter("");
     setListGroupFilter("");
+    setListShiftFilter("");
     revokeAllPreviews();
   }, [
     organization.id,
@@ -192,6 +223,17 @@ export function EnrollmentPage({
   const filteredPersons = persons.filter((p) => {
     if (listGroupFilter && !p.group_ids.includes(Number(listGroupFilter))) {
       return false;
+    }
+    if (organization.mode === "enterprise" && listShiftFilter) {
+      if (listShiftFilter === "__none__" && p.effective_work_shift_id !== null) {
+        return false;
+      }
+      if (
+        listShiftFilter !== "__none__" &&
+        String(p.effective_work_shift_id ?? "") !== listShiftFilter
+      ) {
+        return false;
+      }
     }
     const q = search.trim().toLowerCase();
     if (!q) return true;
@@ -232,7 +274,7 @@ export function EnrollmentPage({
         });
       }
       const bucket = careerMap.get(cKey)!;
-      const pKey = g.semester?.trim() || "Sin periodo";
+      const pKey = formatGroupPeriodLabel(g.semester, g.period_type) ?? "Sin periodo";
       const list = bucket.periods.get(pKey) ?? [];
       list.push(g);
       bucket.periods.set(pKey, list);
@@ -305,11 +347,16 @@ export function EnrollmentPage({
         role,
         biometric_consent: biometricConsent,
         group_ids: selectedGroupIds,
+        work_shift_id:
+          organization.mode === "enterprise" && selectedWorkShiftId
+            ? Number(selectedWorkShiftId)
+            : null,
       });
       setExternalId("");
       setFullName("");
       setEmail("");
       setSelectedGroupIds([]);
+      setSelectedWorkShiftId("");
       setShowCreateForm(false);
       await onRefreshPersons();
       if (created.biometric_consent) {
@@ -676,11 +723,35 @@ export function EnrollmentPage({
                         }`}
                       >
                         {g.name}
+                        {g.default_work_shift_code ? ` · ${g.default_work_shift_code}` : ""}
                       </button>
                     );
                   })}
                 </div>
               )}
+            </div>
+          )}
+
+          {organization.mode === "enterprise" && workShifts.some((s) => s.is_active) && (
+            <div className="sm:max-w-sm">
+              <label className="block text-xs text-slate-400 mb-1">
+                Turno laboral directo (opcional)
+              </label>
+              <select
+                value={selectedWorkShiftId}
+                onChange={(e) => setSelectedWorkShiftId(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">Heredar de departamento / Sin turno</option>
+                {workShifts
+                  .filter((sh) => sh.is_active)
+                  .map((sh) => (
+                    <option key={sh.id} value={sh.id}>
+                      {sh.name} ({sh.start_time}–{sh.end_time}
+                      {sh.crosses_midnight ? " 🌙" : ""})
+                    </option>
+                  ))}
+              </select>
             </div>
           )}
 
@@ -760,6 +831,21 @@ export function EnrollmentPage({
                 )}
               </select>
             )}
+            {organization.mode === "enterprise" && workShifts.length > 0 && (
+              <select
+                value={listShiftFilter}
+                onChange={(e) => setListShiftFilter(e.target.value)}
+                className="sm:w-48 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
+              >
+                <option value="">Todos los turnos</option>
+                <option value="__none__">Sin turno asignado</option>
+                {workShifts.map((sh) => (
+                  <option key={sh.id} value={sh.id}>
+                    {sh.name} ({sh.code})
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
 
           {selectedForRevoke.length > 0 && (
@@ -832,7 +918,14 @@ export function EnrollmentPage({
                             {p.external_id} · {p.role}
                             {personGroups.length > 0
                               ? ` · ${personGroups
-                                  .map((g) => `${g.name}${g.semester ? ` (${g.semester})` : ""}`)
+                                  .map(
+                                    (g) =>
+                                      `${g.name}${
+                                        g.semester
+                                          ? ` (${formatGroupPeriodLabel(g.semester, g.period_type)})`
+                                          : ""
+                                      }`
+                                  )
                                   .join(", ")}`
                               : ""}
                           </p>
@@ -851,6 +944,23 @@ export function EnrollmentPage({
                         {p.embeddings_count}/{TOTAL_POSES} poses
                       </span>
                     </div>
+
+                    {organization.mode === "enterprise" && p.effective_work_shift_name && (
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                        <span className="text-slate-400">Turno:</span>
+                        <span
+                          className={`px-2 py-0.5 rounded border ${
+                            p.shift_source === "direct"
+                              ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/25"
+                              : "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
+                          }`}
+                        >
+                          {p.effective_work_shift_name}
+                          {p.effective_work_shift_code ? ` (${p.effective_work_shift_code})` : ""} ·{" "}
+                          {p.shift_source === "direct" ? "directo" : "heredado"}
+                        </span>
+                      </div>
+                    )}
 
                     {inheritedCourses.length > 0 && (
                       <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">

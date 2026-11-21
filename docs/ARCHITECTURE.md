@@ -41,13 +41,14 @@ El mismo motor soporta ambos casos de uso mediante configuración organizacional
 |---|---|---|
 | `Organization` | Empresa (`mode = "enterprise"`), define tolerancia de retardo y cooldown anti-duplicado | Escuela/Facultad (`mode = "education"`), define tolerancia y `academic_period_type` (`bimestral`, `trimestral`, `cuatrimestral`, `semestral`, `ciclo`) |
 | `Career` | N/A | Carrera o programa académico; puede sobrescribir el tipo de periodo (`period_type`) |
-| `Group` | Departamento, área o turno con horario (`schedule_start`, `schedule_end`) | Grupo académico vinculado a carrera (`career_id`), periodo (`semester`) y aula fija (`default_classroom`) |
+| `WorkShift` | Turno laboral (diurno o nocturno con `crosses_midnight`), días laborales (`0..6`) y tolerancias de entrada/salida anticipada | N/A |
+| `Group` | Departamento, área o equipo con turno por defecto opcional (`default_work_shift_id`) | Grupo académico vinculado a carrera (`career_id`), periodo (`semester`) y aula fija (`default_classroom`) |
 | `Subject` / `CourseAssignment` | N/A | Catálogo de asignaturas vinculadas a grupo y profesor (`CourseAssignment`) con herencia automática para alumnos |
 | `ClassSchedule` | N/A | Bloques de horario semanal por asignatura/grupo (`day_of_week`, `start_time`, `end_time`, `classroom`) |
-| `Person` | Empleado (`external_id` = núm. de empleado) | Alumno o docente (`external_id` = matrícula) |
+| `Person` | Empleado (`external_id` = núm. de empleado) con turno directo opcional (`work_shift_id`) o heredado del área | Alumno o docente (`external_id` = matrícula) |
 | `FaceEmbedding` | 6 vectores validados por pose (`frontal`, `left`, `right`, `up`, `down`, `smile`) | Mismo esquema de 6 poses |
-| `AttendanceSession` | Jornada diaria (`session_type = "workday"`) | Sesión de clase ligada a `course_assignment_id` y `schedule_id` (`session_type = "class"`) |
-| `AttendanceEvent` | Eventos `check_in` y `check_out` con cálculo de puntualidad y horas trabajadas | Evento `present` único por sesión (`on_time` o `late`) |
+| `AttendanceSession` | Jornada diaria o por turno (`session_type = "workday"`, `work_shift_id`) | Sesión de clase ligada a `course_assignment_id` y `schedule_id` (`session_type = "class"`) |
+| `AttendanceEvent` | Eventos `check_in` y `check_out` con estado (`on_time`, `late`, `early_exit`, `manual`), `worked_minutes`, `late_minutes`, `early_exit_minutes` | Evento `present` único por sesión (`on_time` o `late`) |
 | `User` | Cuentas de acceso (`superadmin`, `org_admin`, `operator`) | Cuentas de acceso (`superadmin`, `org_admin`, `teacher`, `operator`) |
 | `DelegatedCredential` | Claves delegadas hasheadas (`scrypt`) para operaciones sensibles | Misma delegación con trazabilidad de creador y asignado |
 | `AuditLog` | Bitácora inmutable de altas, credenciales y revocaciones | Misma bitácora aislada por organización |
@@ -60,6 +61,15 @@ El mismo motor soporta ambos casos de uso mediante configuración organizacional
 - **Herencia automática por grupo:** al asignar asignaturas a un grupo (`CourseAssignment`), todos los alumnos inscritos en ese grupo heredan automáticamente esas materias y son elegibles en su galería biométrica sin asignaciones individuales manuales (`/api/academic/students/{person_id}/courses`).
 - **Aislamiento estricto por profesor:** un usuario con rol `teacher` únicamente visualiza y opera sesiones, alumnos y eventos de sus propios `CourseAssignment` (`403 Forbidden` en sesiones o estadísticas globales de otros docentes). Desde **Mi Agenda Docente**, abre su clase actual o próxima en 1 clic hacia el kiosco.
 - **Generación idempotente de sesiones y estadísticas:** `/api/academic/sessions/generate` crea sesiones por horario del día sin duplicarlas, y `/api/academic/stats` consolida porcentajes de asistencia, retardos y faltas **por asignatura** y **por grupo/alumno** para `org_admin` y `superadmin`.
+
+---
+
+## 3.3. Turnos Empresariales y Reglas de Jornada (Bloque D)
+
+- **Catálogo multi-turno (`0004_enterprise_work_shifts`):** las organizaciones con `mode = "enterprise"` administran múltiples `WorkShift` (`/api/enterprise/shifts`) con horario de entrada/salida, días laborales configurables (`days_of_week`), tolerancia de retardo (propia o heredada de la organización) y tolerancia de salida anticipada (`early_exit_tolerance_minutes`).
+- **Herencia directa o por departamento:** un empleado puede tener un turno directo (`Person.work_shift_id`) o heredar automáticamente el turno por defecto de su área/departamento (`Group.default_work_shift_id`), con soporte de asignación masiva vía `/api/enterprise/shifts/{id}/assign-persons`.
+- **Turnos nocturnos (`crosses_midnight = true`):** si la hora de salida es menor que la hora de entrada (p. ej. `22:00` → `06:00`), la salida se evalúa contra el día calendario siguiente. Cuando un empleado hace `check_out` en el kiosco al amanecer (incluso desde una sesión abierta del nuevo día), `find_open_overnight_checkin` vincula y cierra automáticamente su entrada pendiente en la sesión origen del día anterior, calculando `worked_minutes` y verificando si hubo salida anticipada (`status = "early_exit"`, `early_exit_minutes`).
+- **Generación idempotente y estadísticas empresariales:** `/api/enterprise/sessions/generate` crea jornadas por turno sin duplicarlas y `/api/enterprise/stats` consolida asistencia, puntualidad, retardos, salidas anticipadas, faltas (días programados sin entrada), salidas pendientes y horas trabajadas tanto **por turno** como **por empleado**.
 
 ---
 

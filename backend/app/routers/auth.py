@@ -18,6 +18,22 @@ from app.services.security_service import record_audit_log
 router = APIRouter(prefix="/api", tags=["auth"])
 
 
+def _validate_role_for_org_mode(role: str, org: Organization | None) -> None:
+    """Impide asignar roles docentes en empresa o supervisores en escuela."""
+    if org is None:
+        return
+    if org.mode == "enterprise" and role == "teacher":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El rol 'Profesor' solo está disponible en organizaciones escolares. En modo empresa utiliza 'Supervisor'.",
+        )
+    if org.mode == "education" and role == "supervisor":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El rol 'Supervisor' solo está disponible en organizaciones empresariales. En modo escolar utiliza 'Profesor'.",
+        )
+
+
 def _serialize_user(user: User, org_map: dict[int, Organization] | None = None) -> UserRead:
     org = None
     if user.organization_id is not None:
@@ -88,9 +104,11 @@ def create_user(
                 detail="Un administrador de organización no puede crear usuarios Superadmin.",
             )
         target_org_id: int | None = resolve_org_scope(current_user, payload.organization_id)
+        target_org = db.get(Organization, target_org_id)
     else:
         if payload.role == "superadmin":
             target_org_id = None
+            target_org = None
         else:
             if payload.organization_id is None:
                 raise HTTPException(
@@ -101,6 +119,9 @@ def create_user(
             if org is None:
                 raise HTTPException(status_code=404, detail="Organización no encontrada.")
             target_org_id = org.id
+            target_org = org
+
+    _validate_role_for_org_mode(payload.role, target_org)
 
     email_norm = payload.email.strip().lower()
     existing = db.scalars(select(User).where(User.email == email_norm)).first()
@@ -174,6 +195,9 @@ def update_user(
     if payload.role is not None and payload.role != target.role:
         if payload.role == "superadmin" and target.organization_id is not None:
             target.organization_id = None
+        elif payload.role != "superadmin" and target.organization_id is not None:
+            target_org = db.get(Organization, target.organization_id)
+            _validate_role_for_org_mode(payload.role, target_org)
         target.role = payload.role
         changes.append(f"rol={payload.role}")
     if payload.is_active is not None:
