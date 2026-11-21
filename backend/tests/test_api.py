@@ -1,406 +1,425 @@
+"""Pruebas de integración HTTP para salud, enrolamiento, privacidad y asistencia."""
+
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 
-from app.config import get_settings
-from app.models import AttendanceEvent, FaceEmbedding
-from app.vision.engine import normalize_embedding
-from app.vision.quality import FaceBox
+from app.config import obtener_configuracion
+from app.models import EventoAsistencia, VectorFacial
+from app.vision.engine import normalizar_vector
+from app.vision.quality import CuadroRostro
 from tests.conftest import (
-    encode_jpeg_bytes,
-    make_pose_landmarks,
-    make_sharp_face_image,
-    make_unit_vector,
+    codificar_bytes_jpeg,
+    crear_imagen_rostro_nitida,
+    crear_puntos_pose,
+    crear_vector_unitario,
 )
 
 
-def _good_image_bytes() -> bytes:
-    return encode_jpeg_bytes(make_sharp_face_image(400, 400, (100, 80, 180, 200), 140, False))
+def _bytes_imagen_valida() -> bytes:
+    """Genera un JPEG nítido de prueba para enviar como `multipart/form-data`."""
+    return codificar_bytes_jpeg(
+        crear_imagen_rostro_nitida(400, 400, (100, 80, 180, 200), 140, False)
+    )
 
 
-def test_health_and_seeded_organization(api_client) -> None:
-    client, _, _, _ = api_client
-    res = client.get("/api/health")
-    assert res.status_code == 200
-    body = res.json()
-    assert body["status"] == "ok"
-    assert body["models_loaded"] is True
-    assert body["organizations_count"] == 1
+def test_salud_y_organizacion_semilla(cliente_api) -> None:
+    """Verifica el endpoint `/api/health` y la creación automática de la org demo."""
+    cliente, _, _, _ = cliente_api
+    respuesta = cliente.get("/api/health")
+    assert respuesta.status_code == 200
+    cuerpo = respuesta.json()
+    assert cuerpo["estado"] == "ok"
+    assert cuerpo["modelos_cargados"] is True
+    assert cuerpo["cantidad_organizaciones"] == 1
 
-    orgs = client.get("/api/organizations").json()
-    assert len(orgs) == 1
-    assert orgs[0]["mode"] == "enterprise"
+    organizaciones = cliente.get("/api/organizations").json()
+    assert len(organizaciones) == 1
+    assert organizaciones[0]["modo"] == "enterprise"
 
 
-def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
-    client, SessionLocal, engine, tmp_path = api_client
-    org_id = client.get("/api/organizations").json()[0]["id"]
+def test_validacion_enrolamiento_privacidad_y_revocacion(cliente_api) -> None:
+    """Prueba consentimiento obligatorio, 6 poses, no guardado de fotos crudas y revocación."""
+    cliente, FabricaSesiones, motor, ruta_temporal = cliente_api
+    id_organizacion = cliente.get("/api/organizations").json()[0]["id"]
 
-    # Persona sin consentimiento biométrico
-    p_no_consent = client.post(
+    # Persona sin consentimiento biométrico inicial
+    persona_sin_consentimiento = cliente.post(
         "/api/persons",
         json={
-            "organization_id": org_id,
-            "external_id": "EMP-100",
-            "full_name": "Laura Méndez",
-            "role": "employee",
-            "biometric_consent": False,
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "EMP-100",
+            "nombre_completo": "Laura Méndez",
+            "rol": "employee",
+            "consentimiento_biometrico": False,
         },
     )
-    assert p_no_consent.status_code == 201
-    person_id = p_no_consent.json()["id"]
+    assert persona_sin_consentimiento.status_code == 201
+    id_persona = persona_sin_consentimiento.json()["id"]
 
-    # Debe bloquear enrolamiento sin consentimiento
-    blocked = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "frontal"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    # El enrolamiento debe bloquearse mientras no exista consentimiento
+    bloqueado = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        data={"etiqueta_pose": "frontal"},
+        files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
     )
-    assert blocked.status_code == 400
+    assert bloqueado.status_code == 400
 
-    # Duplicado de external_id devuelve 409
-    dup = client.post(
+    # Identificador externo duplicado en la misma organización devuelve HTTP 409
+    duplicado = cliente.post(
         "/api/persons",
         json={
-            "organization_id": org_id,
-            "external_id": "EMP-100",
-            "full_name": "Otra Persona",
-            "biometric_consent": True,
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "EMP-100",
+            "nombre_completo": "Otra Persona",
+            "consentimiento_biometrico": True,
         },
     )
-    assert dup.status_code == 409
+    assert duplicado.status_code == 409
 
-    # Otorga consentimiento
-    upd = client.patch(f"/api/persons/{person_id}", json={"biometric_consent": True})
-    assert upd.status_code == 200
-    assert upd.json()["biometric_consent"] is True
-
-    # 0 rostros -> rechazado
-    engine.next_boxes = []
-    no_face = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "frontal"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    # Otorga consentimiento biométrico
+    actualizada = cliente.patch(
+        f"/api/persons/{id_persona}",
+        json={"consentimiento_biometrico": True},
     )
-    assert no_face.status_code == 200
-    assert no_face.json()["accepted"] is False
+    assert actualizada.status_code == 200
+    assert actualizada.json()["consentimiento_biometrico"] is True
 
-    # 2 rostros -> rechazado
-    box1 = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))
-    box2 = FaceBox(10, 10, 90, 90, 0.91, make_pose_landmarks("frontal"))
-    engine.next_boxes = [box1, box2]
-    two_faces = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "frontal"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    # 0 rostros detectados -> rechazado
+    motor.siguientes_cuadros = []
+    sin_rostro = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        data={"etiqueta_pose": "frontal"},
+        files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
     )
-    assert two_faces.json()["accepted"] is False
-    assert "varios rostros" in two_faces.json()["message"]
+    assert sin_rostro.status_code == 200
+    assert sin_rostro.json()["aceptado"] is False
 
-    # 1 rostro válido -> aceptado y genera avatar
-    engine.next_boxes = [box1]
-    engine.next_embedding = make_unit_vector(42)
-    ok_frontal = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "frontal", "store_avatar": "true"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    # 2 rostros simultáneos -> rechazado
+    cuadro_1 = CuadroRostro(100, 80, 180, 200, 0.98, crear_puntos_pose("frontal"))
+    cuadro_2 = CuadroRostro(10, 10, 90, 90, 0.91, crear_puntos_pose("frontal"))
+    motor.siguientes_cuadros = [cuadro_1, cuadro_2]
+    dos_rostros = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        data={"etiqueta_pose": "frontal"},
+        files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
     )
-    assert ok_frontal.status_code == 200
-    data_frontal = ok_frontal.json()
-    assert data_frontal["accepted"] is True
-    assert data_frontal["pose_valid"] is True
-    assert data_frontal["embeddings_count"] == 1
-    assert data_frontal["avatar_saved"] is True
+    assert dos_rostros.json()["aceptado"] is False
+    assert "varios rostros" in dos_rostros.json()["mensaje"]
 
-    # Pose incorrecta: rostro frontal enviado como pose "left" -> rechazado
-    wrong_pose = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "left"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    # 1 rostro frontal válido -> aceptado y guarda miniatura avatar
+    motor.siguientes_cuadros = [cuadro_1]
+    motor.siguiente_vector = crear_vector_unitario(42)
+    frontal_ok = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        data={"etiqueta_pose": "frontal", "guardar_avatar": "true"},
+        files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
     )
-    assert wrong_pose.json()["accepted"] is False
-    assert wrong_pose.json()["pose_valid"] is False
+    assert frontal_ok.status_code == 200
+    datos_frontales = frontal_ok.json()
+    assert datos_frontales["aceptado"] is True
+    assert datos_frontales["pose_valida"] is True
+    assert datos_frontales["cantidad_vectores"] == 1
+    assert datos_frontales["avatar_guardado"] is True
 
-    # Pose "left" válida con dry_run=true -> pose_valid=True pero no persiste vector
-    left_box = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("left"))
-    engine.next_boxes = [left_box]
-    dry = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "left", "dry_run": "true"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    # Pose incorrecta: rostro mirando al frente enviado como pose "left" -> rechazado
+    pose_incorrecta = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        data={"etiqueta_pose": "left"},
+        files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
     )
-    assert dry.status_code == 200
-    assert dry.json()["pose_valid"] is True
-    assert dry.json()["accepted"] is False
-    assert dry.json()["embeddings_count"] == 1
+    assert pose_incorrecta.json()["aceptado"] is False
+    assert pose_incorrecta.json()["pose_valida"] is False
 
-    # Pose inconsistente (otra persona) -> rechazada
-    engine.next_embedding = -make_unit_vector(42)
-    inconsistent = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "left"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    # Pose "left" válida con solo_validacion=true -> valida pose pero no persiste vector
+    cuadro_izquierda = CuadroRostro(100, 80, 180, 200, 0.98, crear_puntos_pose("left"))
+    motor.siguientes_cuadros = [cuadro_izquierda]
+    solo_validacion = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        data={"etiqueta_pose": "left", "solo_validacion": "true"},
+        files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
     )
-    assert inconsistent.json()["accepted"] is False
-    assert "no coincide" in inconsistent.json()["message"]
+    assert solo_validacion.status_code == 200
+    assert solo_validacion.json()["pose_valida"] is True
+    assert solo_validacion.json()["aceptado"] is False
+    assert solo_validacion.json()["cantidad_vectores"] == 1
 
-    # Completa las 5 poses restantes válidas hasta llegar a 6/6
-    engine.next_embedding = make_unit_vector(42)
-    last_pose_res = None
+    # Rostro inconsistente (otra persona) -> rechazado
+    motor.siguiente_vector = -crear_vector_unitario(42)
+    inconsistente = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        data={"etiqueta_pose": "left"},
+        files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
+    )
+    assert inconsistente.json()["aceptado"] is False
+    assert "no coincide" in inconsistente.json()["mensaje"]
+
+    # Completa las 5 poses restantes válidas hasta alcanzar 6/6
+    motor.siguiente_vector = crear_vector_unitario(42)
+    ultima_respuesta = None
     for pose in ("left", "right", "up", "down", "smile"):
-        engine.next_boxes = [FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks(pose))]
-        res_pose = client.post(
-            f"/api/persons/{person_id}/enroll-frame",
-            data={"pose_label": pose},
-            files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+        motor.siguientes_cuadros = [
+            CuadroRostro(100, 80, 180, 200, 0.98, crear_puntos_pose(pose))
+        ]
+        res_pose = cliente.post(
+            f"/api/persons/{id_persona}/enroll-frame",
+            data={"etiqueta_pose": pose},
+            files={"imagen": ("frame.jpg", _bytes_imagen_valida(), "image/jpeg")},
         )
         assert res_pose.status_code == 200
-        last_pose_res = res_pose.json()
-        assert last_pose_res["accepted"] is True
+        ultima_respuesta = res_pose.json()
+        assert ultima_respuesta["aceptado"] is True
 
-    assert last_pose_res is not None
-    assert last_pose_res["is_complete"] is True
-    assert last_pose_res["required_poses_count"] == 6
+    assert ultima_respuesta is not None
+    assert ultima_respuesta["enrolamiento_completo"] is True
+    assert ultima_respuesta["cantidad_poses_requeridas"] == 6
 
-    final_person = [p for p in client.get(f"/api/persons?organization_id={org_id}").json() if p["id"] == person_id][0]
-    assert final_person["embeddings_count"] == 6
+    persona_final = [
+        p
+        for p in cliente.get(f"/api/persons?id_organizacion={id_organizacion}").json()
+        if p["id"] == id_persona
+    ][0]
+    assert persona_final["cantidad_vectores"] == 6
 
-    with SessionLocal() as db:
-        frontal_emb = db.scalars(
-            select(FaceEmbedding).where(
-                FaceEmbedding.person_id == person_id,
-                FaceEmbedding.pose_label == "frontal",
+    with FabricaSesiones() as sesion_bd:
+        vector_frontal = sesion_bd.scalars(
+            select(VectorFacial).where(
+                VectorFacial.id_persona == id_persona,
+                VectorFacial.etiqueta_pose == "frontal",
             )
         ).one()
-        assert frontal_emb.pitch_ratio is not None
-        assert frontal_emb.mouth_ratio is not None
+        assert vector_frontal.relacion_inclinacion_vertical is not None
+        assert vector_frontal.relacion_boca is not None
 
-    # Privacidad: ninguna foto cruda .jpg/.png persistida en el directorio temporal de datos
-    saved_images = list(Path(tmp_path).rglob("*.jpg")) + list(Path(tmp_path).rglob("*.png"))
-    assert saved_images == []
+    # Privacidad: ninguna imagen cruda .jpg/.png persistida en disco
+    imagenes_guardadas = list(Path(ruta_temporal).rglob("*.jpg")) + list(
+        Path(ruta_temporal).rglob("*.png")
+    )
+    assert imagenes_guardadas == []
 
-    # Revocación de biometría protegida con contraseña de autorización
-    settings = get_settings()
-    revoked = client.request(
+    # Revocación biométrica protegida con contraseña administrativa
+    configuracion = obtener_configuracion()
+    revocado = cliente.request(
         "DELETE",
-        f"/api/persons/{person_id}/biometrics",
+        f"/api/persons/{id_persona}/biometrics",
         json={
-            "authorization_secret": settings.bootstrap_superadmin_password,
-            "reason": "Prueba de revocación individual",
+            "secreto_autorizacion": configuracion.contrasena_superadmin_inicial,
+            "motivo": "Prueba de revocación individual",
         },
     )
-    assert revoked.status_code == 200
-    assert revoked.json()["deleted_embeddings"] == 6
-    assert revoked.json()["avatar_cleared"] is True
+    assert revocado.status_code == 200
+    assert revocado.json()["vectores_eliminados"] == 6
+    assert revocado.json()["avatar_eliminado"] is True
 
 
-def test_enterprise_checkin_cooldown_checkout_and_csv(api_client) -> None:
-    client, SessionLocal, engine, _ = api_client
-    org_id = client.get("/api/organizations").json()[0]["id"]
+def test_empresa_entrada_enfriamiento_salida_y_csv(cliente_api) -> None:
+    """Valida flujo empresarial completo: reconocimiento, ambigüedad, cooldown, salida y CSV."""
+    cliente, FabricaSesiones, motor, _ = cliente_api
+    id_organizacion = cliente.get("/api/organizations").json()[0]["id"]
 
-    # Crea persona A y persona B
-    p1 = client.post(
+    persona_1 = cliente.post(
         "/api/persons",
         json={
-            "organization_id": org_id,
-            "external_id": "EMP-01",
-            "full_name": "Diego Morales",
-            "biometric_consent": True,
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "EMP-01",
+            "nombre_completo": "Diego Morales",
+            "consentimiento_biometrico": True,
         },
     ).json()
-    p2 = client.post(
+    persona_2 = cliente.post(
         "/api/persons",
         json={
-            "organization_id": org_id,
-            "external_id": "EMP-02",
-            "full_name": "Sofía Herrera",
-            "biometric_consent": True,
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "EMP-02",
+            "nombre_completo": "Sofía Herrera",
+            "consentimiento_biometrico": True,
         },
     ).json()
 
-    v1 = make_unit_vector(101)
-    v2 = make_unit_vector(202)
-    engine.next_boxes = [FaceBox(100, 80, 180, 200, 0.99, [])]
+    vector_1 = crear_vector_unitario(101)
+    vector_2 = crear_vector_unitario(202)
+    motor.siguientes_cuadros = [CuadroRostro(100, 80, 180, 200, 0.99, [])]
 
-    engine.next_embedding = v1
+    motor.siguiente_vector = vector_1
     assert (
-        client.post(
-            f"/api/persons/{p1['id']}/enroll-frame",
-            data={"pose_label": "frontal"},
-            files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
-        ).json()["accepted"]
+        cliente.post(
+            f"/api/persons/{persona_1['id']}/enroll-frame",
+            data={"etiqueta_pose": "frontal"},
+            files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
+        ).json()["aceptado"]
         is True
     )
 
-    engine.next_embedding = v2
+    motor.siguiente_vector = vector_2
     assert (
-        client.post(
-            f"/api/persons/{p2['id']}/enroll-frame",
-            data={"pose_label": "frontal"},
-            files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
-        ).json()["accepted"]
+        cliente.post(
+            f"/api/persons/{persona_2['id']}/enroll-frame",
+            data={"etiqueta_pose": "frontal"},
+            files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
+        ).json()["aceptado"]
         is True
     )
 
     # Rostro desconocido
-    engine.next_embedding = make_unit_vector(999)
-    unk = client.post(
+    motor.siguiente_vector = crear_vector_unitario(999)
+    desconocido = cliente.post(
         "/api/attendance/recognize-frame",
-        data={"organization_id": str(org_id)},
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        data={"id_organizacion": str(id_organizacion)},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     ).json()
-    assert unk["match_status"] == "unknown"
+    assert desconocido["estado_coincidencia"] == "unknown"
 
-    # Coincidencia ambigua (equidistante entre v1 y v2)
-    engine.next_embedding = normalize_embedding(v1 + v2)
-    amb = client.post(
+    # Coincidencia ambigua entre dos personas equidistantes
+    motor.siguiente_vector = normalizar_vector(vector_1 + vector_2)
+    ambiguo = cliente.post(
         "/api/attendance/recognize-frame",
-        data={"organization_id": str(org_id)},
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        data={"id_organizacion": str(id_organizacion)},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     ).json()
-    assert amb["match_status"] == "ambiguous"
+    assert ambiguo["estado_coincidencia"] == "ambiguous"
 
     # Primer reconocimiento -> check_in
-    engine.next_embedding = v1
-    checkin = client.post(
+    motor.siguiente_vector = vector_1
+    entrada = cliente.post(
         "/api/attendance/recognize-frame",
-        data={"organization_id": str(org_id), "action_mode": "auto"},
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        data={"id_organizacion": str(id_organizacion), "modo_accion": "auto"},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     ).json()
-    assert checkin["match_status"] == "matched"
-    assert checkin["attendance_action"] == "recorded"
-    assert checkin["event"]["event_type"] == "check_in"
-    event_id = checkin["event"]["id"]
+    assert entrada["estado_coincidencia"] == "matched"
+    assert entrada["accion_asistencia"] == "recorded"
+    assert entrada["evento"]["tipo_evento"] == "check_in"
+    id_evento = entrada["evento"]["id"]
 
-    # Segundo inmediato -> cooldown sin duplicado
-    cd = client.post(
+    # Segundo inmediato -> bloqueado por enfriamiento (cooldown)
+    enfriamiento = cliente.post(
         "/api/attendance/recognize-frame",
-        data={"organization_id": str(org_id), "action_mode": "auto"},
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        data={"id_organizacion": str(id_organizacion), "modo_accion": "auto"},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     ).json()
-    assert cd["attendance_action"] == "cooldown"
+    assert enfriamiento["accion_asistencia"] == "cooldown"
 
-    # Simula que pasaron 90 minutos moviendo el timestamp de entrada
-    with SessionLocal() as db:
-        ev = db.get(AttendanceEvent, event_id)
-        assert ev is not None
-        ev.timestamp = datetime.now() - timedelta(minutes=90)
-        db.commit()
+    # Simula paso de 90 minutos retrocediendo la fecha/hora de la entrada
+    with FabricaSesiones() as sesion_bd:
+        evento = sesion_bd.get(EventoAsistencia, id_evento)
+        assert evento is not None
+        evento.fecha_hora = datetime.now() - timedelta(minutes=90)
+        sesion_bd.commit()
 
-    # Siguiente reconocimiento -> check_out con worked_minutes >= 89
-    checkout = client.post(
+    # Siguiente reconocimiento -> check_out con minutos_trabajados >= 89
+    salida = cliente.post(
         "/api/attendance/recognize-frame",
-        data={"organization_id": str(org_id), "action_mode": "auto"},
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        data={"id_organizacion": str(id_organizacion), "modo_accion": "auto"},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     ).json()
-    assert checkout["attendance_action"] == "recorded"
-    assert checkout["event"]["event_type"] == "check_out"
-    assert checkout["worked_minutes"] >= 89
+    assert salida["accion_asistencia"] == "recorded"
+    assert salida["evento"]["tipo_evento"] == "check_out"
+    assert salida["minutos_trabajados"] >= 89
 
     # Exportación CSV con BOM UTF-8
-    csv_res = client.get(f"/api/attendance/export.csv?organization_id={org_id}")
-    assert csv_res.status_code == 200
-    assert csv_res.text.startswith("\ufeff")
-    assert "Diego Morales" in csv_res.text
+    respuesta_csv = cliente.get(f"/api/attendance/export.csv?id_organizacion={id_organizacion}")
+    assert respuesta_csv.status_code == 200
+    assert respuesta_csv.text.startswith("\ufeff")
+    assert "Diego Morales" in respuesta_csv.text
 
 
-def test_education_mode_session_group_and_manual_fallback(api_client) -> None:
-    client, SessionLocal, engine, _ = api_client
-    edu_org = client.post(
+def test_modo_educativo_sesion_grupo_y_cierre(cliente_api) -> None:
+    """Valida pase de lista escolar, prevención de duplicados y bloqueo al cerrar sesión."""
+    cliente, FabricaSesiones, motor, _ = cliente_api
+    org_educativa = cliente.post(
         "/api/organizations",
         json={
-            "name": "Universidad Politécnica Demo",
-            "mode": "education",
-            "late_tolerance_minutes": 10,
-            "cooldown_seconds": 5,
+            "nombre": "Universidad Politécnica Demo",
+            "modo": "education",
+            "minutos_tolerancia_retardo": 10,
+            "segundos_enfriamiento": 5,
         },
     ).json()
 
-    grp = client.post(
+    grupo = cliente.post(
         "/api/groups",
         json={
-            "organization_id": edu_org["id"],
-            "name": "7B - Programación",
-            "code": "PROG-7B",
-            "schedule_start": "00:00",
-            "schedule_end": "23:59",
+            "id_organizacion": org_educativa["id"],
+            "nombre": "7B - Programación",
+            "codigo": "PROG-7B",
+            "hora_inicio_horario": "00:00",
+            "hora_fin_horario": "23:59",
         },
     ).json()
 
-    student = client.post(
+    alumno = cliente.post(
         "/api/persons",
         json={
-            "organization_id": edu_org["id"],
-            "external_id": "ALU-2025",
-            "full_name": "Valeria Cruz",
-            "role": "student",
-            "biometric_consent": True,
-            "group_ids": [grp["id"]],
+            "id_organizacion": org_educativa["id"],
+            "identificador_externo": "ALU-2025",
+            "nombre_completo": "Valeria Cruz",
+            "rol": "student",
+            "consentimiento_biometrico": True,
+            "ids_grupos": [grupo["id"]],
         },
     ).json()
 
-    engine.next_boxes = [FaceBox(100, 80, 180, 200, 0.98, [])]
-    engine.next_embedding = make_unit_vector(77)
+    motor.siguientes_cuadros = [CuadroRostro(100, 80, 180, 200, 0.98, [])]
+    motor.siguiente_vector = crear_vector_unitario(77)
     assert (
-        client.post(
-            f"/api/persons/{student['id']}/enroll-frame",
-            data={"pose_label": "frontal"},
-            files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
-        ).json()["accepted"]
+        cliente.post(
+            f"/api/persons/{alumno['id']}/enroll-frame",
+            data={"etiqueta_pose": "frontal"},
+            files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
+        ).json()["aceptado"]
         is True
     )
 
-    session = client.post(
+    sesion = cliente.post(
         "/api/sessions",
         json={
-            "organization_id": edu_org["id"],
-            "group_id": grp["id"],
-            "title": "Clase 1 - Arquitectura",
-            "expected_start_time": "00:00",
+            "id_organizacion": org_educativa["id"],
+            "id_grupo": grupo["id"],
+            "titulo": "Clase 1 - Arquitectura",
+            "hora_inicio_esperada": "00:00",
         },
     ).json()
 
-    rec = client.post(
+    reconocimiento = cliente.post(
         "/api/attendance/recognize-frame",
         data={
-            "organization_id": str(edu_org["id"]),
-            "session_id": str(session["id"]),
+            "id_organizacion": str(org_educativa["id"]),
+            "id_sesion": str(sesion["id"]),
         },
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     ).json()
-    assert rec["attendance_action"] == "recorded"
-    assert rec["event"]["event_type"] == "present"
-    assert rec["event"]["status"] == "late"
+    assert reconocimiento["accion_asistencia"] == "recorded"
+    assert reconocimiento["evento"]["tipo_evento"] == "present"
+    assert reconocimiento["evento"]["estado"] == "late"
 
     # Retrocede timestamp más allá de cooldown (5s) para confirmar already_present
-    with SessionLocal() as db:
-        ev = db.get(AttendanceEvent, rec["event"]["id"])
-        assert ev is not None
-        ev.timestamp = datetime.now() - timedelta(seconds=30)
-        db.commit()
+    with FabricaSesiones() as sesion_bd:
+        evento = sesion_bd.get(EventoAsistencia, reconocimiento["evento"]["id"])
+        assert evento is not None
+        evento.fecha_hora = datetime.now() - timedelta(seconds=30)
+        sesion_bd.commit()
 
-    again = client.post(
+    repetido = cliente.post(
         "/api/attendance/recognize-frame",
         data={
-            "organization_id": str(edu_org["id"]),
-            "session_id": str(session["id"]),
+            "id_organizacion": str(org_educativa["id"]),
+            "id_sesion": str(sesion["id"]),
         },
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     ).json()
-    assert again["attendance_action"] == "already_present"
+    assert repetido["accion_asistencia"] == "already_present"
 
-    # Cierra sesión y valida rechazo de reconocimiento sobre sesión cerrada
-    closed = client.post(f"/api/sessions/{session['id']}/close")
-    assert closed.status_code == 200
-    assert closed.json()["status"] == "closed"
+    # Cierra la sesión y verifica que ya no acepte reconocimientos
+    cerrada = cliente.post(f"/api/sessions/{sesion['id']}/close")
+    assert cerrada.status_code == 200
+    assert cerrada.json()["estado"] == "closed"
 
-    on_closed = client.post(
+    sobre_cerrada = cliente.post(
         "/api/attendance/recognize-frame",
         data={
-            "organization_id": str(edu_org["id"]),
-            "session_id": str(session["id"]),
+            "id_organizacion": str(org_educativa["id"]),
+            "id_sesion": str(sesion["id"]),
         },
-        files={"image": ("f.jpg", _good_image_bytes(), "image/jpeg")},
+        files={"imagen": ("f.jpg", _bytes_imagen_valida(), "image/jpeg")},
     )
-    assert on_closed.status_code == 400
+    assert sobre_cerrada.status_code == 400
