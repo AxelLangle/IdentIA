@@ -497,8 +497,124 @@ def test_alembic_0002_recovers_from_partial_create_all(
             rev = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
         verify_engine.dispose()
 
-        assert rev == "0002_education_domain"
-        assert {"career_id", "semester"}.issubset(group_cols)
+        assert rev == "0003_academic_periods_and_classrooms"
+        assert {"career_id", "semester", "default_classroom"}.issubset(group_cols)
         assert {"course_assignment_id", "schedule_id"}.issubset(session_cols)
     finally:
         get_settings.cache_clear()
+
+
+def test_academic_periods_default_classroom_and_multi_day_schedules(raw_api_client) -> None:
+    """Valida periodos académicos (institución/carrera), aula fija en grupo y múltiples días por materia."""
+    client, _, _, _ = raw_api_client
+    settings = get_settings()
+    sa_headers = _auth_header(
+        client,
+        settings.bootstrap_superadmin_email,
+        settings.bootstrap_superadmin_password,
+    )
+
+    school = client.post(
+        "/api/organizations",
+        headers=sa_headers,
+        json={
+            "name": "Politécnica IdentIA",
+            "mode": "education",
+            "academic_period_type": "cuatrimestral",
+            "admin_user": {
+                "full_name": "Admin Poli",
+                "email": "admin.poli@uni.edu",
+                "password": "PoliPass123!",
+            },
+        },
+    )
+    assert school.status_code == 201, school.text
+    assert school.json()["academic_period_type"] == "cuatrimestral"
+    org_id = school.json()["id"]
+    admin_headers = _auth_header(client, "admin.poli@uni.edu", "PoliPass123!")
+
+    # Carrera A hereda cuatrimestral; Carrera B sobrescribe a semestral
+    career_a = client.post(
+        "/api/academic/careers",
+        headers=admin_headers,
+        json={"organization_id": org_id, "name": "Ingeniería en Software", "code": "ISW"},
+    )
+    assert career_a.status_code == 201, career_a.text
+    assert career_a.json()["period_type"] is None
+    assert career_a.json()["effective_period_type"] == "cuatrimestral"
+
+    career_b = client.post(
+        "/api/academic/careers",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "name": "Derecho",
+            "code": "DER",
+            "period_type": "semestral",
+        },
+    )
+    assert career_b.status_code == 201, career_b.text
+    assert career_b.json()["period_type"] == "semestral"
+    assert career_b.json()["effective_period_type"] == "semestral"
+
+    group = client.post(
+        "/api/groups",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "name": "21026 IS",
+            "code": "21026-IS",
+            "career_id": career_a.json()["id"],
+            "semester": "6to Cuatrimestre",
+            "default_classroom": "Aula 33",
+        },
+    )
+    assert group.status_code == 201, group.text
+    assert group.json()["default_classroom"] == "Aula 33"
+    assert group.json()["period_type"] == "cuatrimestral"
+
+    subj = client.post(
+        "/api/academic/subjects",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "career_id": career_a.json()["id"],
+            "name": "Computación",
+            "code": "CMP-301",
+        },
+    )
+    assert subj.status_code == 201, subj.text
+
+    # Múltiples días en una sola asignación: Lunes y Miércoles en Aula 33, Viernes en Aula 12
+    course = client.post(
+        "/api/academic/courses",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "group_id": group.json()["id"],
+            "subject_id": subj.json()["id"],
+            "term": "2026-3",
+            "schedules": [
+                {"day_of_week": 0, "start_time": "08:00", "end_time": "09:00", "classroom": "Aula 33"},
+                {"day_of_week": 2, "start_time": "08:00", "end_time": "09:00", "classroom": "Aula 33"},
+                {"day_of_week": 4, "start_time": "08:00", "end_time": "09:00", "classroom": "Aula 12"},
+            ],
+        },
+    )
+    assert course.status_code == 201, course.text
+    c_data = course.json()
+    assert c_data["group_default_classroom"] == "Aula 33"
+    assert c_data["semester"] == "6to Cuatrimestre"
+    assert c_data["period_type"] == "cuatrimestral"
+    assert len(c_data["schedules"]) == 3
+    classrooms_by_day = {sl["day_of_week"]: sl["classroom"] for sl in c_data["schedules"]}
+    assert classrooms_by_day == {0: "Aula 33", 2: "Aula 33", 4: "Aula 12"}
+
+    stats = client.get("/api/academic/stats", headers=admin_headers)
+    assert stats.status_code == 200, stats.text
+    s_data = stats.json()
+    assert s_data["by_subject"][0]["career_id"] == career_a.json()["id"]
+    assert s_data["by_subject"][0]["semester"] == "6to Cuatrimestre"
+    assert s_data["by_subject"][0]["period_type"] == "cuatrimestral"
+    g_match = next(item for item in s_data["by_group"] if item["group_id"] == group.json()["id"])
+    assert g_match["period_type"] == "cuatrimestral"
