@@ -6,7 +6,7 @@ export type AcademicPeriodType =
   | "semestral"
   | "ciclo";
 export type PersonRole = "employee" | "student" | "teacher" | "admin";
-export type UserRole = "superadmin" | "org_admin" | "teacher" | "operator";
+export type UserRole = "superadmin" | "org_admin" | "teacher" | "supervisor" | "operator";
 export type PoseLabel = "frontal" | "left" | "right" | "up" | "down" | "smile";
 export type ActionMode = "auto" | "check_in" | "check_out" | "present";
 export type SessionStatus = "open" | "closed";
