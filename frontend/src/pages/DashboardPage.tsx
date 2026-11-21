@@ -164,16 +164,17 @@ export function DashboardPage({
               Nueva Organización
             </button>
           )}
-          {organization.mode === "enterprise" && canEditOrg && (
-            <button
-              type="button"
-              onClick={() => onNavigateTab("enterprise_shifts")}
-              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors"
-            >
-              <Briefcase className="w-4 h-4 text-indigo-400" />
-              Turnos y Jornadas
-            </button>
-          )}
+          {organization.mode === "enterprise" &&
+            (canEditOrg || currentUser.role === "supervisor") && (
+              <button
+                type="button"
+                onClick={() => onNavigateTab("enterprise_shifts")}
+                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors"
+              >
+                <Briefcase className="w-4 h-4 text-indigo-400" />
+                Turnos y Jornadas
+              </button>
+            )}
           <button
             type="button"
             onClick={() => void api.downloadCsv(organization.id)}
