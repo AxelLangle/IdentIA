@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 OrgMode = Literal["enterprise", "education"]
+AcademicPeriodType = Literal["bimestral", "trimestral", "cuatrimestral", "semestral", "ciclo"]
 PersonRole = Literal["employee", "student", "teacher", "admin"]
 UserRole = Literal["superadmin", "org_admin", "teacher", "operator"]
 PoseLabel = Literal["frontal", "left", "right", "up", "down", "smile"]
@@ -25,6 +26,7 @@ class OrgAdminBootstrap(BaseModel):
 class OrganizationCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
     mode: OrgMode = "enterprise"
+    academic_period_type: AcademicPeriodType = "semestral"
     late_tolerance_minutes: int = Field(default=15, ge=0, le=180)
     cooldown_seconds: int = Field(default=60, ge=5, le=3600)
     store_avatar_by_default: bool = True
@@ -34,6 +36,7 @@ class OrganizationCreate(BaseModel):
 class OrganizationUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=120)
     mode: OrgMode | None = None
+    academic_period_type: AcademicPeriodType | None = None
     late_tolerance_minutes: int | None = Field(default=None, ge=0, le=180)
     cooldown_seconds: int | None = Field(default=None, ge=5, le=3600)
     store_avatar_by_default: bool | None = None
@@ -45,6 +48,7 @@ class OrganizationRead(BaseModel):
     id: int
     name: str
     mode: str
+    academic_period_type: str = "semestral"
     late_tolerance_minutes: int
     cooldown_seconds: int
     store_avatar_by_default: bool
@@ -60,6 +64,7 @@ class GroupCreate(BaseModel):
     schedule_end: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
     career_id: int | None = None
     semester: str | None = Field(default=None, max_length=40)
+    default_classroom: str | None = Field(default=None, max_length=80)
 
 
 class GroupUpdate(BaseModel):
@@ -69,6 +74,7 @@ class GroupUpdate(BaseModel):
     schedule_end: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     career_id: int | None = None
     semester: str | None = Field(default=None, max_length=40)
+    default_classroom: str | None = Field(default=None, max_length=80)
 
 
 class GroupRead(BaseModel):
@@ -81,6 +87,8 @@ class GroupRead(BaseModel):
     name: str
     code: str
     semester: str | None = None
+    default_classroom: str | None = None
+    period_type: str = "semestral"
     schedule_start: str
     schedule_end: str
     created_at: datetime
@@ -390,12 +398,14 @@ class CareerCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=140)
     code: str = Field(..., min_length=1, max_length=40)
     description: str | None = Field(default=None, max_length=255)
+    period_type: AcademicPeriodType | None = None
 
 
 class CareerUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=140)
     code: str | None = Field(default=None, min_length=1, max_length=40)
     description: str | None = Field(default=None, max_length=255)
+    period_type: AcademicPeriodType | None = None
 
 
 class CareerRead(BaseModel):
@@ -406,6 +416,8 @@ class CareerRead(BaseModel):
     name: str
     code: str
     description: str | None
+    period_type: str | None = None
+    effective_period_type: str = "semestral"
     created_at: datetime
     groups_count: int = 0
     subjects_count: int = 0
@@ -470,6 +482,9 @@ class CourseAssignmentRead(BaseModel):
     group_id: int
     group_name: str
     group_code: str
+    group_default_classroom: str | None = None
+    semester: str | None = None
+    period_type: str = "semestral"
     career_id: int | None = None
     career_name: str | None = None
     subject_id: int
@@ -537,7 +552,10 @@ class SubjectAttendanceStat(BaseModel):
     group_id: int
     group_name: str
     group_code: str
+    career_id: int | None = None
     career_name: str | None = None
+    semester: str | None = None
+    period_type: str = "semestral"
     teacher_name: str | None = None
     sessions_count: int
     enrolled_students: int
@@ -569,6 +587,7 @@ class GroupAttendanceStat(BaseModel):
     career_id: int | None = None
     career_name: str | None = None
     semester: str | None = None
+    period_type: str = "semestral"
     subjects_count: int
     students_count: int
     total_sessions: int
