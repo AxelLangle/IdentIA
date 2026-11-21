@@ -252,15 +252,20 @@ def create_group(
                 detail="Carrera no encontrada en la organización.",
             )
 
+    shift_for_defaults: WorkShift | None = None
     if payload.default_work_shift_id is not None:
-        shift = db.get(WorkShift, payload.default_work_shift_id)
-        if shift is None or shift.organization_id != org.id:
+        shift_for_defaults = db.get(WorkShift, payload.default_work_shift_id)
+        if shift_for_defaults is None or shift_for_defaults.organization_id != org.id:
             raise HTTPException(
                 status_code=404,
                 detail="Turno laboral no encontrado en la organización.",
             )
 
     data = payload.model_dump()
+    if shift_for_defaults is not None:
+        # Mantener las columnas heredadas alineadas con el turno para evitar discrepancias
+        data["schedule_start"] = shift_for_defaults.start_time
+        data["schedule_end"] = shift_for_defaults.end_time
     if data.get("semester") is not None:
         data["semester"] = data["semester"].strip() or None
     if data.get("default_classroom") is not None:
@@ -322,6 +327,9 @@ def update_group(
                 status_code=404,
                 detail="Turno laboral no encontrado en la organización.",
             )
+        # Sincronizar horario base heredado con el turno seleccionado
+        data["schedule_start"] = shift.start_time
+        data["schedule_end"] = shift.end_time
 
     for field, value in data.items():
         if field in ("semester", "default_classroom") and isinstance(value, str):
