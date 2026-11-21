@@ -1,4 +1,10 @@
 export type OrgMode = "enterprise" | "education";
+export type AcademicPeriodType =
+  | "bimestral"
+  | "trimestral"
+  | "cuatrimestral"
+  | "semestral"
+  | "ciclo";
 export type PersonRole = "employee" | "student" | "teacher" | "admin";
 export type UserRole = "superadmin" | "org_admin" | "teacher" | "operator";
 export type PoseLabel = "frontal" | "left" | "right" | "up" | "down" | "smile";
@@ -9,6 +15,7 @@ export interface Organization {
   id: number;
   name: string;
   mode: OrgMode;
+  academic_period_type: AcademicPeriodType;
   late_tolerance_minutes: number;
   cooldown_seconds: number;
   store_avatar_by_default: boolean;
@@ -23,6 +30,8 @@ export interface Group {
   name: string;
   code: string;
   semester: string | null;
+  default_classroom: string | null;
+  period_type: string;
   schedule_start: string;
   schedule_end: string;
   created_at: string;
@@ -236,6 +245,8 @@ export interface Career {
   name: string;
   code: string;
   description: string | null;
+  period_type: AcademicPeriodType | null;
+  effective_period_type: AcademicPeriodType;
   created_at: string;
   groups_count: number;
   subjects_count: number;
@@ -267,6 +278,9 @@ export interface CourseAssignment {
   group_id: number;
   group_name: string;
   group_code: string;
+  group_default_classroom: string | null;
+  semester: string | null;
+  period_type: string;
   career_id: number | null;
   career_name: string | null;
   subject_id: number;
@@ -323,7 +337,10 @@ export interface SubjectAttendanceStat {
   group_id: number;
   group_name: string;
   group_code: string;
+  career_id: number | null;
   career_name: string | null;
+  semester: string | null;
+  period_type: string;
   teacher_name: string | null;
   sessions_count: number;
   enrolled_students: number;
@@ -355,6 +372,7 @@ export interface GroupAttendanceStat {
   career_id: number | null;
   career_name: string | null;
   semester: string | null;
+  period_type: string;
   subjects_count: number;
   students_count: number;
   total_sessions: number;
