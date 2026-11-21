@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
+  ArrowUpDown,
   BarChart3,
   BookOpen,
   CalendarCheck,
@@ -8,12 +9,20 @@ import {
   Clock,
   GraduationCap,
   Layers,
+  Pencil,
   Plus,
   ScanFace,
   Trash2,
+  X,
 } from "lucide-react";
+import {
+  ACADEMIC_PERIOD_OPTIONS,
+  comparePeriodsNatural,
+  getPeriodMeta,
+} from "../lib/academicPeriods";
 import { api } from "../lib/api";
 import type {
+  AcademicPeriodType,
   AcademicStatsResponse,
   AuthUser,
   Career,
@@ -32,15 +41,24 @@ interface AcademicPageProps {
 }
 
 type AcademicSubTab = "structure" | "courses" | "stats";
+type SubjectSortField = "career_period" | "period_career" | "rate" | "subject";
+type GroupSortField = "career_period" | "period_career" | "rate" | "group";
+
+interface PendingScheduleDraft {
+  day_of_week: number;
+  start_time: string;
+  end_time: string;
+  classroom: string;
+}
 
 const WEEKDAYS = [
-  { value: 0, label: "Lunes" },
-  { value: 1, label: "Martes" },
-  { value: 2, label: "Miércoles" },
-  { value: 3, label: "Jueves" },
-  { value: 4, label: "Viernes" },
-  { value: 5, label: "Sábado" },
-  { value: 6, label: "Domingo" },
+  { value: 0, short: "Lun", mini: "L", label: "Lunes" },
+  { value: 1, short: "Mar", mini: "M", label: "Martes" },
+  { value: 2, short: "Mié", mini: "X", label: "Miércoles" },
+  { value: 3, short: "Jue", mini: "J", label: "Jueves" },
+  { value: 4, short: "Vie", mini: "V", label: "Viernes" },
+  { value: 5, short: "Sáb", mini: "S", label: "Sábado" },
+  { value: 6, short: "Dom", mini: "D", label: "Domingo" },
 ];
 
 function dayLabel(day: number): string {
@@ -53,6 +71,10 @@ function getTodayIso(): string {
   const m = String(now.getMonth() + 1).padStart(2, "0");
   const d = String(now.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+function getDefaultWeekday(): number {
+  return new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
 }
 
 export function AcademicPage({
@@ -71,43 +93,65 @@ export function AcademicPage({
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Periodo académico general de la institución
+  const [orgPeriodType, setOrgPeriodType] = useState<AcademicPeriodType>(
+    organization.academic_period_type ?? "semestral"
+  );
+  const [savingOrgPeriod, setSavingOrgPeriod] = useState(false);
+
   // Alta de carrera
   const [careerName, setCareerName] = useState("");
   const [careerCode, setCareerCode] = useState("");
   const [careerDesc, setCareerDesc] = useState("");
+  const [careerPeriodType, setCareerPeriodType] = useState<string>("");
 
   // Alta de grupo académico
   const [groupName, setGroupName] = useState("");
   const [groupCode, setGroupCode] = useState("");
   const [groupCareerId, setGroupCareerId] = useState<string>("");
   const [groupSemester, setGroupSemester] = useState("");
+  const [groupDefaultClassroom, setGroupDefaultClassroom] = useState("");
+
+  // Edición rápida de grupo (aula fija / periodo)
+  const [editingGroupId, setEditingGroupId] = useState<number | null>(null);
+  const [editGroupSemester, setEditGroupSemester] = useState("");
+  const [editGroupClassroom, setEditGroupClassroom] = useState("");
 
   // Alta de asignatura
   const [subjectName, setSubjectName] = useState("");
   const [subjectCode, setSubjectCode] = useState("");
   const [subjectCareerId, setSubjectCareerId] = useState<string>("");
 
-  // Alta de curso (Grupo + Materia + Profesor + horario inicial)
+  // Alta de curso (Grupo + Materia + Profesor + horarios multi-día)
   const [courseGroupId, setCourseGroupId] = useState<string>("");
   const [courseSubjectId, setCourseSubjectId] = useState<string>("");
   const [courseTeacherId, setCourseTeacherId] = useState<string>("");
   const [courseTerm, setCourseTerm] = useState("");
-  const [initDay, setInitDay] = useState<number>(new Date().getDay() === 0 ? 6 : new Date().getDay() - 1);
+  const [selectedDays, setSelectedDays] = useState<number[]>([getDefaultWeekday()]);
   const [initStart, setInitStart] = useState("10:00");
   const [initEnd, setInitEnd] = useState("11:00");
   const [initClassroom, setInitClassroom] = useState("");
+  const [pendingSchedules, setPendingSchedules] = useState<PendingScheduleDraft[]>([]);
 
-  // Nuevo bloque horario inline por curso
+  // Bloques horarios inline por curso existente (multi-día + aula prellenada editable)
   const [scheduleDrafts, setScheduleDrafts] = useState<
-    Record<number, { day: number; start: string; end: string; classroom: string }>
+    Record<number, { days: number[]; start: string; end: string; classroom?: string }>
   >({});
 
-  // Filtros de estadísticas
+  // Filtros y ordenamiento de estadísticas
   const [statsDateFrom, setStatsDateFrom] = useState("");
   const [statsDateTo, setStatsDateTo] = useState("");
   const [statsCareerId, setStatsCareerId] = useState<string>("");
   const [statsGroupId, setStatsGroupId] = useState<string>("");
   const [expandedGroupIds, setExpandedGroupIds] = useState<Record<number, boolean>>({});
+  const [subjectSortBy, setSubjectSortBy] = useState<SubjectSortField>("career_period");
+  const [subjectSortAsc, setSubjectSortAsc] = useState(true);
+  const [groupSortBy, setGroupSortBy] = useState<GroupSortField>("career_period");
+  const [groupSortAsc, setGroupSortAsc] = useState(true);
+
+  useEffect(() => {
+    setOrgPeriodType(organization.academic_period_type ?? "semestral");
+  }, [organization.academic_period_type, organization.id]);
 
   const loadAcademicData = useCallback(async () => {
     setLoading(true);
@@ -122,7 +166,9 @@ export function AcademicPage({
       setCareers(carList);
       setSubjects(subjList);
       setCourses(courseList);
-      setTeachers(usersList.filter((u) => u.is_active && (u.role === "teacher" || u.role === "org_admin")));
+      setTeachers(
+        usersList.filter((u) => u.is_active && (u.role === "teacher" || u.role === "org_admin"))
+      );
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "No se pudo cargar la estructura académica.");
     } finally {
@@ -155,6 +201,26 @@ export function AcademicPage({
     }
   }, [subTab, loadStats]);
 
+  async function handleSaveOrgPeriod(e: FormEvent) {
+    e.preventDefault();
+    setSavingOrgPeriod(true);
+    setErrorMsg(null);
+    setStatusMsg(null);
+    try {
+      await api.updateOrganization(organization.id, {
+        academic_period_type: orgPeriodType,
+      });
+      await Promise.all([onRefreshOrg(), loadAcademicData()]);
+      setStatusMsg(
+        `Periodo académico general actualizado a ${getPeriodMeta(orgPeriodType).label}.`
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo guardar el periodo general.");
+    } finally {
+      setSavingOrgPeriod(false);
+    }
+  }
+
   async function handleCreateCareer(e: FormEvent) {
     e.preventDefault();
     setErrorMsg(null);
@@ -165,14 +231,28 @@ export function AcademicPage({
         name: careerName.trim(),
         code: careerCode.trim(),
         description: careerDesc.trim() || null,
+        period_type: careerPeriodType ? (careerPeriodType as AcademicPeriodType) : null,
       });
       setCareerName("");
       setCareerCode("");
       setCareerDesc("");
+      setCareerPeriodType("");
       setStatusMsg("Carrera registrada.");
       await loadAcademicData();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Error creando carrera.");
+    }
+  }
+
+  async function handleUpdateCareerPeriod(careerId: number, value: string) {
+    setErrorMsg(null);
+    try {
+      await api.updateCareer(careerId, {
+        period_type: value ? (value as AcademicPeriodType) : null,
+      });
+      await Promise.all([loadAcademicData(), onRefreshOrg()]);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo actualizar el periodo.");
     }
   }
 
@@ -197,16 +277,38 @@ export function AcademicPage({
         code: groupCode.trim(),
         career_id: groupCareerId ? Number(groupCareerId) : null,
         semester: groupSemester.trim() || null,
+        default_classroom: groupDefaultClassroom.trim() || null,
         schedule_start: "07:00",
         schedule_end: "15:00",
       });
       setGroupName("");
       setGroupCode("");
       setGroupSemester("");
+      setGroupDefaultClassroom("");
       setStatusMsg("Grupo académico creado.");
       await Promise.all([onRefreshOrg(), loadAcademicData()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Error creando grupo.");
+    }
+  }
+
+  function startEditGroup(g: Group) {
+    setEditingGroupId(g.id);
+    setEditGroupSemester(g.semester ?? "");
+    setEditGroupClassroom(g.default_classroom ?? "");
+  }
+
+  async function handleSaveGroupEdit(groupId: number) {
+    setErrorMsg(null);
+    try {
+      await api.updateGroup(groupId, {
+        semester: editGroupSemester.trim() || null,
+        default_classroom: editGroupClassroom.trim() || null,
+      });
+      setEditingGroupId(null);
+      await Promise.all([onRefreshOrg(), loadAcademicData()]);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo actualizar el grupo.");
     }
   }
 
@@ -262,11 +364,69 @@ export function AcademicPage({
     }
   }
 
+  function handleSelectCourseGroup(groupIdStr: string) {
+    setCourseGroupId(groupIdStr);
+    const selected = groups.find((g) => String(g.id) === groupIdStr);
+    // Prellena el aula fija del grupo pero deja editarla libremente
+    setInitClassroom(selected?.default_classroom ?? "");
+  }
+
+  function toggleSelectedDay(day: number) {
+    setSelectedDays((prev) =>
+      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day].sort((a, b) => a - b)
+    );
+  }
+
+  function appendSelectedDaysToPending() {
+    if (selectedDays.length === 0) return;
+    setPendingSchedules((prev) => {
+      const next = [...prev];
+      const existingKeys = new Set(
+        next.map((s) => `${s.day_of_week}-${s.start_time}-${s.end_time}`)
+      );
+      for (const day of [...selectedDays].sort((a, b) => a - b)) {
+        const key = `${day}-${initStart}-${initEnd}`;
+        if (!existingKeys.has(key)) {
+          next.push({
+            day_of_week: day,
+            start_time: initStart,
+            end_time: initEnd,
+            classroom: initClassroom.trim(),
+          });
+          existingKeys.add(key);
+        }
+      }
+      return next;
+    });
+    setSelectedDays([]);
+  }
+
   async function handleCreateCourse(e: FormEvent) {
     e.preventDefault();
     if (!courseGroupId || !courseSubjectId) return;
     setErrorMsg(null);
     setStatusMsg(null);
+
+    const combined: PendingScheduleDraft[] = [...pendingSchedules];
+    const seen = new Set(combined.map((s) => `${s.day_of_week}-${s.start_time}-${s.end_time}`));
+    for (const day of [...selectedDays].sort((a, b) => a - b)) {
+      const key = `${day}-${initStart}-${initEnd}`;
+      if (!seen.has(key)) {
+        combined.push({
+          day_of_week: day,
+          start_time: initStart,
+          end_time: initEnd,
+          classroom: initClassroom.trim(),
+        });
+        seen.add(key);
+      }
+    }
+
+    if (combined.length === 0) {
+      setErrorMsg("Selecciona al menos un día para el horario de la materia.");
+      return;
+    }
+
     try {
       await api.createCourse({
         organization_id: organization.id,
@@ -274,17 +434,20 @@ export function AcademicPage({
         subject_id: Number(courseSubjectId),
         teacher_user_id: courseTeacherId ? Number(courseTeacherId) : null,
         term: courseTerm.trim() || null,
-        schedules: [
-          {
-            day_of_week: initDay,
-            start_time: initStart,
-            end_time: initEnd,
-            classroom: initClassroom.trim() || null,
-          },
-        ],
+        schedules: combined.map((sl) => ({
+          day_of_week: sl.day_of_week,
+          start_time: sl.start_time,
+          end_time: sl.end_time,
+          classroom: sl.classroom.trim() || null,
+        })),
       });
-      setInitClassroom("");
-      setStatusMsg("Asignatura vinculada al grupo con su horario. Los alumnos del grupo la heredan automáticamente.");
+      const grp = groups.find((g) => String(g.id) === courseGroupId);
+      setPendingSchedules([]);
+      setSelectedDays([getDefaultWeekday()]);
+      setInitClassroom(grp?.default_classroom ?? "");
+      setStatusMsg(
+        `Asignatura vinculada al grupo con ${combined.length} bloque${combined.length === 1 ? "" : "s"} de horario.`
+      );
       await Promise.all([loadAcademicData(), onRefreshOrg()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Error asignando asignatura.");
@@ -303,24 +466,52 @@ export function AcademicPage({
     }
   }
 
-  async function handleAddSchedule(courseId: number) {
-    const draft = scheduleDrafts[courseId] ?? {
-      day: 0,
-      start: "08:00",
-      end: "09:00",
-      classroom: "",
-    };
+  function getCourseScheduleDraft(course: CourseAssignment) {
+    return (
+      scheduleDrafts[course.id] ?? {
+        days: [0],
+        start: "08:00",
+        end: "09:00",
+        classroom: course.group_default_classroom ?? "",
+      }
+    );
+  }
+
+  function toggleInlineDraftDay(course: CourseAssignment, day: number) {
+    const draft = getCourseScheduleDraft(course);
+    const nextDays = draft.days.includes(day)
+      ? draft.days.filter((d) => d !== day)
+      : [...draft.days, day].sort((a, b) => a - b);
+    setScheduleDrafts((prev) => ({
+      ...prev,
+      [course.id]: { ...draft, days: nextDays },
+    }));
+  }
+
+  async function handleAddSchedulesToCourse(course: CourseAssignment) {
+    const draft = getCourseScheduleDraft(course);
+    if (draft.days.length === 0) {
+      setErrorMsg("Marca al menos un día para agregar el horario.");
+      return;
+    }
     setErrorMsg(null);
+    const resolvedClassroom = (draft.classroom ?? course.group_default_classroom ?? "").trim() || null;
     try {
-      await api.addCourseSchedule(courseId, {
-        day_of_week: draft.day,
-        start_time: draft.start,
-        end_time: draft.end,
-        classroom: draft.classroom.trim() || null,
-      });
+      for (const day of draft.days) {
+        await api.addCourseSchedule(course.id, {
+          day_of_week: day,
+          start_time: draft.start,
+          end_time: draft.end,
+          classroom: resolvedClassroom,
+        });
+      }
       setScheduleDrafts((prev) => ({
         ...prev,
-        [courseId]: { ...draft, classroom: "" },
+        [course.id]: {
+          ...draft,
+          days: [],
+          classroom: course.group_default_classroom ?? "",
+        },
       }));
       await loadAcademicData();
     } catch (err) {
@@ -376,6 +567,54 @@ export function AcademicPage({
     }
   }
 
+  const selectedCareerForNewGroup = careers.find((c) => String(c.id) === groupCareerId);
+  const newGroupPeriodMeta = getPeriodMeta(
+    selectedCareerForNewGroup?.effective_period_type ?? orgPeriodType
+  );
+  const orgPeriodMeta = getPeriodMeta(orgPeriodType);
+
+  const sortedBySubject = stats
+    ? [...stats.by_subject].sort((a, b) => {
+        const dir = subjectSortAsc ? 1 : -1;
+        let cmp = 0;
+        if (subjectSortBy === "career_period") {
+          cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
+          if (cmp === 0) cmp = comparePeriodsNatural(a.semester, b.semester);
+          if (cmp === 0) cmp = a.subject_name.localeCompare(b.subject_name, "es");
+        } else if (subjectSortBy === "period_career") {
+          cmp = comparePeriodsNatural(a.semester, b.semester);
+          if (cmp === 0) cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
+          if (cmp === 0) cmp = a.subject_name.localeCompare(b.subject_name, "es");
+        } else if (subjectSortBy === "rate") {
+          cmp = a.attendance_rate - b.attendance_rate;
+        } else {
+          cmp = a.subject_name.localeCompare(b.subject_name, "es");
+        }
+        return cmp * dir;
+      })
+    : [];
+
+  const sortedByGroup = stats
+    ? [...stats.by_group].sort((a, b) => {
+        const dir = groupSortAsc ? 1 : -1;
+        let cmp = 0;
+        if (groupSortBy === "career_period") {
+          cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
+          if (cmp === 0) cmp = comparePeriodsNatural(a.semester, b.semester);
+          if (cmp === 0) cmp = a.group_name.localeCompare(b.group_name, "es", { numeric: true });
+        } else if (groupSortBy === "period_career") {
+          cmp = comparePeriodsNatural(a.semester, b.semester);
+          if (cmp === 0) cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
+          if (cmp === 0) cmp = a.group_name.localeCompare(b.group_name, "es", { numeric: true });
+        } else if (groupSortBy === "rate") {
+          cmp = a.overall_attendance_rate - b.overall_attendance_rate;
+        } else {
+          cmp = a.group_name.localeCompare(b.group_name, "es", { numeric: true });
+        }
+        return cmp * dir;
+      })
+    : [];
+
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -385,7 +624,8 @@ export function AcademicPage({
             Estructura Académica y Estadísticas
           </h2>
           <p className="text-sm text-slate-400">
-            Jerarquía: Institución → Carrera → Grupo → Materias, Profesores y Horarios
+            Jerarquía: Institución ({orgPeriodMeta.label}) → Carrera → Grupo → Materias,
+            Profesores y Horarios
           </p>
         </div>
 
@@ -441,6 +681,39 @@ export function AcademicPage({
         <>
           {subTab === "structure" && (
             <div className="space-y-6">
+              {/* Periodo general de la institución */}
+              <form
+                onSubmit={handleSaveOrgPeriod}
+                className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4"
+              >
+                <div>
+                  <h3 className="font-semibold text-sm">Periodo académico general de la institución</h3>
+                  <p className="text-xs text-slate-400">
+                    Se hereda por defecto en carreras y grupos (cada carrera puede sobrescribirlo si maneja otro sistema).
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={orgPeriodType}
+                    onChange={(e) => setOrgPeriodType(e.target.value as AcademicPeriodType)}
+                    className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                  >
+                    {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="submit"
+                    disabled={savingOrgPeriod}
+                    className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-semibold"
+                  >
+                    {savingOrgPeriod ? "Guardando..." : "Guardar periodo"}
+                  </button>
+                </div>
+              </form>
+
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Alta de Carrera */}
                 <form
@@ -466,14 +739,28 @@ export function AcademicPage({
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm uppercase"
                     />
                   </div>
-                  <div className="flex gap-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                     <input
                       type="text"
                       value={careerDesc}
                       onChange={(e) => setCareerDesc(e.target.value)}
                       placeholder="Descripción opcional"
-                      className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                      className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
+                    <select
+                      value={careerPeriodType}
+                      onChange={(e) => setCareerPeriodType(e.target.value)}
+                      className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                    >
+                      <option value="">Usar general ({orgPeriodMeta.label})</option>
+                      {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex justify-end">
                     <button
                       type="submit"
                       className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold"
@@ -525,9 +812,22 @@ export function AcademicPage({
                       type="text"
                       value={groupSemester}
                       onChange={(e) => setGroupSemester(e.target.value)}
-                      placeholder="Semestre / Cuatrimestre"
+                      placeholder={newGroupPeriodMeta.placeholder}
+                      title={newGroupPeriodMeta.singular}
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
+                    <input
+                      type="text"
+                      value={groupDefaultClassroom}
+                      onChange={(e) => setGroupDefaultClassroom(e.target.value)}
+                      placeholder="Aula fija (ej. Aula 33)"
+                      className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-400">
+                      Periodo aplicable: <strong>{newGroupPeriodMeta.singular}</strong> ({newGroupPeriodMeta.label})
+                    </span>
                     <button
                       type="submit"
                       className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold"
@@ -547,32 +847,56 @@ export function AcademicPage({
                   </div>
                 ) : (
                   careers.map((career) => {
-                    const careerGroups = groups.filter((g) => g.career_id === career.id);
+                    const careerGroups = groups
+                      .filter((g) => g.career_id === career.id)
+                      .sort((a, b) => comparePeriodsNatural(a.semester, b.semester));
+                    const cMeta = getPeriodMeta(career.effective_period_type);
                     return (
                       <div
                         key={career.id}
                         className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
                       >
-                        <div className="flex items-start justify-between gap-4">
+                        <div className="flex flex-wrap items-start justify-between gap-4">
                           <div>
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
                               <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-xs font-semibold">
                                 {career.code}
                               </span>
                               <h4 className="text-base font-bold">{career.name}</h4>
+                              <span className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[11px] text-slate-300">
+                                {cMeta.label}
+                                {career.period_type ? "" : " (heredado)"}
+                              </span>
                             </div>
                             {career.description && (
                               <p className="text-xs text-slate-400 mt-1">{career.description}</p>
                             )}
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => void handleDeleteCareer(career.id)}
-                            className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/10"
-                            title="Eliminar carrera"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                          <div className="flex items-center gap-2">
+                            <select
+                              value={career.period_type ?? ""}
+                              onChange={(e) =>
+                                void handleUpdateCareerPeriod(career.id, e.target.value)
+                              }
+                              className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
+                              title="Tipo de periodo de esta carrera"
+                            >
+                              <option value="">Usar general ({orgPeriodMeta.label})</option>
+                              {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                                <option key={opt.value} value={opt.value}>
+                                  {opt.label}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => void handleDeleteCareer(career.id)}
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/10"
+                              title="Eliminar carrera"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
                         </div>
 
                         {careerGroups.length === 0 ? (
@@ -584,28 +908,71 @@ export function AcademicPage({
                             {careerGroups.map((g) => (
                               <div
                                 key={g.id}
-                                className="rounded-xl bg-slate-800/60 border border-slate-700/70 p-3.5 flex items-center justify-between gap-2"
+                                className="rounded-xl bg-slate-800/60 border border-slate-700/70 p-3.5 space-y-2"
                               >
-                                <div>
-                                  <p className="text-sm font-semibold">
-                                    {g.name}{" "}
-                                    <span className="text-xs font-normal text-slate-400">
-                                      ({g.code})
-                                    </span>
-                                  </p>
-                                  <p className="text-xs text-slate-400 mt-0.5">
-                                    {g.semester ? `${g.semester} · ` : ""}
-                                    {g.members_count} alumnos · {g.courses_count} materias
-                                  </p>
+                                <div className="flex items-start justify-between gap-2">
+                                  <div>
+                                    <p className="text-sm font-semibold">
+                                      {g.name}{" "}
+                                      <span className="text-xs font-normal text-slate-400">
+                                        ({g.code})
+                                      </span>
+                                    </p>
+                                    <p className="text-xs text-slate-400 mt-0.5">
+                                      {g.semester ? `${g.semester} · ` : ""}
+                                      {g.default_classroom ? `${g.default_classroom} · ` : ""}
+                                      {g.members_count} alumnos · {g.courses_count} materias
+                                    </p>
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        editingGroupId === g.id
+                                          ? setEditingGroupId(null)
+                                          : startEditGroup(g)
+                                      }
+                                      className="p-1 text-slate-500 hover:text-indigo-300"
+                                      title="Editar periodo y aula fija"
+                                    >
+                                      <Pencil className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleDeleteGroup(g.id)}
+                                      className="p-1 text-slate-500 hover:text-red-400"
+                                      title="Eliminar grupo"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={() => void handleDeleteGroup(g.id)}
-                                  className="p-1 text-slate-500 hover:text-red-400"
-                                  title="Eliminar grupo"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
+
+                                {editingGroupId === g.id && (
+                                  <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-700/60">
+                                    <input
+                                      type="text"
+                                      value={editGroupSemester}
+                                      onChange={(e) => setEditGroupSemester(e.target.value)}
+                                      placeholder={cMeta.singular}
+                                      className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                    />
+                                    <input
+                                      type="text"
+                                      value={editGroupClassroom}
+                                      onChange={(e) => setEditGroupClassroom(e.target.value)}
+                                      placeholder="Aula fija (ej. Aula 33)"
+                                      className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleSaveGroupEdit(g.id)}
+                                      className="col-span-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold"
+                                    >
+                                      Guardar cambios
+                                    </button>
+                                  </div>
+                                )}
                               </div>
                             ))}
                           </div>
@@ -631,6 +998,8 @@ export function AcademicPage({
                                 {g.name} <span className="text-xs text-slate-400">({g.code})</span>
                               </p>
                               <p className="text-xs text-slate-400">
+                                {g.semester ? `${g.semester} · ` : ""}
+                                {g.default_classroom ? `${g.default_classroom} · ` : ""}
                                 {g.members_count} alumnos · {g.courses_count} materias
                               </p>
                             </div>
@@ -703,7 +1072,7 @@ export function AcademicPage({
                     </div>
                   </form>
 
-                  <div className="space-y-2 max-h-56 overflow-y-auto">
+                  <div className="space-y-2 max-h-64 overflow-y-auto">
                     {subjects.map((subj) => (
                       <div
                         key={subj.id}
@@ -736,7 +1105,7 @@ export function AcademicPage({
                   </div>
                 </div>
 
-                {/* Vincular Grupo + Materia + Profesor + Horario */}
+                {/* Vincular Grupo + Materia + Profesor + Múltiples Días */}
                 <form
                   onSubmit={handleCreateCourse}
                   className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
@@ -758,13 +1127,14 @@ export function AcademicPage({
                       <select
                         required
                         value={courseGroupId}
-                        onChange={(e) => setCourseGroupId(e.target.value)}
+                        onChange={(e) => handleSelectCourseGroup(e.target.value)}
                         className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       >
                         <option value="">Selecciona grupo...</option>
                         {groups.map((g) => (
                           <option key={g.id} value={g.id}>
                             {g.name} ({g.code})
+                            {g.default_classroom ? ` · ${g.default_classroom}` : ""}
                           </option>
                         ))}
                       </select>
@@ -804,7 +1174,9 @@ export function AcademicPage({
                       </select>
                     </div>
                     <div>
-                      <label className="block text-[11px] text-slate-400 mb-1">Ciclo / Periodo</label>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Clave de periodo / ciclo
+                      </label>
                       <input
                         type="text"
                         value={courseTerm}
@@ -815,42 +1187,106 @@ export function AcademicPage({
                     </div>
                   </div>
 
-                  <div className="pt-2 border-t border-slate-800">
-                    <p className="text-xs font-semibold text-slate-300 mb-2">Horario inicial de clase</p>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                      <select
-                        value={initDay}
-                        onChange={(e) => setInitDay(Number(e.target.value))}
-                        className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
-                      >
-                        {WEEKDAYS.map((d) => (
-                          <option key={d.value} value={d.value}>
-                            {d.label}
-                          </option>
-                        ))}
-                      </select>
-                      <input
-                        type="time"
-                        required
-                        value={initStart}
-                        onChange={(e) => setInitStart(e.target.value)}
-                        className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
-                      />
-                      <input
-                        type="time"
-                        required
-                        value={initEnd}
-                        onChange={(e) => setInitEnd(e.target.value)}
-                        className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
-                      />
-                      <input
-                        type="text"
-                        value={initClassroom}
-                        onChange={(e) => setInitClassroom(e.target.value)}
-                        placeholder="Aula / Lab"
-                        className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
-                      />
+                  <div className="pt-2 border-t border-slate-800 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-semibold text-slate-300">
+                        Días y horario de clase (marca uno o varios días)
+                      </p>
+                      <span className="text-[11px] text-slate-400">
+                        {selectedDays.length} día{selectedDays.length === 1 ? "" : "s"}
+                      </span>
                     </div>
+
+                    <div className="flex flex-wrap gap-1.5">
+                      {WEEKDAYS.map((d) => {
+                        const active = selectedDays.includes(d.value);
+                        return (
+                          <button
+                            key={d.value}
+                            type="button"
+                            onClick={() => toggleSelectedDay(d.value)}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                              active
+                                ? "bg-indigo-600 border-indigo-500 text-white"
+                                : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
+                            }`}
+                          >
+                            {d.short}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end">
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">Inicio</label>
+                        <input
+                          type="time"
+                          value={initStart}
+                          onChange={(e) => setInitStart(e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">Fin</label>
+                        <input
+                          type="time"
+                          value={initEnd}
+                          onChange={(e) => setInitEnd(e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Aula (editable)
+                        </label>
+                        <input
+                          type="text"
+                          value={initClassroom}
+                          onChange={(e) => setInitClassroom(e.target.value)}
+                          placeholder="Aula / Lab"
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        disabled={selectedDays.length === 0}
+                        onClick={appendSelectedDaysToPending}
+                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 disabled:opacity-40 text-xs font-medium text-indigo-300"
+                        title="Añade estos días para combinar con otros horarios o aulas distintas"
+                      >
+                        + Agregar horario(s)
+                      </button>
+                    </div>
+
+                    {pendingSchedules.length > 0 && (
+                      <div className="space-y-1.5 rounded-xl bg-slate-800/40 border border-slate-800 p-2.5">
+                        <p className="text-[11px] text-slate-400">
+                          Horarios acumulados para esta materia ({pendingSchedules.length}):
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {pendingSchedules.map((sl, idx) => (
+                            <span
+                              key={`${sl.day_of_week}-${sl.start_time}-${idx}`}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-500/15 border border-indigo-500/30 text-[11px] text-indigo-200"
+                            >
+                              <strong>{dayLabel(sl.day_of_week)}</strong> {sl.start_time}–
+                              {sl.end_time}
+                              {sl.classroom ? ` · ${sl.classroom}` : ""}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setPendingSchedules((prev) => prev.filter((_, i) => i !== idx))
+                                }
+                                className="text-indigo-300 hover:text-white"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   <button
@@ -875,12 +1311,9 @@ export function AcademicPage({
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {courses.map((course) => {
-                      const draft = scheduleDrafts[course.id] ?? {
-                        day: 0,
-                        start: "08:00",
-                        end: "09:00",
-                        classroom: "",
-                      };
+                      const draft = getCourseScheduleDraft(course);
+                      const inlineClassroom =
+                        draft.classroom ?? course.group_default_classroom ?? "";
                       return (
                         <div
                           key={course.id}
@@ -896,8 +1329,12 @@ export function AcademicPage({
                               </div>
                               <p className="text-xs text-slate-400 mt-1">
                                 Grupo: <strong className="text-slate-200">{course.group_name}</strong>
-                                {course.career_name ? ` · ${course.career_name}` : ""} ·{" "}
-                                {course.students_count} alumnos heredados
+                                {course.career_name ? ` · ${course.career_name}` : ""}
+                                {course.semester ? ` · ${course.semester}` : ""}
+                                {course.group_default_classroom
+                                  ? ` · Aula base: ${course.group_default_classroom}`
+                                  : ""}{" "}
+                                · {course.students_count} alumnos heredados
                               </p>
                             </div>
 
@@ -964,52 +1401,70 @@ export function AcademicPage({
                               </div>
                             ))}
 
-                            <div className="grid grid-cols-5 gap-1.5 pt-1">
-                              <select
-                                value={draft.day}
-                                onChange={(e) =>
-                                  setScheduleDrafts((prev) => ({
-                                    ...prev,
-                                    [course.id]: { ...draft, day: Number(e.target.value) },
-                                  }))
-                                }
-                                className="col-span-2 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-[11px]"
-                              >
-                                {WEEKDAYS.map((d) => (
-                                  <option key={d.value} value={d.value}>
-                                    {d.label}
-                                  </option>
-                                ))}
-                              </select>
-                              <input
-                                type="time"
-                                value={draft.start}
-                                onChange={(e) =>
-                                  setScheduleDrafts((prev) => ({
-                                    ...prev,
-                                    [course.id]: { ...draft, start: e.target.value },
-                                  }))
-                                }
-                                className="bg-slate-800 border border-slate-700 rounded px-1.5 py-1 text-[11px]"
-                              />
-                              <input
-                                type="time"
-                                value={draft.end}
-                                onChange={(e) =>
-                                  setScheduleDrafts((prev) => ({
-                                    ...prev,
-                                    [course.id]: { ...draft, end: e.target.value },
-                                  }))
-                                }
-                                className="bg-slate-800 border border-slate-700 rounded px-1.5 py-1 text-[11px]"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => void handleAddSchedule(course.id)}
-                                className="inline-flex items-center justify-center rounded bg-slate-700 hover:bg-indigo-600 text-[11px] font-semibold px-2 py-1"
-                              >
-                                + Hora
-                              </button>
+                            <div className="pt-1.5 space-y-1.5 border-t border-slate-800/70">
+                              <div className="flex flex-wrap gap-1">
+                                {WEEKDAYS.map((d) => {
+                                  const checked = draft.days.includes(d.value);
+                                  return (
+                                    <button
+                                      key={d.value}
+                                      type="button"
+                                      onClick={() => toggleInlineDraftDay(course, d.value)}
+                                      className={`px-2 py-0.5 rounded text-[11px] font-medium border ${
+                                        checked
+                                          ? "bg-indigo-600 border-indigo-500 text-white"
+                                          : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
+                                      }`}
+                                      title={d.label}
+                                    >
+                                      {d.mini}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              <div className="grid grid-cols-4 gap-1.5">
+                                <input
+                                  type="time"
+                                  value={draft.start}
+                                  onChange={(e) =>
+                                    setScheduleDrafts((prev) => ({
+                                      ...prev,
+                                      [course.id]: { ...draft, start: e.target.value },
+                                    }))
+                                  }
+                                  className="bg-slate-800 border border-slate-700 rounded px-1.5 py-1 text-[11px]"
+                                />
+                                <input
+                                  type="time"
+                                  value={draft.end}
+                                  onChange={(e) =>
+                                    setScheduleDrafts((prev) => ({
+                                      ...prev,
+                                      [course.id]: { ...draft, end: e.target.value },
+                                    }))
+                                  }
+                                  className="bg-slate-800 border border-slate-700 rounded px-1.5 py-1 text-[11px]"
+                                />
+                                <input
+                                  type="text"
+                                  value={inlineClassroom}
+                                  onChange={(e) =>
+                                    setScheduleDrafts((prev) => ({
+                                      ...prev,
+                                      [course.id]: { ...draft, classroom: e.target.value },
+                                    }))
+                                  }
+                                  placeholder="Aula"
+                                  className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-[11px]"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => void handleAddSchedulesToCourse(course)}
+                                  className="inline-flex items-center justify-center rounded bg-slate-700 hover:bg-indigo-600 text-[11px] font-semibold px-2 py-1"
+                                >
+                                  + Hora(s)
+                                </button>
+                              </div>
                             </div>
                           </div>
                         </div>
@@ -1108,13 +1563,39 @@ export function AcademicPage({
 
                   {/* Por Asignatura */}
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
-                    <h3 className="font-semibold text-base">Asistencia por Asignatura</h3>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <h3 className="font-semibold text-base">Asistencia por Asignatura</h3>
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="text-slate-400">Ordenar por:</span>
+                        <select
+                          value={subjectSortBy}
+                          onChange={(e) => setSubjectSortBy(e.target.value as SubjectSortField)}
+                          className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
+                        >
+                          <option value="career_period">Carrera y Periodo</option>
+                          <option value="period_career">Periodo y Carrera</option>
+                          <option value="rate">% Asistencia</option>
+                          <option value="subject">Asignatura</option>
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => setSubjectSortAsc((v) => !v)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 text-xs"
+                        >
+                          <ArrowUpDown className="w-3.5 h-3.5" />
+                          {subjectSortAsc ? "Asc" : "Desc"}
+                        </button>
+                      </div>
+                    </div>
+
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm text-left">
                         <thead className="text-xs text-slate-400 border-b border-slate-800">
                           <tr>
-                            <th className="py-2 pr-3">Materia</th>
+                            <th className="py-2 pr-3">Carrera</th>
+                            <th className="py-2 pr-3">Periodo</th>
                             <th className="py-2 pr-3">Grupo</th>
+                            <th className="py-2 pr-3">Materia</th>
                             <th className="py-2 pr-3">Profesor</th>
                             <th className="py-2 pr-3">Sesiones</th>
                             <th className="py-2 pr-3">Asistencias</th>
@@ -1124,13 +1605,19 @@ export function AcademicPage({
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/80">
-                          {stats.by_subject.map((row) => (
+                          {sortedBySubject.map((row) => (
                             <tr key={row.course_assignment_id}>
+                              <td className="py-2.5 pr-3 text-xs text-slate-300">
+                                {row.career_name ?? "—"}
+                              </td>
+                              <td className="py-2.5 pr-3 text-xs text-slate-300">
+                                {row.semester ?? "—"}
+                              </td>
+                              <td className="py-2.5 pr-3 text-xs font-medium">{row.group_name}</td>
                               <td className="py-2.5 pr-3">
                                 <span className="font-medium">{row.subject_name}</span>{" "}
                                 <span className="text-xs text-slate-400">({row.subject_code})</span>
                               </td>
-                              <td className="py-2.5 pr-3 text-xs">{row.group_name}</td>
                               <td className="py-2.5 pr-3 text-xs text-slate-300">
                                 {row.teacher_name ?? "—"}
                               </td>
@@ -1149,9 +1636,9 @@ export function AcademicPage({
                               </td>
                             </tr>
                           ))}
-                          {stats.by_subject.length === 0 && (
+                          {sortedBySubject.length === 0 && (
                             <tr>
-                              <td colSpan={8} className="py-6 text-center text-xs text-slate-500">
+                              <td colSpan={10} className="py-6 text-center text-xs text-slate-500">
                                 No hay asignaturas para mostrar con estos filtros.
                               </td>
                             </tr>
@@ -1163,12 +1650,37 @@ export function AcademicPage({
 
                   {/* Consolidado por Grupo */}
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
-                    <h3 className="font-semibold text-base">
-                      Consolidado por Grupo (todas sus materias)
-                    </h3>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <h3 className="font-semibold text-base">
+                        Consolidado por Grupo (todas sus materias)
+                      </h3>
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="text-slate-400">Ordenar por:</span>
+                        <select
+                          value={groupSortBy}
+                          onChange={(e) => setGroupSortBy(e.target.value as GroupSortField)}
+                          className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
+                        >
+                          <option value="career_period">Carrera y Periodo</option>
+                          <option value="period_career">Periodo y Carrera</option>
+                          <option value="rate">% Asistencia</option>
+                          <option value="group">Grupo</option>
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => setGroupSortAsc((v) => !v)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 text-xs"
+                        >
+                          <ArrowUpDown className="w-3.5 h-3.5" />
+                          {groupSortAsc ? "Asc" : "Desc"}
+                        </button>
+                      </div>
+                    </div>
+
                     <div className="space-y-3">
-                      {stats.by_group.map((grp) => {
+                      {sortedByGroup.map((grp) => {
                         const expanded = Boolean(expandedGroupIds[grp.group_id]);
+                        const gMeta = getPeriodMeta(grp.period_type);
                         return (
                           <div
                             key={grp.group_id}
@@ -1190,7 +1702,9 @@ export function AcademicPage({
                                   <span className="text-xs text-slate-400">({grp.group_code})</span>
                                 </p>
                                 <p className="text-xs text-slate-400">
-                                  {grp.career_name ?? "Sin carrera"} · {grp.subjects_count} materias ·{" "}
+                                  {grp.career_name ?? "Sin carrera"} ·{" "}
+                                  {grp.semester ?? `Sin ${gMeta.singular.toLowerCase()}`} (
+                                  {gMeta.label}) · {grp.subjects_count} materias ·{" "}
                                   {grp.students_count} alumnos · {grp.total_sessions} sesiones
                                 </p>
                               </div>
