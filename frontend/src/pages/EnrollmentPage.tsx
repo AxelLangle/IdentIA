@@ -15,6 +15,8 @@ import {
   X,
 } from "lucide-react";
 import { CameraView, type CameraViewHandle } from "../components/CameraView";
+import { PasswordInput } from "../components/PasswordInput";
+import { comparePeriodsNatural, getPeriodMeta } from "../lib/academicPeriods";
 import { api } from "../lib/api";
 import type {
   AuthUser,
@@ -125,8 +127,10 @@ export function EnrollmentPage({
   const [revokeError, setRevokeError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState(false);
 
-  // Materias heredadas por grupo (modo educación)
+  // Materias heredadas y filtros por grupo/carrera/periodo (modo educación)
   const [courses, setCourses] = useState<CourseAssignment[]>([]);
+  const [formCareerFilter, setFormCareerFilter] = useState<string>("");
+  const [listGroupFilter, setListGroupFilter] = useState<string>("");
 
   const canManagePersons = ["superadmin", "org_admin", "operator"].includes(currentUser.role);
   const canDeletePersons = ["superadmin", "org_admin"].includes(currentUser.role);
@@ -175,6 +179,8 @@ export function EnrollmentPage({
     setCompletedBanner(null);
     setSelectedForRevoke([]);
     setRevokeTargets(null);
+    setFormCareerFilter("");
+    setListGroupFilter("");
     revokeAllPreviews();
   }, [
     organization.id,
@@ -184,10 +190,78 @@ export function EnrollmentPage({
   ]);
 
   const filteredPersons = persons.filter((p) => {
+    if (listGroupFilter && !p.group_ids.includes(Number(listGroupFilter))) {
+      return false;
+    }
     const q = search.trim().toLowerCase();
     if (!q) return true;
     return p.full_name.toLowerCase().includes(q) || p.external_id.toLowerCase().includes(q);
   });
+
+  // Agrupación de grupos académicos por Carrera -> Periodo
+  const careerFilterOptions = Array.from(
+    new Map(
+      groups
+        .filter((g) => g.career_id !== null && g.career_name)
+        .map((g) => [String(g.career_id), g.career_name!])
+    ).entries()
+  ).sort((a, b) => a[1].localeCompare(b[1], "es"));
+
+  const groupedAcademicBuckets = (() => {
+    const filtered = formCareerFilter
+      ? groups.filter((g) =>
+          formCareerFilter === "__none__"
+            ? g.career_id === null
+            : String(g.career_id) === formCareerFilter
+        )
+      : groups;
+
+    const careerMap = new Map<
+      string,
+      { careerLabel: string; periodType: string; periods: Map<string, Group[]> }
+    >();
+
+    for (const g of filtered) {
+      const cKey = g.career_id !== null ? String(g.career_id) : "__none__";
+      const cLabel = g.career_name ?? "Sin carrera asignada";
+      if (!careerMap.has(cKey)) {
+        careerMap.set(cKey, {
+          careerLabel: cLabel,
+          periodType: g.period_type,
+          periods: new Map(),
+        });
+      }
+      const bucket = careerMap.get(cKey)!;
+      const pKey = g.semester?.trim() || "Sin periodo";
+      const list = bucket.periods.get(pKey) ?? [];
+      list.push(g);
+      bucket.periods.set(pKey, list);
+    }
+
+    return Array.from(careerMap.entries())
+      .sort(([kA, a], [kB, b]) => {
+        if (kA === "__none__") return 1;
+        if (kB === "__none__") return -1;
+        return a.careerLabel.localeCompare(b.careerLabel, "es");
+      })
+      .map(([careerKey, bucket]) => ({
+        careerKey,
+        careerLabel: bucket.careerLabel,
+        periodMeta: getPeriodMeta(bucket.periodType),
+        periods: Array.from(bucket.periods.entries())
+          .sort(([pA], [pB]) => {
+            if (pA === "Sin periodo") return 1;
+            if (pB === "Sin periodo") return -1;
+            return comparePeriodsNatural(pA, pB);
+          })
+          .map(([periodLabel, periodGroups]) => ({
+            periodLabel,
+            groups: [...periodGroups].sort((x, y) =>
+              x.name.localeCompare(y.name, "es", { numeric: true })
+            ),
+          })),
+      }));
+  })();
 
   function startEnrollmentFor(person: Person) {
     revokeAllPreviews();
@@ -512,32 +586,101 @@ export function EnrollmentPage({
           </div>
 
           {groups.length > 0 && (
-            <div>
-              <p className="text-xs text-slate-400 mb-2">
-                {organization.mode === "education"
-                  ? "Asignar a grupo académico (heredará automáticamente sus materias)"
-                  : "Asignar a grupos / departamentos"}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {groups.map((g) => {
-                  const selected = selectedGroupIds.includes(g.id);
-                  return (
-                    <button
-                      key={g.id}
-                      type="button"
-                      onClick={() => toggleGroupSelection(g.id)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                        selected
-                          ? "bg-indigo-600 border-indigo-500 text-white"
-                          : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
-                      }`}
-                    >
-                      {g.name}
-                      {g.career_name ? ` · ${g.career_name}` : ""}
-                    </button>
-                  );
-                })}
+            <div className="space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-slate-400">
+                  {organization.mode === "education"
+                    ? "Asignar a grupo académico (ordenado por carrera y periodo; heredará sus materias)"
+                    : "Asignar a grupos / departamentos"}
+                </p>
+                {organization.mode === "education" && careerFilterOptions.length > 1 && (
+                  <select
+                    value={formCareerFilter}
+                    onChange={(e) => setFormCareerFilter(e.target.value)}
+                    className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
+                  >
+                    <option value="">Todas las carreras</option>
+                    {careerFilterOptions.map(([id, name]) => (
+                      <option key={id} value={id}>
+                        {name}
+                      </option>
+                    ))}
+                    {groups.some((g) => g.career_id === null) && (
+                      <option value="__none__">Sin carrera asignada</option>
+                    )}
+                  </select>
+                )}
               </div>
+
+              {organization.mode === "education" ? (
+                <div className="space-y-3 max-h-60 overflow-y-auto pr-1">
+                  {groupedAcademicBuckets.map((careerBucket) => (
+                    <div
+                      key={careerBucket.careerKey}
+                      className="rounded-xl bg-slate-800/40 border border-slate-800 p-3 space-y-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-semibold text-indigo-300">
+                          {careerBucket.careerLabel}
+                        </p>
+                        <span className="text-[10px] text-slate-400">
+                          Sistema {careerBucket.periodMeta.label.toLowerCase()}
+                        </span>
+                      </div>
+
+                      <div className="space-y-2">
+                        {careerBucket.periods.map((periodBucket) => (
+                          <div key={periodBucket.periodLabel} className="space-y-1">
+                            <p className="text-[11px] font-medium text-slate-400">
+                              {periodBucket.periodLabel}
+                            </p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {periodBucket.groups.map((g) => {
+                                const selected = selectedGroupIds.includes(g.id);
+                                return (
+                                  <button
+                                    key={g.id}
+                                    type="button"
+                                    onClick={() => toggleGroupSelection(g.id)}
+                                    className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                                      selected
+                                        ? "bg-indigo-600 border-indigo-500 text-white"
+                                        : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
+                                    }`}
+                                  >
+                                    {g.name}
+                                    {g.default_classroom ? ` · ${g.default_classroom}` : ""}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex flex-wrap gap-2">
+                  {groups.map((g) => {
+                    const selected = selectedGroupIds.includes(g.id);
+                    return (
+                      <button
+                        key={g.id}
+                        type="button"
+                        onClick={() => toggleGroupSelection(g.id)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                          selected
+                            ? "bg-indigo-600 border-indigo-500 text-white"
+                            : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {g.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -583,15 +726,40 @@ export function EnrollmentPage({
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Lista del padrón */}
         <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-          <div className="relative">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Buscar por nombre o matrícula/ID..."
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            />
+          <div className="flex flex-col sm:flex-row gap-2">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Buscar por nombre o matrícula/ID..."
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+            {organization.mode === "education" && groups.length > 0 && (
+              <select
+                value={listGroupFilter}
+                onChange={(e) => setListGroupFilter(e.target.value)}
+                className="sm:w-48 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
+              >
+                <option value="">Todos los grupos</option>
+                {groupedAcademicBuckets.map((cb) =>
+                  cb.periods.map((pb) => (
+                    <optgroup
+                      key={`${cb.careerKey}-${pb.periodLabel}`}
+                      label={`${cb.careerLabel} — ${pb.periodLabel}`}
+                    >
+                      {pb.groups.map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))
+                )}
+              </select>
+            )}
           </div>
 
           {selectedForRevoke.length > 0 && (
@@ -663,7 +831,9 @@ export function EnrollmentPage({
                           <p className="text-xs text-slate-400">
                             {p.external_id} · {p.role}
                             {personGroups.length > 0
-                              ? ` · ${personGroups.map((g) => g.name).join(", ")}`
+                              ? ` · ${personGroups
+                                  .map((g) => `${g.name}${g.semester ? ` (${g.semester})` : ""}`)
+                                  .join(", ")}`
                               : ""}
                           </p>
                         </div>
@@ -1048,8 +1218,7 @@ export function EnrollmentPage({
               <label className="block text-xs text-slate-400 mb-1">
                 Contraseña de seguridad (Admin, Superadmin o Clave Delegada)
               </label>
-              <input
-                type="password"
+              <PasswordInput
                 required
                 autoFocus
                 value={revokeSecret}
