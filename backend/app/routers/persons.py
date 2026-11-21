@@ -194,7 +194,7 @@ def list_persons(
 @router.post("/persons", response_model=PersonRead, status_code=status.HTTP_201_CREATED)
 def create_person(
     payload: PersonCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> PersonRead:
     settings = get_settings()
@@ -247,7 +247,7 @@ def create_person(
 def update_person(
     person_id: int,
     payload: PersonUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> PersonRead:
     settings = get_settings()
@@ -311,7 +311,7 @@ async def enroll_frame(
     pose_label: PoseLabel = Form(...),
     store_avatar: bool | None = Form(default=None),
     dry_run: bool = Form(default=False),
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> EnrollFrameResponse:
     settings = get_settings()
