@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 OrgMode = Literal["enterprise", "education"]
 AcademicPeriodType = Literal["bimestral", "trimestral", "cuatrimestral", "semestral", "ciclo"]
 PersonRole = Literal["employee", "student", "teacher", "admin"]
-UserRole = Literal["superadmin", "org_admin", "teacher", "operator"]
+UserRole = Literal["superadmin", "org_admin", "teacher", "supervisor", "operator"]
 PoseLabel = Literal["frontal", "left", "right", "up", "down", "smile"]
 SessionType = Literal["workday", "class"]
 SessionStatus = Literal["open", "closed"]
