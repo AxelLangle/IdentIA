@@ -11,6 +11,7 @@ from app.models import (
     ClassSchedule,
     CourseAssignment,
     Group,
+    Organization,
     Person,
     PersonGroup,
     Subject,
@@ -117,8 +118,10 @@ def serialize_courses_batch(
         return []
 
     student_counts = _group_student_counts(db, organization_id)
+    org = db.get(Organization, organization_id)
+    org_period_type = org.academic_period_type if org else "semestral"
     career_map = {
-        c.id: c.name
+        c.id: c
         for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
     }
 
@@ -129,6 +132,8 @@ def serialize_courses_batch(
             key=lambda s: (s.day_of_week, s.start_time, s.id),
         )
         career_id = c.group.career_id if c.group else None
+        career = career_map.get(career_id) if career_id else None
+        effective_period = (career.period_type if career and career.period_type else None) or org_period_type
         result.append(
             CourseAssignmentRead(
                 id=c.id,
@@ -136,8 +141,11 @@ def serialize_courses_batch(
                 group_id=c.group_id,
                 group_name=c.group.name if c.group else "",
                 group_code=c.group.code if c.group else "",
+                group_default_classroom=c.group.default_classroom if c.group else None,
+                semester=c.group.semester if c.group else None,
+                period_type=effective_period,
                 career_id=career_id,
-                career_name=career_map.get(career_id) if career_id else None,
+                career_name=career.name if career else None,
                 subject_id=c.subject_id,
                 subject_name=c.subject.name if c.subject else "",
                 subject_code=c.subject.code if c.subject else "",
@@ -520,9 +528,12 @@ def compute_academic_stats(
     group_id: int | None = None,
 ) -> AcademicStatsResponse:
     """Calcula estadísticas por asignatura y consolidadas por grupo/alumno."""
+    org = db.get(Organization, organization_id)
+    org_period_type = org.academic_period_type if org else "semestral"
     careers = list(
         db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
     )
+    career_obj_map = {c.id: c for c in careers}
     career_map = {c.id: c.name for c in careers}
 
     groups_stmt = select(Group).where(Group.organization_id == organization_id).order_by(Group.name.asc())
@@ -635,6 +646,10 @@ def compute_academic_stats(
         absent = max(0, expected - present)
         rate = round((present / expected) * 100.0, 2) if expected > 0 else 0.0
         cid = course.group.career_id if course.group else None
+        career_obj = career_obj_map.get(cid) if cid else None
+        subj_period_type = (
+            career_obj.period_type if career_obj and career_obj.period_type else org_period_type
+        )
 
         by_subject.append(
             SubjectAttendanceStat(
@@ -645,7 +660,10 @@ def compute_academic_stats(
                 group_id=course.group_id,
                 group_name=course.group.name if course.group else "",
                 group_code=course.group.code if course.group else "",
+                career_id=cid,
                 career_name=career_map.get(cid) if cid else None,
+                semester=course.group.semester if course.group else None,
+                period_type=subj_period_type,
                 teacher_name=course.teacher.full_name if course.teacher else None,
                 sessions_count=sessions_count,
                 enrolled_students=enrolled_count,
@@ -715,6 +733,10 @@ def compute_academic_stats(
         grand_present += total_present
         grand_sessions += total_sessions
 
+        grp_career = career_obj_map.get(g.career_id) if g.career_id else None
+        grp_period_type = (
+            grp_career.period_type if grp_career and grp_career.period_type else org_period_type
+        )
         by_group.append(
             GroupAttendanceStat(
                 group_id=g.id,
@@ -723,6 +745,7 @@ def compute_academic_stats(
                 career_id=g.career_id,
                 career_name=career_map.get(g.career_id) if g.career_id else None,
                 semester=g.semester,
+                period_type=grp_period_type,
                 subjects_count=len(group_courses),
                 students_count=len(group_students),
                 total_sessions=total_sessions,
