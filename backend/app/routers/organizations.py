@@ -3,7 +3,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import Career, CourseAssignment, Group, Organization, PersonGroup, User
+from app.models import Career, CourseAssignment, Group, Organization, PersonGroup, User, WorkShift
 from app.schemas import (
     GroupCreate,
     GroupRead,
@@ -132,6 +132,10 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
         c.id: c
         for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
     }
+    shift_map = {
+        sh.id: sh
+        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
+    }
     counts_rows = db.execute(
         select(PersonGroup.group_id, func.count(PersonGroup.person_id)).group_by(PersonGroup.group_id)
     ).all()
@@ -150,6 +154,7 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
     result: list[GroupRead] = []
     for g in groups:
         career = career_map.get(g.career_id) if g.career_id else None
+        shift = shift_map.get(g.default_work_shift_id) if g.default_work_shift_id else None
         effective_period = (
             career.period_type if career and career.period_type else org_period_type
         )
@@ -163,6 +168,9 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
                 code=g.code,
                 semester=g.semester,
                 default_classroom=g.default_classroom,
+                default_work_shift_id=g.default_work_shift_id,
+                default_work_shift_name=shift.name if shift else None,
+                default_work_shift_code=shift.code if shift else None,
                 period_type=effective_period,
                 schedule_start=g.schedule_start,
                 schedule_end=g.schedule_end,
@@ -215,6 +223,14 @@ def create_group(
                 detail="Carrera no encontrada en la organización.",
             )
 
+    if payload.default_work_shift_id is not None:
+        shift = db.get(WorkShift, payload.default_work_shift_id)
+        if shift is None or shift.organization_id != org.id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
+            )
+
     data = payload.model_dump()
     if data.get("semester") is not None:
         data["semester"] = data["semester"].strip() or None
@@ -247,6 +263,14 @@ def update_group(
             raise HTTPException(
                 status_code=404,
                 detail="Carrera no encontrada en la organización.",
+            )
+
+    if "default_work_shift_id" in data and data["default_work_shift_id"] is not None:
+        shift = db.get(WorkShift, data["default_work_shift_id"])
+        if shift is None or shift.organization_id != group.organization_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
             )
 
     for field, value in data.items():
