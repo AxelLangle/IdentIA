@@ -281,7 +281,7 @@ export function App() {
             )}
           {activeTab === "enterprise_shifts" &&
             selectedOrg.mode === "enterprise" &&
-            (currentUser.role === "superadmin" || currentUser.role === "org_admin") && (
+            ["superadmin", "org_admin", "supervisor"].includes(currentUser.role) && (
               <EnterpriseShiftsPage
                 currentUser={currentUser}
                 organization={selectedOrg}
