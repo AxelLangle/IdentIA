@@ -491,15 +491,19 @@ def test_alembic_0002_recovers_from_partial_create_all(
 
         verify_engine = create_db_engine(db_url)
         insp = inspect(verify_engine)
+        table_names = set(insp.get_table_names())
         group_cols = {c["name"] for c in insp.get_columns("groups")}
+        person_cols = {c["name"] for c in insp.get_columns("persons")}
         session_cols = {c["name"] for c in insp.get_columns("attendance_sessions")}
         with verify_engine.connect() as conn:
             rev = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
         verify_engine.dispose()
 
-        assert rev == "0003_academic_periods_and_classrooms"
-        assert {"career_id", "semester", "default_classroom"}.issubset(group_cols)
-        assert {"course_assignment_id", "schedule_id"}.issubset(session_cols)
+        assert rev == "0004_enterprise_work_shifts"
+        assert "work_shifts" in table_names
+        assert {"career_id", "semester", "default_classroom", "default_work_shift_id"}.issubset(group_cols)
+        assert "work_shift_id" in person_cols
+        assert {"course_assignment_id", "schedule_id", "work_shift_id"}.issubset(session_cols)
     finally:
         get_settings.cache_clear()
 
