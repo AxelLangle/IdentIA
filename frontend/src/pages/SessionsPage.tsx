@@ -9,6 +9,7 @@ import type {
   Group,
   Organization,
   Person,
+  WorkShift,
 } from "../types/api";
 
 interface SessionsPageProps {
@@ -32,11 +33,15 @@ export function SessionsPage({
 }: SessionsPageProps) {
   const isTeacher = currentUser.role === "teacher";
   const isEducation = organization.mode === "education";
+  const isEnterprise = organization.mode === "enterprise";
   const canManageGroups = currentUser.role === "superadmin" || currentUser.role === "org_admin";
-  const canGenerateSessions =
+  const canGenerateAcademic =
     isEducation && ["superadmin", "org_admin", "teacher"].includes(currentUser.role);
+  const canGenerateEnterprise =
+    isEnterprise && ["superadmin", "org_admin", "operator"].includes(currentUser.role);
 
   const [courses, setCourses] = useState<CourseAssignment[]>([]);
+  const [workShifts, setWorkShifts] = useState<WorkShift[]>([]);
   // Crear grupo
   const [groupName, setGroupName] = useState("");
   const [groupCode, setGroupCode] = useState("");
@@ -46,6 +51,7 @@ export function SessionsPage({
   // Crear sesión
   const [sessionTitle, setSessionTitle] = useState("");
   const [sessionCourseId, setSessionCourseId] = useState<string>("");
+  const [sessionShiftId, setSessionShiftId] = useState<string>("");
   const [sessionGroupId, setSessionGroupId] = useState<string>("");
   const [expectedStart, setExpectedStart] = useState("");
 
@@ -62,22 +68,32 @@ export function SessionsPage({
 
   useEffect(() => {
     setSessionCourseId("");
+    setSessionShiftId("");
     setSessionGroupId("");
     setManualSessionId("");
     setManualPersonId("");
-    if (!isEducation) {
-      setCourses([]);
-      return;
-    }
     let cancelled = false;
-    api
-      .listCourses(organization.id)
-      .then((list) => {
-        if (!cancelled) setCourses(list);
-      })
-      .catch(() => {
-        if (!cancelled) setCourses([]);
-      });
+    if (isEducation) {
+      setWorkShifts([]);
+      api
+        .listCourses(organization.id)
+        .then((list) => {
+          if (!cancelled) setCourses(list);
+        })
+        .catch(() => {
+          if (!cancelled) setCourses([]);
+        });
+    } else {
+      setCourses([]);
+      api
+        .listWorkShifts(organization.id)
+        .then((list) => {
+          if (!cancelled) setWorkShifts(list);
+        })
+        .catch(() => {
+          if (!cancelled) setWorkShifts([]);
+        });
+    }
     return () => {
       cancelled = true;
     };
@@ -103,12 +119,17 @@ export function SessionsPage({
       const todayIso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
         now.getDate()
       ).padStart(2, "0")}`;
-      const res = await api.generateAcademicSessions({
-        organization_id: organization.id,
-        target_date: todayIso,
-      });
+      const res = isEducation
+        ? await api.generateAcademicSessions({
+            organization_id: organization.id,
+            target_date: todayIso,
+          })
+        : await api.generateEnterpriseSessions({
+            organization_id: organization.id,
+            target_date: todayIso,
+          });
       setStatusMsg(
-        `Sesiones del ${res.target_date}: ${res.created_count} nuevas, ${res.existing_count} existentes.`
+        `${isEducation ? "Sesiones" : "Jornadas"} del ${res.target_date}: ${res.created_count} nuevas, ${res.existing_count} existentes.`
       );
       await onRefreshAll();
     } catch (err) {
@@ -145,11 +166,13 @@ export function SessionsPage({
         organization_id: organization.id,
         group_id: !sessionCourseId && sessionGroupId ? Number(sessionGroupId) : null,
         course_assignment_id: sessionCourseId ? Number(sessionCourseId) : null,
+        work_shift_id: isEnterprise && sessionShiftId ? Number(sessionShiftId) : null,
         title: sessionTitle.trim(),
         expected_start_time: expectedStart || null,
       });
       setSessionTitle("");
       setSessionCourseId("");
+      setSessionShiftId("");
       setExpectedStart("");
       await onRefreshAll();
     } catch (err) {
@@ -197,14 +220,14 @@ export function SessionsPage({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {canGenerateSessions && (
+          {(canGenerateAcademic || (canGenerateEnterprise && workShifts.length > 0)) && (
             <button
               type="button"
               onClick={() => void handleGenerateTodaySessions()}
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white"
             >
               <CalendarCheck className="w-4 h-4" />
-              Generar sesiones de hoy
+              {isEducation ? "Generar sesiones de hoy" : "Generar jornadas de hoy"}
             </button>
           )}
           <button
@@ -300,6 +323,7 @@ export function SessionsPage({
                   </p>
                   <p className="text-xs text-slate-500">
                     {g.schedule_start} - {g.schedule_end} · {g.members_count} integrantes
+                    {g.default_work_shift_name ? ` · Turno: ${g.default_work_shift_name}` : ""}
                   </p>
                 </div>
                 {canManageGroups && (
@@ -345,6 +369,33 @@ export function SessionsPage({
                 {courses.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.subject_name} ({c.subject_code}) · {c.group_name}
+                  </option>
+                ))}
+              </select>
+            )}
+            {isEnterprise && workShifts.length > 0 && (
+              <select
+                value={sessionShiftId}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSessionShiftId(val);
+                  const matched = workShifts.find((sh) => String(sh.id) === val);
+                  if (matched) {
+                    if (!sessionTitle.trim()) {
+                      setSessionTitle(`${matched.name} (${matched.start_time}-${matched.end_time})`);
+                    }
+                    if (!expectedStart) {
+                      setExpectedStart(matched.start_time);
+                    }
+                  }
+                }}
+                className="sm:col-span-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">Opcional: vincular a turno laboral</option>
+                {workShifts.map((sh) => (
+                  <option key={sh.id} value={sh.id}>
+                    {sh.name} ({sh.start_time}–{sh.end_time}
+                    {sh.crosses_midnight ? " 🌙" : ""})
                   </option>
                 ))}
               </select>
@@ -401,6 +452,13 @@ export function SessionsPage({
                       {s.subject_name}
                       {s.group_name ? ` · ${s.group_name}` : ""}
                       {s.teacher_name ? ` · ${s.teacher_name}` : ""}
+                    </p>
+                  )}
+                  {s.work_shift_name && (
+                    <p className="text-[11px] text-indigo-300 mt-0.5">
+                      Turno: {s.work_shift_name}
+                      {s.work_shift_code ? ` (${s.work_shift_code})` : ""}
+                      {s.work_shift_crosses_midnight ? " 🌙" : ""}
                     </p>
                   )}
                   <p className="text-xs text-slate-500">
@@ -538,8 +596,54 @@ export function SessionsPage({
                     {ev.person_name}{" "}
                     <span className="text-xs text-slate-500">({ev.person_external_id})</span>
                   </td>
-                  <td className="py-2.5 px-3 text-xs">{ev.event_type}</td>
-                  <td className="py-2.5 px-3 text-xs">{ev.status}</td>
+                  <td className="py-2.5 px-3 text-xs">
+                    {ev.event_type === "check_in"
+                      ? "Entrada"
+                      : ev.event_type === "check_out"
+                        ? "Salida"
+                        : "Asistencia"}
+                    {ev.work_shift_name && (
+                      <span className="block text-[11px] text-slate-400">
+                        {ev.work_shift_name}
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-3 text-xs">
+                    <span
+                      className={
+                        ev.status === "on_time"
+                          ? "text-emerald-300"
+                          : ev.status === "late"
+                            ? "text-amber-300"
+                            : ev.status === "early_exit"
+                              ? "text-orange-300"
+                              : "text-sky-300"
+                      }
+                    >
+                      {ev.status === "on_time"
+                        ? "A tiempo"
+                        : ev.status === "late"
+                          ? "Retardo"
+                          : ev.status === "early_exit"
+                            ? "Salida anticipada"
+                            : "Manual"}
+                    </span>
+                    {ev.late_minutes !== null && ev.late_minutes > 0 && (
+                      <span className="block text-[11px] text-amber-400">
+                        +{ev.late_minutes} min
+                      </span>
+                    )}
+                    {ev.early_exit_minutes !== null && ev.early_exit_minutes > 0 && (
+                      <span className="block text-[11px] text-orange-400">
+                        -{ev.early_exit_minutes} min
+                      </span>
+                    )}
+                    {ev.worked_minutes !== null && (
+                      <span className="block text-[11px] text-slate-400">
+                        {ev.worked_minutes} min trabajados
+                      </span>
+                    )}
+                  </td>
                   <td className="py-2.5 px-3 text-xs text-slate-400">{ev.capture_mode}</td>
                   <td className="py-2.5 pl-3 text-right text-xs">
                     {ev.confidence_score !== null
