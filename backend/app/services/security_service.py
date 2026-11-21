@@ -1,130 +1,145 @@
+"""Servicio de autorizaciones sensibles, credenciales delegadas y bitácora de auditoría.
+
+Valida contraseñas administrativas o contraseñas delegadas temporales (con verificación
+de vigencia y permisos de operación) antes de permitir acciones de alto impacto como
+la revocación biométrica o el cambio de tipo de periodo académico.
+"""
+
 from dataclasses import dataclass
 from datetime import datetime
 from fastapi import HTTPException, status
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.models import AuditLog, DelegatedCredential, User
-from app.security import verify_secret
+from app.models import CredencialDelegada, RegistroAuditoria, Usuario
+from app.security import verificar_secreto
 
 
 @dataclass(frozen=True)
-class AuthorizationResult:
-    """Resultado de validar una autorización sensible (admin o credencial delegada)."""
+class ResultadoAutorizacion:
+    """Resultado de validar una autorización sensible (administrador o credencial delegada)."""
 
-    authorized_by_user: User | None
-    delegated_credential: DelegatedCredential | None
-    method: str  # "admin_password" | "delegated_credential"
+    usuario_autorizador: Usuario | None
+    credencial_delegada: CredencialDelegada | None
+    metodo: str  # "admin_password" | "delegated_credential"
 
 
-def record_audit_log(
-    db: Session,
+def registrar_auditoria(
+    sesion_bd: Session,
     *,
-    organization_id: int | None,
-    action: str,
-    target_type: str,
-    target_id: int | None,
-    target_summary: str | None,
-    executed_by_user: User | None,
-    authorized_by_user: User | None = None,
-    delegated_credential: DelegatedCredential | None = None,
-    details: str | None = None,
-) -> AuditLog:
-    """Registra una entrada en la bitácora de auditoría sin confirmar transacción."""
-    entry = AuditLog(
-        organization_id=organization_id,
-        action=action,
-        target_type=target_type,
-        target_id=target_id,
-        target_summary=target_summary,
-        executed_by_user_id=executed_by_user.id if executed_by_user else None,
-        authorized_by_user_id=authorized_by_user.id if authorized_by_user else None,
-        delegated_credential_id=delegated_credential.id if delegated_credential else None,
-        details=details,
+    id_organizacion: int | None,
+    accion: str,
+    tipo_objetivo: str,
+    id_objetivo: int | None,
+    resumen_objetivo: str | None,
+    usuario_ejecutor: Usuario | None,
+    usuario_autorizador: Usuario | None = None,
+    credencial_delegada: CredencialDelegada | None = None,
+    detalles: str | None = None,
+) -> RegistroAuditoria:
+    """Agrega un evento a la bitácora de auditoría sin confirmar la transacción.
+
+    Se deja el `commit` al flujo llamador para que la acción de negocio y su registro
+    de auditoría sean atómicos dentro de la misma transacción.
+    """
+    entrada = RegistroAuditoria(
+        id_organizacion=id_organizacion,
+        accion=accion,
+        tipo_objetivo=tipo_objetivo,
+        id_objetivo=id_objetivo,
+        resumen_objetivo=resumen_objetivo,
+        id_usuario_ejecutor=usuario_ejecutor.id if usuario_ejecutor else None,
+        id_usuario_autorizador=usuario_autorizador.id if usuario_autorizador else None,
+        id_credencial_delegada=credencial_delegada.id if credencial_delegada else None,
+        detalles=detalles,
     )
-    db.add(entry)
-    return entry
+    sesion_bd.add(entrada)
+    return entrada
 
 
-def verify_sensitive_authorization(
-    db: Session,
+def verificar_autorizacion_sensible(
+    sesion_bd: Session,
     *,
-    current_user: User,
-    organization_id: int,
-    authorization_secret: str,
-    required_operation: str = "revoke_biometrics",
-) -> AuthorizationResult:
+    usuario_actual: Usuario,
+    id_organizacion: int,
+    secreto_autorizacion: str,
+    operacion_requerida: str = "revoke_biometrics",
+) -> ResultadoAutorizacion:
     """Valida contraseña de Superadmin, Org Admin de la organización o credencial delegada."""
-    secret = authorization_secret.strip()
-    if not secret:
+    secreto_limpio = secreto_autorizacion.strip()
+    if not secreto_limpio:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Se requiere la contraseña de autorización.",
         )
 
-    admin_candidates = list(
-        db.scalars(
-            select(User).where(
-                User.is_active.is_(True),
+    candidatos_admin = list(
+        sesion_bd.scalars(
+            select(Usuario).where(
+                Usuario.esta_activo.is_(True),
                 or_(
-                    User.role == "superadmin",
-                    (User.role == "org_admin") & (User.organization_id == organization_id),
+                    Usuario.rol == "superadmin",
+                    (Usuario.rol == "org_admin") & (Usuario.id_organizacion == id_organizacion),
                 ),
             )
         ).all()
     )
 
-    # Prioriza al propio usuario actual si es admin autorizado
-    admin_candidates.sort(key=lambda u: 0 if u.id == current_user.id else 1)
+    # Prioriza verificar primero al propio usuario actual si cuenta con rol administrativo
+    candidatos_admin.sort(key=lambda usuario: 0 if usuario.id == usuario_actual.id else 1)
 
-    for admin in admin_candidates:
-        if verify_secret(secret, admin.password_hash):
-            return AuthorizationResult(
-                authorized_by_user=admin,
-                delegated_credential=None,
-                method="admin_password",
+    for administrador in candidatos_admin:
+        if verificar_secreto(secreto_limpio, administrador.hash_contrasena):
+            return ResultadoAutorizacion(
+                usuario_autorizador=administrador,
+                credencial_delegada=None,
+                metodo="admin_password",
             )
 
-    # Verifica credenciales delegadas activas de la organización
-    credentials = list(
-        db.scalars(
-            select(DelegatedCredential).where(
-                DelegatedCredential.organization_id == organization_id,
-                DelegatedCredential.status == "active",
+    # Si no coincidió con contraseñas admin, evalúa credenciales delegadas activas
+    credenciales = list(
+        sesion_bd.scalars(
+            select(CredencialDelegada).where(
+                CredencialDelegada.id_organizacion == id_organizacion,
+                CredencialDelegada.estado == "active",
             )
         ).all()
     )
-    now = datetime.now()
-    for cred in credentials:
-        if cred.expires_at is not None and cred.expires_at < now:
-            cred.status = "expired"
-            db.flush()
+    ahora = datetime.now()
+    for credencial in credenciales:
+        if credencial.expira_en is not None and credencial.expira_en < ahora:
+            credencial.estado = "expired"
+            sesion_bd.flush()
             continue
 
-        allowed = {op.strip() for op in cred.allowed_operations.split(",") if op.strip()}
-        if required_operation not in allowed:
+        operaciones_permitidas = {
+            operacion.strip()
+            for operacion in credencial.operaciones_permitidas.split(",")
+            if operacion.strip()
+        }
+        if operacion_requerida not in operaciones_permitidas:
             continue
 
-        if verify_secret(secret, cred.secret_hash):
+        if verificar_secreto(secreto_limpio, credencial.hash_secreto):
             if (
-                cred.assigned_to_user_id is not None
-                and current_user.role not in ("superadmin", "org_admin")
-                and cred.assigned_to_user_id != current_user.id
+                credencial.id_usuario_asignado is not None
+                and usuario_actual.rol not in ("superadmin", "org_admin")
+                and credencial.id_usuario_asignado != usuario_actual.id
             ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Esta credencial delegada está asignada a otro usuario.",
                 )
 
-            creator = (
-                db.get(User, cred.created_by_user_id)
-                if cred.created_by_user_id is not None
+            usuario_creador = (
+                sesion_bd.get(Usuario, credencial.id_usuario_creador)
+                if credencial.id_usuario_creador is not None
                 else None
             )
-            return AuthorizationResult(
-                authorized_by_user=creator,
-                delegated_credential=cred,
-                method="delegated_credential",
+            return ResultadoAutorizacion(
+                usuario_autorizador=usuario_creador,
+                credencial_delegada=credencial,
+                metodo="delegated_credential",
             )
 
     raise HTTPException(
@@ -133,37 +148,41 @@ def verify_sensitive_authorization(
     )
 
 
-def verify_admin_password(
-    db: Session,
+def verificar_contrasena_admin(
+    sesion_bd: Session,
     *,
-    current_user: User,
-    organization_id: int,
-    authorization_secret: str | None,
-) -> User:
-    """Valida exclusivamente la contraseña de un Superadmin o Admin de la organización."""
-    secret = (authorization_secret or "").strip()
-    if not secret:
+    usuario_actual: Usuario,
+    id_organizacion: int,
+    secreto_autorizacion: str | None,
+) -> Usuario:
+    """Valida exclusivamente la contraseña de un Superadmin o Admin de la organización.
+
+    No acepta credenciales delegadas; se exige para cambios estructurales como el
+    tipo de periodo académico.
+    """
+    secreto_limpio = (secreto_autorizacion or "").strip()
+    if not secreto_limpio:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Se requiere la contraseña de administrador para cambiar el tipo de periodo.",
         )
 
-    admin_candidates = list(
-        db.scalars(
-            select(User).where(
-                User.is_active.is_(True),
+    candidatos_admin = list(
+        sesion_bd.scalars(
+            select(Usuario).where(
+                Usuario.esta_activo.is_(True),
                 or_(
-                    User.role == "superadmin",
-                    (User.role == "org_admin") & (User.organization_id == organization_id),
+                    Usuario.rol == "superadmin",
+                    (Usuario.rol == "org_admin") & (Usuario.id_organizacion == id_organizacion),
                 ),
             )
         ).all()
     )
-    admin_candidates.sort(key=lambda u: 0 if u.id == current_user.id else 1)
+    candidatos_admin.sort(key=lambda usuario: 0 if usuario.id == usuario_actual.id else 1)
 
-    for admin in admin_candidates:
-        if verify_secret(secret, admin.password_hash):
-            return admin
+    for administrador in candidatos_admin:
+        if verificar_secreto(secreto_limpio, administrador.hash_contrasena):
+            return administrador
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
