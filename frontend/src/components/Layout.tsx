@@ -1,3 +1,9 @@
+/**
+ * Marco principal de navegación de IdentIA.
+ * Renderiza la barra lateral con el menú filtrado por rol y modo operativo,
+ * el encabezado superior con selector de organización multi-tenant para
+ * superadministradores, la ficha de sesión del usuario y el área principal.
+ */
 import type { ReactNode } from "react";
 import {
   Activity,
@@ -12,9 +18,15 @@ import {
   ShieldCheck,
   Users,
 } from "lucide-react";
-import type { AuthUser, HealthResponse, Organization, UserRole } from "../types/api";
+import type {
+  Organizacion,
+  RespuestaSalud,
+  RolUsuario,
+  UsuarioAutenticado,
+} from "../types/api";
 
-export type NavTab =
+/** Identificadores válidos de las pestañas de navegación en la aplicación. */
+export type PestanaNavegacion =
   | "dashboard"
   | "kiosk"
   | "enrollment"
@@ -24,19 +36,30 @@ export type NavTab =
   | "teacher_portal"
   | "security";
 
-interface LayoutProps {
-  activeTab: NavTab;
-  onChangeTab: (tab: NavTab) => void;
-  currentUser: AuthUser;
-  onLogout: () => void;
-  organizations: Organization[];
-  selectedOrg: Organization | null;
-  onSelectOrg: (orgId: number) => void;
-  health: HealthResponse | null;
+/** Propiedades recibidas por el contenedor principal `DisenoPrincipal`. */
+interface PropiedadesDisenoPrincipal {
+  /** Pestaña activa actualmente en el espacio de trabajo. */
+  pestanaActiva: PestanaNavegacion;
+  /** Callback ejecutado cuando el usuario cambia de vista en la barra lateral. */
+  alCambiarPestana: (pestana: PestanaNavegacion) => void;
+  /** Perfil del usuario autenticado mediante JWT. */
+  usuarioActual: UsuarioAutenticado;
+  /** Callback para cerrar la sesión actual. */
+  alCerrarSesion: () => void;
+  /** Lista de organizaciones accesibles para el usuario. */
+  organizaciones: Organizacion[];
+  /** Organización seleccionada actualmente como contexto activo. */
+  organizacionSeleccionada: Organizacion | null;
+  /** Callback ejecutado cuando el superadmin elige otra organización. */
+  alSeleccionarOrganizacion: (idOrganizacion: number) => void;
+  /** Diagnóstico más reciente de disponibilidad de modelos ONNX. */
+  estadoSalud: RespuestaSalud | null;
+  /** Vista hija correspondiente a la pestaña activa. */
   children: ReactNode;
 }
 
-const ROLE_LABELS: Record<UserRole, string> = {
+/** Etiquetas legibles mostradas en la ficha superior según el rol del usuario. */
+const ETIQUETAS_ROL: Record<RolUsuario, string> = {
   superadmin: "Superadmin",
   org_admin: "Admin Org",
   teacher: "Profesor",
@@ -44,51 +67,67 @@ const ROLE_LABELS: Record<UserRole, string> = {
   operator: "Operador",
 };
 
-export function Layout({
-  activeTab,
-  onChangeTab,
-  currentUser,
-  onLogout,
-  organizations,
-  selectedOrg,
-  onSelectOrg,
-  health,
+/**
+ * Envuelve el contenido autenticado dentro de la barra lateral de navegación,
+ * barra superior de contexto organizacional y contenedor de página principal.
+ */
+export function DisenoPrincipal({
+  pestanaActiva,
+  alCambiarPestana,
+  usuarioActual,
+  alCerrarSesion,
+  organizaciones,
+  organizacionSeleccionada,
+  alSeleccionarOrganizacion,
+  estadoSalud,
   children,
-}: LayoutProps) {
-  const canViewSecurity = currentUser.role === "superadmin" || currentUser.role === "org_admin";
-  const isEducation = selectedOrg?.mode === "education";
-  const isEnterprise = selectedOrg?.mode === "enterprise";
-  const isTeacher = currentUser.role === "teacher";
+}: PropiedadesDisenoPrincipal) {
+  const puedeVerSeguridad =
+    usuarioActual.rol === "superadmin" || usuarioActual.rol === "org_admin";
+  const esEducacion = organizacionSeleccionada?.modo === "education";
+  const esEmpresa = organizacionSeleccionada?.modo === "enterprise";
+  const esDocente = usuarioActual.rol === "teacher";
 
-  const navItems: { id: NavTab; label: string; icon: typeof LayoutDashboard; visible: boolean }[] = [
+  // Catálogo declarativo de navegación sujeto a permisos por rol y modo.
+  const elementosNavegacion: {
+    id: PestanaNavegacion;
+    etiqueta: string;
+    icono: typeof LayoutDashboard;
+    visible: boolean;
+  }[] = [
     {
       id: "teacher_portal",
-      label: "Mi Agenda Docente",
-      icon: BookOpen,
-      visible: isEducation && isTeacher,
+      etiqueta: "Mi Agenda Docente",
+      icono: BookOpen,
+      visible: esEducacion && esDocente,
     },
-    { id: "dashboard", label: "Dashboard", icon: LayoutDashboard, visible: !isTeacher },
-    { id: "kiosk", label: "Kiosco en vivo", icon: ScanFace, visible: true },
-    { id: "enrollment", label: "Personas y Registro", icon: Users, visible: !isTeacher },
+    { id: "dashboard", etiqueta: "Dashboard", icono: LayoutDashboard, visible: !esDocente },
+    { id: "kiosk", etiqueta: "Kiosco en vivo", icono: ScanFace, visible: true },
+    { id: "enrollment", etiqueta: "Personas y Registro", icono: Users, visible: !esDocente },
     {
       id: "academic",
-      label: "Estructura Académica",
-      icon: GraduationCap,
-      visible: isEducation && canViewSecurity,
+      etiqueta: "Estructura Académica",
+      icono: GraduationCap,
+      visible: esEducacion && puedeVerSeguridad,
     },
     {
       id: "enterprise_shifts",
-      label: "Turnos y Jornadas",
-      icon: Briefcase,
-      visible: isEnterprise && (canViewSecurity || currentUser.role === "supervisor"),
+      etiqueta: "Turnos y Jornadas",
+      icono: Briefcase,
+      visible: esEmpresa && (puedeVerSeguridad || usuarioActual.rol === "supervisor"),
     },
     {
       id: "sessions",
-      label: isTeacher ? "Mis Sesiones" : "Grupos y Sesiones",
-      icon: CalendarClock,
+      etiqueta: esDocente ? "Mis Sesiones" : "Grupos y Sesiones",
+      icono: CalendarClock,
       visible: true,
     },
-    { id: "security", label: "Seguridad y Usuarios", icon: ShieldCheck, visible: canViewSecurity },
+    {
+      id: "security",
+      etiqueta: "Seguridad y Usuarios",
+      icono: ShieldCheck,
+      visible: puedeVerSeguridad,
+    },
   ];
 
   return (
@@ -107,24 +146,24 @@ export function Layout({
           </div>
 
           <nav className="p-3 flex md:flex-col gap-1 overflow-x-auto">
-            {navItems
-              .filter((item) => item.visible)
-              .map((item) => {
-                const Icon = item.icon;
-                const isActive = activeTab === item.id;
+            {elementosNavegacion
+              .filter((elemento) => elemento.visible)
+              .map((elemento) => {
+                const Icono = elemento.icono;
+                const estaActiva = pestanaActiva === elemento.id;
                 return (
                   <button
-                    key={item.id}
+                    key={elemento.id}
                     type="button"
-                    onClick={() => onChangeTab(item.id)}
+                    onClick={() => alCambiarPestana(elemento.id)}
                     className={`flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
-                      isActive
+                      estaActiva
                         ? "bg-indigo-600 text-white shadow-sm"
                         : "text-slate-300 hover:bg-slate-800/80 hover:text-white"
                     }`}
                   >
-                    <Icon className="w-4 h-4 shrink-0" />
-                    <span>{item.label}</span>
+                    <Icono className="w-4 h-4 shrink-0" />
+                    <span>{elemento.etiqueta}</span>
                   </button>
                 );
               })}
@@ -139,12 +178,12 @@ export function Layout({
             </span>
             <span
               className={`px-2 py-0.5 rounded-full text-[11px] font-medium ${
-                health?.models_loaded
+                estadoSalud?.modelos_cargados
                   ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
                   : "bg-amber-500/15 text-amber-300 border border-amber-500/30"
               }`}
             >
-              {health?.models_loaded ? "YuNet + SFace" : "Cargando"}
+              {estadoSalud?.modelos_cargados ? "YuNet + SFace" : "Cargando"}
             </span>
           </div>
           <p className="text-[11px] text-slate-500">
@@ -161,34 +200,34 @@ export function Layout({
               Organización
             </span>
 
-            {currentUser.role === "superadmin" ? (
+            {usuarioActual.rol === "superadmin" ? (
               <select
                 id="org-selector"
-                value={selectedOrg?.id ?? ""}
-                onChange={(e) => onSelectOrg(Number(e.target.value))}
+                value={organizacionSeleccionada?.id ?? ""}
+                onChange={(evento) => alSeleccionarOrganizacion(Number(evento.target.value))}
                 className="bg-slate-800 border border-slate-700 text-slate-100 text-sm rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500 max-w-xs truncate"
               >
-                {organizations.map((org) => (
-                  <option key={org.id} value={org.id}>
-                    {org.name}
+                {organizaciones.map((organizacion) => (
+                  <option key={organizacion.id} value={organizacion.id}>
+                    {organizacion.nombre}
                   </option>
                 ))}
               </select>
             ) : (
               <span className="text-sm font-semibold text-slate-100 truncate max-w-xs">
-                {selectedOrg?.name ?? "Sin organización"}
+                {organizacionSeleccionada?.nombre ?? "Sin organización"}
               </span>
             )}
 
-            {selectedOrg && (
+            {organizacionSeleccionada && (
               <span
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
-                  selectedOrg.mode === "enterprise"
+                  organizacionSeleccionada.modo === "enterprise"
                     ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
                     : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
                 }`}
               >
-                {selectedOrg.mode === "enterprise" ? (
+                {organizacionSeleccionada.modo === "enterprise" ? (
                   <>
                     <Building2 className="w-3.5 h-3.5" />
                     Empresa (Check-in/out)
@@ -206,15 +245,15 @@ export function Layout({
           <div className="flex items-center gap-3">
             <div className="text-right hidden sm:block">
               <p className="text-xs font-semibold text-slate-200 leading-tight">
-                {currentUser.full_name}
+                {usuarioActual.nombre_completo}
               </p>
               <p className="text-[11px] text-indigo-300">
-                {ROLE_LABELS[currentUser.role]} · {currentUser.email}
+                {ETIQUETAS_ROL[usuarioActual.rol]} · {usuarioActual.correo}
               </p>
             </div>
             <button
               type="button"
-              onClick={onLogout}
+              onClick={alCerrarSesion}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
               title="Cerrar sesión"
             >
