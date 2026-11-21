@@ -206,8 +206,8 @@ export const api = {
     organization_id: number;
     name: string;
     code: string;
-    schedule_start: string;
-    schedule_end: string;
+    schedule_start?: string;
+    schedule_end?: string;
     career_id?: number | null;
     semester?: string | null;
     period_type?: AcademicPeriodType | null;
