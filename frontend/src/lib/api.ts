@@ -192,7 +192,7 @@ export const api = {
         | "cooldown_seconds"
         | "store_avatar_by_default"
       >
-    >
+    > & { authorization_secret?: string }
   ) =>
     requestJson<Organization>(`/api/organizations/${orgId}`, {
       method: "PATCH",
@@ -210,6 +210,7 @@ export const api = {
     schedule_end: string;
     career_id?: number | null;
     semester?: string | null;
+    period_type?: AcademicPeriodType | null;
     default_classroom?: string | null;
     default_work_shift_id?: number | null;
   }) =>
@@ -227,8 +228,10 @@ export const api = {
       schedule_end: string;
       career_id: number | null;
       semester: string | null;
+      period_type: AcademicPeriodType | null;
       default_classroom: string | null;
       default_work_shift_id: number | null;
+      authorization_secret: string;
     }>
   ) =>
     requestJson<Group>(`/api/groups/${groupId}`, {
@@ -431,6 +434,7 @@ export const api = {
       code: string;
       description: string | null;
       period_type: AcademicPeriodType | null;
+      authorization_secret: string;
     }>
   ) =>
     requestJson<Career>(`/api/academic/careers/${careerId}`, {
