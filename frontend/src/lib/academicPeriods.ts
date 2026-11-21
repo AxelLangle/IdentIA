@@ -1,91 +1,110 @@
-import type { AcademicPeriodType } from "../types/api";
+/**
+ * Catálogo, formateo y ordenamiento natural de periodos académicos en IdentIA.
+ *
+ * Centraliza los cinco regímenes escolares soportados (`bimestral`, `trimestral`,
+ * `cuatrimestral`, `semestral` y `ciclo`) para mantener consistencia visual entre
+ * la configuración institucional, carreras, grupos, enrolamiento y estadísticas.
+ */
+import type { TipoPeriodoAcademico } from "../types/api";
 
-export interface PeriodMeta {
-  value: AcademicPeriodType;
-  label: string;
+/** Metadatos lingüísticos y ejemplos de captura para un tipo de periodo académico. */
+export interface MetadatosPeriodo {
+  valor: TipoPeriodoAcademico;
+  etiqueta: string;
   singular: string;
   plural: string;
-  prefix: string;
-  placeholder: string;
+  prefijo: string;
+  marcadorEjemplo: string;
 }
 
-export const ACADEMIC_PERIOD_OPTIONS: PeriodMeta[] = [
+/** Catálogo oficial de tipos de periodo académico seleccionables. */
+export const OPCIONES_PERIODO_ACADEMICO: MetadatosPeriodo[] = [
   {
-    value: "bimestral",
-    label: "Bimestral",
+    valor: "bimestral",
+    etiqueta: "Bimestral",
     singular: "Bimestre",
     plural: "Bimestres",
-    prefix: "Bimestre",
-    placeholder: "Ej. 3 (se mostrará Bimestre 3)",
+    prefijo: "Bimestre",
+    marcadorEjemplo: "Ej. 3 (se mostrará Bimestre 3)",
   },
   {
-    value: "trimestral",
-    label: "Trimestral",
+    valor: "trimestral",
+    etiqueta: "Trimestral",
     singular: "Trimestre",
     plural: "Trimestres",
-    prefix: "Trimestre",
-    placeholder: "Ej. 4 (se mostrará Trimestre 4)",
+    prefijo: "Trimestre",
+    marcadorEjemplo: "Ej. 4 (se mostrará Trimestre 4)",
   },
   {
-    value: "cuatrimestral",
-    label: "Cuatrimestral",
+    valor: "cuatrimestral",
+    etiqueta: "Cuatrimestral",
     singular: "Cuatrimestre",
     plural: "Cuatrimestres",
-    prefix: "Cuatrimestre",
-    placeholder: "Ej. 6 (se mostrará Cuatrimestre 6)",
+    prefijo: "Cuatrimestre",
+    marcadorEjemplo: "Ej. 6 (se mostrará Cuatrimestre 6)",
   },
   {
-    value: "semestral",
-    label: "Semestral",
+    valor: "semestral",
+    etiqueta: "Semestral",
     singular: "Semestre",
     plural: "Semestres",
-    prefix: "Semestre",
-    placeholder: "Ej. 5 (se mostrará Semestre 5)",
+    prefijo: "Semestre",
+    marcadorEjemplo: "Ej. 5 (se mostrará Semestre 5)",
   },
   {
-    value: "ciclo",
-    label: "Ciclo anual (año completo)",
+    valor: "ciclo",
+    etiqueta: "Ciclo anual (año completo)",
     singular: "Ciclo / Grado",
     plural: "Ciclos / Grados",
-    prefix: "Ciclo",
-    placeholder: "Ej. 2026 o 2 (se mostrará Ciclo 2026)",
+    prefijo: "Ciclo",
+    marcadorEjemplo: "Ej. 2026 o 2 (se mostrará Ciclo 2026)",
   },
 ];
 
-export function getPeriodMeta(periodType?: string | null): PeriodMeta {
+/**
+ * Obtiene los metadatos de un periodo académico con respaldo a `"semestral"`.
+ */
+export function obtenerMetadatosPeriodo(tipoPeriodo?: string | null): MetadatosPeriodo {
   return (
-    ACADEMIC_PERIOD_OPTIONS.find((item) => item.value === periodType) ??
-    ACADEMIC_PERIOD_OPTIONS[3]
+    OPCIONES_PERIODO_ACADEMICO.find((elemento) => elemento.valor === tipoPeriodo) ??
+    OPCIONES_PERIODO_ACADEMICO[3]
   );
 }
 
-const PERIOD_WORD_EDGE_RE =
+/** Expresión regular para remover palabras redundantes al inicio o final del número de periodo. */
+const EXPRESION_PALABRA_PERIODO =
   /^(?:bimestres?|trimestres?|cuatrimestres?|semestres?|ciclos?(?:\s+anual)?|grados?|a[ñn]os?)(?:\s+|(?:\s+de\s+))|\s*(?:bimestres?|trimestres?|cuatrimestres?|semestres?|ciclos?|grados?)$/gi;
 
 /**
- * Antepone el tipo de periodo antes del número/etiqueta del grupo
- * (p. ej. "6" -> "Cuatrimestre 6", "6to Cuatrimestre" -> "Cuatrimestre 6to").
+ * Antepone el tipo de periodo antes del número o etiqueta capturada en el grupo
+ * (p. ej. `"6"` -> `"Cuatrimestre 6"`, `"6to Cuatrimestre"` -> `"Cuatrimestre 6to"`).
  */
-export function formatGroupPeriodLabel(
-  semester?: string | null,
-  periodType?: string | null
+export function formatearEtiquetaPeriodoGrupo(
+  semestre?: string | null,
+  tipoPeriodo?: string | null
 ): string | null {
-  const raw = (semester ?? "").trim();
-  if (!raw) return null;
-  const meta = getPeriodMeta(periodType);
-  let cleaned = raw;
-  for (let i = 0; i < 2; i += 1) {
-    cleaned = cleaned.replace(PERIOD_WORD_EDGE_RE, "").trim();
+  const textoCrudo = (semestre ?? "").trim();
+  if (!textoCrudo) return null;
+  const metadatos = obtenerMetadatosPeriodo(tipoPeriodo);
+  let textoLimpio = textoCrudo;
+  for (let paso = 0; paso < 2; paso += 1) {
+    textoLimpio = textoLimpio.replace(EXPRESION_PALABRA_PERIODO, "").trim();
   }
-  return cleaned ? `${meta.prefix} ${cleaned}` : meta.prefix;
+  return textoLimpio ? `${metadatos.prefijo} ${textoLimpio}` : metadatos.prefijo;
 }
 
-/** Ordena nombres de periodos de forma natural ("2do Cuatrimestre" antes de "10mo Cuatrimestre"). */
-export function comparePeriodsNatural(a?: string | null, b?: string | null): number {
-  const va = (a ?? "").trim();
-  const vb = (b ?? "").trim();
-  if (!va && !vb) return 0;
-  if (!va) return 1;
-  if (!vb) return -1;
-  return va.localeCompare(vb, "es", { numeric: true, sensitivity: "base" });
+/**
+ * Ordena etiquetas de periodos de forma natural en español
+ * (ej. `"2do Cuatrimestre"` antes que `"10mo Cuatrimestre"`).
+ */
+export function compararPeriodosNatural(
+  primerValor?: string | null,
+  segundoValor?: string | null
+): number {
+  const valorA = (primerValor ?? "").trim();
+  const valorB = (segundoValor ?? "").trim();
+  if (!valorA && !valorB) return 0;
+  if (!valorA) return 1;
+  if (!valorB) return -1;
+  return valorA.localeCompare(valorB, "es", { numeric: true, sensitivity: "base" });
 }
