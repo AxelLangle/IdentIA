@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import {
   Activity,
+  Briefcase,
   CheckCircle2,
   Download,
   Plus,
@@ -154,6 +155,16 @@ export function DashboardPage({
             >
               <Plus className="w-4 h-4" />
               Nueva Organización
+            </button>
+          )}
+          {organization.mode === "enterprise" && canEditOrg && (
+            <button
+              type="button"
+              onClick={() => onNavigateTab("enterprise_shifts")}
+              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors"
+            >
+              <Briefcase className="w-4 h-4 text-indigo-400" />
+              Turnos y Jornadas
             </button>
           )}
           <button
@@ -499,6 +510,11 @@ export function DashboardPage({
                           : ev.event_type === "check_out"
                             ? "Salida"
                             : "Asistencia"}
+                        {ev.work_shift_name && (
+                          <span className="block text-[11px] text-slate-400">
+                            {ev.work_shift_name}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2.5 px-3">
                         <span
@@ -507,14 +523,18 @@ export function DashboardPage({
                               ? "bg-emerald-500/15 text-emerald-300"
                               : ev.status === "late"
                                 ? "bg-amber-500/15 text-amber-300"
-                                : "bg-sky-500/15 text-sky-300"
+                                : ev.status === "early_exit"
+                                  ? "bg-orange-500/15 text-orange-300"
+                                  : "bg-sky-500/15 text-sky-300"
                           }`}
                         >
                           {ev.status === "on_time"
                             ? "A tiempo"
                             : ev.status === "late"
                               ? "Retardo"
-                              : "Manual"}
+                              : ev.status === "early_exit"
+                                ? "Salida anticipada"
+                                : "Manual"}
                         </span>
                       </td>
                       <td className="py-2.5 px-3 text-xs text-slate-300">
