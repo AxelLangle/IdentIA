@@ -700,3 +700,137 @@ def test_alembic_0004_upgrade_and_downgrade(tmp_path: Path, monkeypatch) -> None
         assert rev3 == "0004_enterprise_work_shifts"
     finally:
         get_settings.cache_clear()
+
+
+def test_supervisor_permissions_and_department_shift_schedule_sync(raw_api_client) -> None:
+    """Verifica permisos de Supervisor en empresa y sincronización de horario con turno por defecto."""
+    client, _, _, _ = raw_api_client
+    settings = get_settings()
+    sa_headers = _auth_header(
+        client,
+        settings.bootstrap_superadmin_email,
+        settings.bootstrap_superadmin_password,
+    )
+    org_id, admin_headers = _create_enterprise_org(
+        client,
+        sa_headers,
+        name="Planta Industrial Alfa",
+        admin_email="alfa.admin@identia.local",
+    )
+
+    sup_res = client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "email": "alfa.sup@identia.local",
+            "full_name": "Carlos Supervisor",
+            "password": "Supervisor2026!",
+            "role": "supervisor",
+        },
+    )
+    assert sup_res.status_code == 201, sup_res.text
+    sup_headers = _auth_header(client, "alfa.sup@identia.local", "Supervisor2026!")
+
+    shift_a = client.post(
+        "/api/enterprise/shifts",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "name": "Turno Matutino 7-15",
+            "code": "MAT7",
+            "start_time": "07:00",
+            "end_time": "15:00",
+            "days_of_week": [0, 1, 2, 3, 4],
+        },
+    ).json()
+    shift_b = client.post(
+        "/api/enterprise/shifts",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "name": "Turno Nocturno 22-06",
+            "code": "NOC22",
+            "start_time": "22:00",
+            "end_time": "06:00",
+            "days_of_week": [0, 1, 2, 3, 4],
+        },
+    ).json()
+
+    # Crear área sin pasar schedule_start/schedule_end debe sincronizarse con shift_a
+    dept_res = client.post(
+        "/api/groups",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "name": "Empaque",
+            "code": "EMP",
+            "default_work_shift_id": shift_a["id"],
+        },
+    )
+    assert dept_res.status_code == 201, dept_res.text
+    dept = dept_res.json()
+    assert dept["schedule_start"] == "07:00"
+    assert dept["schedule_end"] == "15:00"
+
+    # Al cambiar default_work_shift_id también sincroniza schedule_start y schedule_end
+    dept_patch = client.patch(
+        f"/api/groups/{dept['id']}",
+        headers=admin_headers,
+        json={"default_work_shift_id": shift_b["id"]},
+    )
+    assert dept_patch.status_code == 200, dept_patch.text
+    assert dept_patch.json()["schedule_start"] == "22:00"
+    assert dept_patch.json()["schedule_end"] == "06:00"
+
+    # Permisos operativos del Supervisor (permitidos)
+    assert client.get(f"/api/enterprise/shifts?organization_id={org_id}", headers=sup_headers).status_code == 200
+    assert client.get(f"/api/enterprise/stats?organization_id={org_id}", headers=sup_headers).status_code == 200
+    assert (
+        client.post(
+            "/api/enterprise/sessions/generate",
+            headers=sup_headers,
+            json={"organization_id": org_id, "target_date": "2026-06-15"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            f"/api/enterprise/shifts/{shift_a['id']}/start-session",
+            headers=sup_headers,
+            json={"session_date": "2026-06-15"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/persons",
+            headers=sup_headers,
+            json={
+                "organization_id": org_id,
+                "external_id": "SUP-EMP-01",
+                "full_name": "Operario Registrado",
+                "role": "employee",
+                "biometric_consent": True,
+                "group_ids": [dept["id"]],
+            },
+        ).status_code
+        == 201
+    )
+
+    # Acciones restringidas al Supervisor -> 403
+    assert (
+        client.post(
+            "/api/enterprise/shifts",
+            headers=sup_headers,
+            json={
+                "organization_id": org_id,
+                "name": "No permitido",
+                "code": "NP",
+                "start_time": "10:00",
+                "end_time": "18:00",
+            },
+        ).status_code
+        == 403
+    )
+    assert client.delete(f"/api/enterprise/shifts/{shift_a['id']}", headers=sup_headers).status_code == 403
+    assert client.get(f"/api/users?organization_id={org_id}", headers=sup_headers).status_code == 403
