@@ -41,6 +41,7 @@ class OrganizationUpdate(BaseModel):
     late_tolerance_minutes: int | None = Field(default=None, ge=0, le=180)
     cooldown_seconds: int | None = Field(default=None, ge=5, le=3600)
     store_avatar_by_default: bool | None = None
+    authorization_secret: str | None = Field(default=None, max_length=120)
 
 
 class OrganizationRead(BaseModel):
@@ -65,6 +66,7 @@ class GroupCreate(BaseModel):
     schedule_end: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
     career_id: int | None = None
     semester: str | None = Field(default=None, max_length=40)
+    period_type: AcademicPeriodType | None = None
     default_classroom: str | None = Field(default=None, max_length=80)
     default_work_shift_id: int | None = None
 
@@ -76,8 +78,10 @@ class GroupUpdate(BaseModel):
     schedule_end: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     career_id: int | None = None
     semester: str | None = Field(default=None, max_length=40)
+    period_type: AcademicPeriodType | None = None
     default_classroom: str | None = Field(default=None, max_length=80)
     default_work_shift_id: int | None = None
+    authorization_secret: str | None = Field(default=None, max_length=120)
 
 
 class GroupRead(BaseModel):
@@ -95,6 +99,7 @@ class GroupRead(BaseModel):
     default_work_shift_name: str | None = None
     default_work_shift_code: str | None = None
     period_type: str = "semestral"
+    custom_period_type: str | None = None
     schedule_start: str
     schedule_end: str
     created_at: datetime
@@ -433,6 +438,7 @@ class CareerUpdate(BaseModel):
     code: str | None = Field(default=None, min_length=1, max_length=40)
     description: str | None = Field(default=None, max_length=255)
     period_type: AcademicPeriodType | None = None
+    authorization_secret: str | None = Field(default=None, max_length=120)
 
 
 class CareerRead(BaseModel):
