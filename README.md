@@ -25,11 +25,11 @@ Surgió como una reconstrucción completa desde cero del proyecto académico ant
 
 De acuerdo con mejores prácticas de seguridad de la información (ISO/IEC 24745 y LFPDPPP):
 
-- **No se almacenan las 3–5 fotos crudas de enrolamiento.** Cada imagen enviada se procesa únicamente en memoria RAM y se descarta al instante tras extraer su vector matemático de 512 bytes.
-- **Consentimiento explícito obligatorio:** No es posible registrar datos biométricos sin aceptar `biometric_consent`.
+- **No se almacenan las fotos crudas de enrolamiento.** Cada imagen enviada se procesa únicamente en memoria RAM y se descarta al instante tras extraer su vector matemático de 512 bytes.
+- **Consentimiento explícito obligatorio:** No es posible registrar datos biométricos sin aceptar `consentimiento_biometrico`.
 - **Avatar opcional desacoplado:** Solo se conserva opcionalmente 1 miniatura comprimida (`200x200` JPEG) para identificación visual en pantalla.
-- **Derecho de revocación:** Desde la interfaz o vía `DELETE /api/persons/{id}/biometrics` se borran todos los embeddings y el avatar al instante.
-- **Trazabilidad de modelo:** Cada vector almacena `model_name` y `model_version` para detectar automáticamente re-enrolamientos necesarios ante futuras actualizaciones del modelo.
+- **Derecho de revocación:** Desde la interfaz o vía `POST /api/persons/biometrics/revoke` se borran todos los embeddings y el avatar al instante con trazabilidad en bitácora.
+- **Trazabilidad de modelo:** Cada vector almacena `nombre_modelo` y `version_modelo` para detectar automáticamente re-enrolamientos necesarios ante futuras actualizaciones del modelo.
 
 ---
 
@@ -122,14 +122,52 @@ npm run build
 
 ---
 
+## Ejecutables Offline de Escritorio (Release 1.1.0)
+
+Desde la versión **1.1.0**, todo el código fuente (`backend/` y `frontend/`) utiliza identificadores descriptivos en español y documentación interna extensa (conservando sin cambios los nombres físicos de tablas/columnas SQLite y migraciones Alembic). Además, se distribuyen paquetes autónomos para Windows que embeben el servidor FastAPI, la interfaz web React compilada (`frontend_dist/`) y los modelos YuNet + SFace ONNX (`models/`), permitiendo operar 100% offline:
+
+- **`release/IdentIA-1.1.0.exe` (~89.55 MB):** Ejecutable único (`--onefile`), listo para copiar y ejecutar directamente.
+- **`release/IdentIA-1.1.0-portable.zip` (~89.64 MB):** Paquete portable (`--onedir`) de arranque instantáneo; basta descomprimir y ejecutar `IdentIA-1.1.0.exe`.
+
+### Ejecutar el binario compilado
+
+Al iniciar el ejecutable se crea la carpeta `datos_identia/` junto al binario para persistir la base de datos SQLite y se abre automáticamente el navegador web.
+
+**En Git Bash (terminal principal):**
+```bash
+./release/IdentIA-1.1.0.exe
+# Opciones disponibles: ./release/IdentIA-1.1.0.exe --puerto 8000 --sin-navegador
+```
+
+**En PowerShell:**
+```powershell
+.\release\IdentIA-1.1.0.exe
+# Opciones disponibles: .\release\IdentIA-1.1.0.exe --puerto 8000 --sin-navegador
+```
+
+### Recompilar los ejecutables desde código fuente
+
+**En Git Bash (terminal principal):**
+```bash
+powershell.exe -ExecutionPolicy Bypass -File scripts/compilar_release_1_1_0.ps1
+```
+
+**En PowerShell:**
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\compilar_release_1_1_0.ps1
+```
+
+---
+
 ## Hoja de Ruta
 
 - **Fase 0–1 (Completa):** Arquitectura unificada, repositorio limpio y motor biométrico ONNX YuNet + SFace con control de calidad.
 - **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, grupos, sesiones y exportación CSV).
 - **Bloque A (Completa):** Compensación de contraluz/sombras LAB, bloqueo de contraluz en registro, asistente guiado de 6 poses con validación geométrica y manual de uso.
 - **Bloque B (Completa):** Autenticación JWT, aislamiento multi-organización (`superadmin`, `org_admin`, `teacher`, `operator`), revocación individual/lote con contraseñas delegadas hasheadas (`scrypt`), bitácora de auditoría y migraciones Alembic.
-- **Bloque C (Completa):** Modelo educativo completo (`Career`, `Group` académico con periodo/aula fija, `Subject`, `CourseAssignment`, `ClassSchedule`), periodos configurables, herencia automática de materias, portal docente con aislamiento estricto ("Tu clase ahora" en 1 clic), estadísticas por asignatura/grupo y migraciones `0002`/`0003`.
-- **Bloque D (Completa en `feat/bloque-d-turnos-empresa`):** Turnos empresariales (`WorkShift` diurno y nocturno con cruce de medianoche), asignación individual/lote y herencia por departamento, reglas de puntualidad/salida anticipada/inasistencias, estadísticas por turno/empleado y migración `0004_enterprise_work_shifts`.
+- **Bloque C (Completa):** Modelo educativo completo (`Carrera`, `Grupo` académico con periodo/aula fija, `Materia`, `AsignacionCurso`, `HorarioClase`), periodos configurables, herencia automática de materias, portal docente con aislamiento estricto ("Tu clase ahora" en 1 clic), estadísticas por asignatura/grupo y migraciones `0002`/`0003`.
+- **Bloque D (Completa):** Turnos empresariales (`TurnoLaboral` diurno y nocturno con cruce de medianoche), asignación individual/lote y herencia por departamento, reglas de puntualidad/salida anticipada/inasistencias, estadísticas por turno/empleado y migración `0004_enterprise_work_shifts`.
+- **Release 1.1.0 (Actual en `feat/release-1.1.0`):** Refactorización integral del proyecto a variables descriptivas y comentarios detallados en español (conservando el esquema físico SQLite), lanzador autónomo (`backend/lanzador_escritorio.py`) y generación de ejecutables Windows offline (`release/IdentIA-1.1.0.exe` y `release/IdentIA-1.1.0-portable.zip`).
 - **Fase 3 (Siguiente desde `develop`):** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
 
 ---

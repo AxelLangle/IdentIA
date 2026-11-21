@@ -1,404 +1,468 @@
-from app.config import get_settings
-from app.vision.quality import FaceBox
+"""Pruebas de autenticación JWT, aislamiento multi-organización y credenciales delegadas."""
+
+from app.config import obtener_configuracion
+from app.vision.quality import CuadroRostro
 from tests.conftest import (
-    encode_jpeg_bytes,
-    make_pose_landmarks,
-    make_sharp_face_image,
-    make_unit_vector,
+    codificar_bytes_jpeg,
+    crear_imagen_rostro_nitida,
+    crear_puntos_pose,
+    crear_vector_unitario,
 )
 
 
-def _auth_header(client, email: str, password: str) -> dict[str, str]:
-    res = client.post("/api/auth/login", json={"email": email, "password": password})
-    assert res.status_code == 200, res.text
-    return {"Authorization": f"Bearer {res.json()['access_token']}"}
-
-
-def _enroll_frontal(client, headers: dict[str, str], person_id: int, engine, seed: int) -> None:
-    engine.next_boxes = [FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))]
-    engine.next_embedding = make_unit_vector(seed)
-    img_bytes = encode_jpeg_bytes(make_sharp_face_image(400, 400, (100, 80, 180, 200), 140, False))
-    res = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        headers=headers,
-        data={"pose_label": "frontal", "store_avatar": "true"},
-        files={"image": ("f.jpg", img_bytes, "image/jpeg")},
-    )
-    assert res.status_code == 200
-    assert res.json()["accepted"] is True
-
-
-def test_authentication_and_multi_tenant_isolation(raw_api_client) -> None:
-    client, _, _, _ = raw_api_client
-    settings = get_settings()
-
-    # Endpoints protegidos rechazan acceso sin token
-    assert client.get("/api/organizations").status_code == 401
-    assert client.get("/api/auth/me").status_code == 401
-
-    # Login inválido
-    bad_login = client.post(
+def _encabezado_autorizacion(cliente, correo: str, contrasena: str) -> dict[str, str]:
+    """Inicia sesión en `/api/auth/login` y devuelve el header `Authorization`."""
+    respuesta = cliente.post(
         "/api/auth/login",
-        json={"email": settings.bootstrap_superadmin_email, "password": "wrong-password"},
+        json={"correo": correo, "contrasena": contrasena},
     )
-    assert bad_login.status_code == 401
+    assert respuesta.status_code == 200, respuesta.text
+    return {"Authorization": f"Bearer {respuesta.json()['token_acceso']}"}
 
-    # Superadmin crea Org A (con Admin A) y Org B (con Admin B)
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+
+def _enrolar_frontal(
+    cliente,
+    encabezados: dict[str, str],
+    id_persona: int,
+    motor,
+    semilla: int,
+) -> None:
+    """Enrola rápidamente la toma frontal de una persona usando el motor simulado."""
+    motor.siguientes_cuadros = [CuadroRostro(100, 80, 180, 200, 0.98, crear_puntos_pose("frontal"))]
+    motor.siguiente_vector = crear_vector_unitario(semilla)
+    bytes_img = codificar_bytes_jpeg(
+        crear_imagen_rostro_nitida(400, 400, (100, 80, 180, 200), 140, False)
     )
+    respuesta = cliente.post(
+        f"/api/persons/{id_persona}/enroll-frame",
+        headers=encabezados,
+        data={"etiqueta_pose": "frontal", "guardar_avatar": "true"},
+        files={"imagen": ("f.jpg", bytes_img, "image/jpeg")},
+    )
+    assert respuesta.status_code == 200
+    assert respuesta.json()["aceptado"] is True
 
-    org_a = client.post(
-        "/api/organizations",
-        headers=sa_headers,
+
+def test_autenticacion_y_aislamiento_multiorganizacion(cliente_api_sin_autenticar) -> None:
+    """Valida HTTP 401 sin token, escalamiento prohibido y aislamiento estricto entre orgs."""
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+
+    # Endpoints protegidos deben rechazar peticiones sin Bearer token
+    assert cliente.get("/api/organizations").status_code == 401
+    assert cliente.get("/api/auth/me").status_code == 401
+
+    # Login con contraseña errónea
+    login_invalido = cliente.post(
+        "/api/auth/login",
         json={
-            "name": "Empresa Alpha",
-            "mode": "enterprise",
-            "admin_user": {
-                "full_name": "Admin Alpha",
-                "email": "alpha@identia.local",
-                "password": "AlphaPass123",
+            "correo": configuracion.correo_superadmin_inicial,
+            "contrasena": "clave-incorrecta",
+        },
+    )
+    assert login_invalido.status_code == 401
+
+    # Superadmin crea Organización Alpha y Organización Beta con sus respectivos admins
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
+    )
+
+    org_a = cliente.post(
+        "/api/organizations",
+        headers=encabezados_sa,
+        json={
+            "nombre": "Empresa Alpha",
+            "modo": "enterprise",
+            "usuario_administrador": {
+                "nombre_completo": "Admin Alpha",
+                "correo": "alpha@identia.local",
+                "contrasena": "AlphaPass123",
             },
         },
     )
     assert org_a.status_code == 201
-    org_a_id = org_a.json()["id"]
+    id_org_a = org_a.json()["id"]
 
-    org_b = client.post(
+    org_b = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": "Escuela Beta",
-            "mode": "education",
-            "admin_user": {
-                "full_name": "Admin Beta",
-                "email": "beta@identia.local",
-                "password": "BetaPass123",
+            "nombre": "Escuela Beta",
+            "modo": "education",
+            "usuario_administrador": {
+                "nombre_completo": "Admin Beta",
+                "correo": "beta@identia.local",
+                "contrasena": "BetaPass123",
             },
         },
     )
     assert org_b.status_code == 201
-    org_b_id = org_b.json()["id"]
+    id_org_b = org_b.json()["id"]
 
-    alpha_headers = _auth_header(client, "alpha@identia.local", "AlphaPass123")
-    beta_headers = _auth_header(client, "beta@identia.local", "BetaPass123")
+    encabezados_alpha = _encabezado_autorizacion(cliente, "alpha@identia.local", "AlphaPass123")
+    encabezados_beta = _encabezado_autorizacion(cliente, "beta@identia.local", "BetaPass123")
 
-    # Cada org_admin solo ve su propia organización
-    alpha_orgs = client.get("/api/organizations", headers=alpha_headers).json()
-    assert [o["id"] for o in alpha_orgs] == [org_a_id]
+    # Cada org_admin únicamente observa su propia organización
+    orgs_alpha = cliente.get("/api/organizations", headers=encabezados_alpha).json()
+    assert [org["id"] for org in orgs_alpha] == [id_org_a]
 
-    beta_orgs = client.get("/api/organizations", headers=beta_headers).json()
-    assert [o["id"] for o in beta_orgs] == [org_b_id]
+    orgs_beta = cliente.get("/api/organizations", headers=encabezados_beta).json()
+    assert [org["id"] for org in orgs_beta] == [id_org_b]
 
-    # Org_admin NO puede crear organizaciones ni escalar a superadmin
+    # Un org_admin no puede crear organizaciones ni crear cuentas superadmin
     assert (
-        client.post(
+        cliente.post(
             "/api/organizations",
-            headers=alpha_headers,
-            json={"name": "Org Ilegal", "mode": "enterprise"},
+            headers=encabezados_alpha,
+            json={"nombre": "Org Ilegal", "modo": "enterprise"},
         ).status_code
         == 403
     )
     assert (
-        client.post(
+        cliente.post(
             "/api/users",
-            headers=alpha_headers,
+            headers=encabezados_alpha,
             json={
-                "email": "fake_sa@identia.local",
-                "full_name": "Fake SA",
-                "password": "Password123",
-                "role": "superadmin",
+                "correo": "falso_sa@identia.local",
+                "nombre_completo": "Falso SA",
+                "contrasena": "Password123",
+                "rol": "superadmin",
             },
         ).status_code
         == 403
     )
 
-    # Admin Alpha crea una persona en Org A
-    p_a = client.post(
+    # Admin Alpha da de alta una persona dentro de Org A
+    persona_a = cliente.post(
         "/api/persons",
-        headers=alpha_headers,
+        headers=encabezados_alpha,
         json={
-            "organization_id": org_a_id,
-            "external_id": "ALP-01",
-            "full_name": "Empleado Alpha",
-            "biometric_consent": True,
+            "id_organizacion": id_org_a,
+            "identificador_externo": "ALP-01",
+            "nombre_completo": "Empleado Alpha",
+            "consentimiento_biometrico": True,
         },
     )
-    assert p_a.status_code == 201
-    person_a_id = p_a.json()["id"]
+    assert persona_a.status_code == 201
+    id_persona_a = persona_a.json()["id"]
 
-    # Admin Beta recibe 403 al intentar leer, crear o modificar recursos de Org A
-    assert client.get(f"/api/persons?organization_id={org_a_id}", headers=beta_headers).status_code == 403
-    assert client.get(f"/api/groups?organization_id={org_a_id}", headers=beta_headers).status_code == 403
-    assert client.get(f"/api/users?organization_id={org_a_id}", headers=beta_headers).status_code == 403
-    assert client.get(f"/api/security/audit-logs?organization_id={org_a_id}", headers=beta_headers).status_code == 403
-    assert client.delete(f"/api/persons/{person_a_id}", headers=beta_headers).status_code == 403
+    # Admin Beta recibe 403 al intentar acceder o mutar recursos de Org A
     assert (
-        client.patch(
-            f"/api/organizations/{org_a_id}",
-            headers=beta_headers,
-            json={"cooldown_seconds": 10},
+        cliente.get(
+            f"/api/persons?id_organizacion={id_org_a}", headers=encabezados_beta
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.get(
+            f"/api/groups?id_organizacion={id_org_a}", headers=encabezados_beta
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.get(
+            f"/api/users?id_organizacion={id_org_a}", headers=encabezados_beta
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.get(
+            f"/api/security/audit-logs?id_organizacion={id_org_a}", headers=encabezados_beta
+        ).status_code
+        == 403
+    )
+    assert cliente.delete(f"/api/persons/{id_persona_a}", headers=encabezados_beta).status_code == 403
+    assert (
+        cliente.patch(
+            f"/api/organizations/{id_org_a}",
+            headers=encabezados_beta,
+            json={"segundos_enfriamiento": 10},
         ).status_code
         == 403
     )
 
-    # Superadmin sí conserva acceso a todas las organizaciones
-    all_orgs = client.get("/api/organizations", headers=sa_headers).json()
-    assert {org_a_id, org_b_id}.issubset({o["id"] for o in all_orgs})
-    assert client.get(f"/api/persons?organization_id={org_a_id}", headers=sa_headers).status_code == 200
-    assert client.get(f"/api/persons?organization_id={org_b_id}", headers=sa_headers).status_code == 200
-
-
-def test_delegated_credential_revocation_batch_and_audit(raw_api_client) -> None:
-    client, _, engine, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+    # Superadmin conserva visibilidad transversal sobre todas las organizaciones
+    todas_orgs = cliente.get("/api/organizations", headers=encabezados_sa).json()
+    assert {id_org_a, id_org_b}.issubset({org["id"] for org in todas_orgs})
+    assert (
+        cliente.get(
+            f"/api/persons?id_organizacion={id_org_a}", headers=encabezados_sa
+        ).status_code
+        == 200
+    )
+    assert (
+        cliente.get(
+            f"/api/persons?id_organizacion={id_org_b}", headers=encabezados_sa
+        ).status_code
+        == 200
     )
 
-    org_res = client.post(
+
+def test_credenciales_delegadas_revocacion_lote_y_auditoria(cliente_api_sin_autenticar) -> None:
+    """Comprueba emisión, restricción de destinatario, revocación por lote, auditoría y baja de clave."""
+    cliente, _, motor, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
+    )
+
+    res_org = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": "Corporativo Seguridad",
-            "mode": "enterprise",
-            "admin_user": {
-                "full_name": "María Admin",
-                "email": "maria.admin@identia.local",
-                "password": "MariaAdmin2026!",
+            "nombre": "Corporativo Seguridad",
+            "modo": "enterprise",
+            "usuario_administrador": {
+                "nombre_completo": "María Admin",
+                "correo": "maria.admin@identia.local",
+                "contrasena": "MariaAdmin2026!",
             },
         },
     )
-    assert org_res.status_code == 201
-    org_id = org_res.json()["id"]
+    assert res_org.status_code == 201
+    id_organizacion = res_org.json()["id"]
 
-    admin_headers = _auth_header(client, "maria.admin@identia.local", "MariaAdmin2026!")
+    encabezados_admin = _encabezado_autorizacion(
+        cliente, "maria.admin@identia.local", "MariaAdmin2026!"
+    )
 
-    # Admin de organización crea dos subordinados operadores
-    op1 = client.post(
+    # Admin de organización crea dos operadores subordinados
+    op_1 = cliente.post(
         "/api/users",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "email": "op1@identia.local",
-            "full_name": "Operador Uno",
-            "password": "Operador1Pass",
-            "role": "operator",
+            "correo": "op1@identia.local",
+            "nombre_completo": "Operador Uno",
+            "contrasena": "Operador1Pass",
+            "rol": "operator",
         },
     ).json()
-    client.post(
+    cliente.post(
         "/api/users",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "email": "op2@identia.local",
-            "full_name": "Operador Dos",
-            "password": "Operador2Pass",
-            "role": "operator",
+            "correo": "op2@identia.local",
+            "nombre_completo": "Operador Dos",
+            "contrasena": "Operador2Pass",
+            "rol": "operator",
         },
     )
 
-    op1_headers = _auth_header(client, "op1@identia.local", "Operador1Pass")
-    op2_headers = _auth_header(client, "op2@identia.local", "Operador2Pass")
+    encabezados_op1 = _encabezado_autorizacion(cliente, "op1@identia.local", "Operador1Pass")
+    encabezados_op2 = _encabezado_autorizacion(cliente, "op2@identia.local", "Operador2Pass")
 
-    # Crea y enrola 2 personas en la organización
-    p1 = client.post(
+    # Crea y enrola 2 empleados
+    persona_1 = cliente.post(
         "/api/persons",
-        headers=op1_headers,
+        headers=encabezados_op1,
         json={
-            "organization_id": org_id,
-            "external_id": "SEG-01",
-            "full_name": "Persona Uno",
-            "biometric_consent": True,
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "SEG-01",
+            "nombre_completo": "Persona Uno",
+            "consentimiento_biometrico": True,
         },
     ).json()
-    p2 = client.post(
+    persona_2 = cliente.post(
         "/api/persons",
-        headers=op1_headers,
+        headers=encabezados_op1,
         json={
-            "organization_id": org_id,
-            "external_id": "SEG-02",
-            "full_name": "Persona Dos",
-            "biometric_consent": True,
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "SEG-02",
+            "nombre_completo": "Persona Dos",
+            "consentimiento_biometrico": True,
         },
     ).json()
-    _enroll_frontal(client, op1_headers, p1["id"], engine, 11)
-    _enroll_frontal(client, op1_headers, p2["id"], engine, 22)
+    _enrolar_frontal(cliente, encabezados_op1, persona_1["id"], motor, 11)
+    _enrolar_frontal(cliente, encabezados_op1, persona_2["id"], motor, 22)
 
-    # Sin contraseña correcta -> 403
-    bad_revoke = client.post(
+    # Contraseña incorrecta -> HTTP 403
+    revocacion_erronea = cliente.post(
         "/api/persons/biometrics/revoke",
-        headers=op1_headers,
-        json={"person_ids": [p1["id"]], "authorization_secret": "Incorrecta999"},
+        headers=encabezados_op1,
+        json={"ids_personas": [persona_1["id"]], "secreto_autorizacion": "Incorrecta999"},
     )
-    assert bad_revoke.status_code == 403
+    assert revocacion_erronea.status_code == 403
 
-    # Admin de org crea credencial delegada asignada a Operador Uno
-    cred_res = client.post(
+    # Admin genera credencial delegada exclusiva para Operador Uno
+    res_credencial = cliente.post(
         "/api/security/delegated-credentials",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "label": "Clave temporal turno matutino",
-            "assigned_to_user_id": op1["id"],
-            "expires_in_days": 7,
+            "etiqueta": "Clave temporal turno matutino",
+            "id_usuario_asignado": op_1["id"],
+            "expira_en_dias": 7,
         },
     )
-    assert cred_res.status_code == 201
-    cred_data = cred_res.json()
-    cred_id = cred_data["credential"]["id"]
-    plain_secret = cred_data["plain_secret"]
-    assert plain_secret.startswith("IDN-")
-    # La respuesta de listado no expone el secreto en texto plano
-    listed_creds = client.get("/api/security/delegated-credentials", headers=admin_headers).json()
-    assert listed_creds[0]["created_by_name"] == "María Admin"
-    assert listed_creds[0]["assigned_to_name"] == "Operador Uno"
-    assert "secret_hash" not in listed_creds[0]
+    assert res_credencial.status_code == 201
+    datos_credencial = res_credencial.json()
+    id_credencial = datos_credencial["credencial"]["id"]
+    secreto_plano = datos_credencial["secreto_plano"]
+    assert secreto_plano.startswith("IDN-")
 
-    # Operador Dos NO puede usar la credencial asignada exclusivamente a Operador Uno
-    wrong_subordinate = client.post(
+    credenciales_listadas = cliente.get(
+        "/api/security/delegated-credentials", headers=encabezados_admin
+    ).json()
+    assert credenciales_listadas[0]["nombre_creador"] == "María Admin"
+    assert credenciales_listadas[0]["nombre_asignado"] == "Operador Uno"
+    assert "hash_secreto" not in credenciales_listadas[0]
+
+    # Operador Dos no puede utilizar una clave asignada a Operador Uno
+    operador_equivocado = cliente.post(
         "/api/persons/biometrics/revoke",
-        headers=op2_headers,
-        json={"person_ids": [p1["id"]], "authorization_secret": plain_secret},
+        headers=encabezados_op2,
+        json={"ids_personas": [persona_1["id"]], "secreto_autorizacion": secreto_plano},
     )
-    assert wrong_subordinate.status_code == 403
+    assert operador_equivocado.status_code == 403
 
-    # Operador Uno sí puede revocar en lote con la credencial delegada
-    batch_ok = client.post(
+    # Operador Uno sí revoca por lote con la clave delegada
+    lote_ok = cliente.post(
         "/api/persons/biometrics/revoke",
-        headers=op1_headers,
+        headers=encabezados_op1,
         json={
-            "person_ids": [p1["id"], p2["id"]],
-            "authorization_secret": plain_secret,
-            "reason": "Cambio de cámara en sucursal",
+            "ids_personas": [persona_1["id"], persona_2["id"]],
+            "secreto_autorizacion": secreto_plano,
+            "motivo": "Cambio de cámara en sucursal",
         },
     )
-    assert batch_ok.status_code == 200
-    body = batch_ok.json()
-    assert body["revoked_persons_count"] == 2
-    assert body["deleted_embeddings"] == 2
-    assert body["authorized_by_name"] == "María Admin"
-    assert body["authorization_method"] == "delegated_credential"
+    assert lote_ok.status_code == 200
+    cuerpo_lote = lote_ok.json()
+    assert cuerpo_lote["cantidad_personas_revocadas"] == 2
+    assert cuerpo_lote["vectores_eliminados"] == 2
+    assert cuerpo_lote["nombre_autorizador"] == "María Admin"
+    assert cuerpo_lote["metodo_autorizacion"] == "delegated_credential"
 
-    # Verifica que la bitácora de auditoría registró ejecutor, creador de credencial y objetivo
-    logs = client.get(f"/api/security/audit-logs?organization_id={org_id}", headers=admin_headers).json()
-    revoke_logs = [entry for entry in logs if entry["action"] == "revoke_biometrics"]
-    assert len(revoke_logs) == 2
-    assert all(entry["executed_by_name"] == "Operador Uno" for entry in revoke_logs)
-    assert all(entry["authorized_by_name"] == "María Admin" for entry in revoke_logs)
-    assert all(entry["delegated_assigned_to_name"] == "Operador Uno" for entry in revoke_logs)
+    # Verifica bitácora de auditoría completa
+    registros = cliente.get(
+        f"/api/security/audit-logs?id_organizacion={id_organizacion}",
+        headers=encabezados_admin,
+    ).json()
+    registros_revocacion = [r for r in registros if r["accion"] == "revoke_biometrics"]
+    assert len(registros_revocacion) == 2
+    assert all(r["nombre_ejecutor"] == "Operador Uno" for r in registros_revocacion)
+    assert all(r["nombre_autorizador"] == "María Admin" for r in registros_revocacion)
+    assert all(r["nombre_asignado_credencial"] == "Operador Uno" for r in registros_revocacion)
 
-    # Si el admin revoca la credencial delegada, ya no funciona
-    rev_cred = client.post(f"/api/security/delegated-credentials/{cred_id}/revoke", headers=admin_headers)
-    assert rev_cred.status_code == 200
-    assert rev_cred.json()["status"] == "revoked"
+    # Tras revocar la credencial delegada, deja de autorizar inmediatamente
+    cred_revocada = cliente.post(
+        f"/api/security/delegated-credentials/{id_credencial}/revoke",
+        headers=encabezados_admin,
+    )
+    assert cred_revocada.status_code == 200
+    assert cred_revocada.json()["estado"] == "revoked"
 
-    _enroll_frontal(client, op1_headers, p1["id"], engine, 33)
-    after_revoke = client.post(
+    _enrolar_frontal(cliente, encabezados_op1, persona_1["id"], motor, 33)
+    despues_revocar = cliente.post(
         "/api/persons/biometrics/revoke",
-        headers=op1_headers,
-        json={"person_ids": [p1["id"]], "authorization_secret": plain_secret},
+        headers=encabezados_op1,
+        json={"ids_personas": [persona_1["id"]], "secreto_autorizacion": secreto_plano},
     )
-    assert after_revoke.status_code == 403
+    assert despues_revocar.status_code == 403
 
 
-def test_dynamic_role_validation_by_organization_mode(raw_api_client) -> None:
-    """Valida que 'supervisor' sea exclusivo de empresa y 'teacher' exclusivo de escuela."""
-    client, _, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+def test_validacion_dinamica_rol_por_modo_organizacion(cliente_api_sin_autenticar) -> None:
+    """Valida que `supervisor` sea exclusivo de empresa y `teacher` exclusivo de escuela."""
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    ent_org = client.post(
+    org_empresa = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": "Empresa Logística Norte",
-            "mode": "enterprise",
-            "admin_user": {
-                "full_name": "Admin Empresa",
-                "email": "admin.ent@identia.local",
-                "password": "AdminEnt2026!",
+            "nombre": "Empresa Logística Norte",
+            "modo": "enterprise",
+            "usuario_administrador": {
+                "nombre_completo": "Admin Empresa",
+                "correo": "admin.ent@identia.local",
+                "contrasena": "AdminEnt2026!",
             },
         },
     ).json()
-    edu_org = client.post(
+    org_escuela = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": "Escuela Técnica Sur",
-            "mode": "education",
-            "admin_user": {
-                "full_name": "Admin Escuela",
-                "email": "admin.edu@identia.local",
-                "password": "AdminEdu2026!",
+            "nombre": "Escuela Técnica Sur",
+            "modo": "education",
+            "usuario_administrador": {
+                "nombre_completo": "Admin Escuela",
+                "correo": "admin.edu@identia.local",
+                "contrasena": "AdminEdu2026!",
             },
         },
     ).json()
 
-    ent_admin_headers = _auth_header(client, "admin.ent@identia.local", "AdminEnt2026!")
-    edu_admin_headers = _auth_header(client, "admin.edu@identia.local", "AdminEdu2026!")
+    encabezados_empresa = _encabezado_autorizacion(
+        cliente, "admin.ent@identia.local", "AdminEnt2026!"
+    )
+    encabezados_escuela = _encabezado_autorizacion(
+        cliente, "admin.edu@identia.local", "AdminEdu2026!"
+    )
 
-    # Empresa: rechaza 'teacher' (400), acepta 'supervisor' (201)
-    bad_ent_teacher = client.post(
+    # Empresa: rechaza teacher (400), acepta supervisor (201)
+    profesor_en_empresa = cliente.post(
         "/api/users",
-        headers=ent_admin_headers,
+        headers=encabezados_empresa,
         json={
-            "email": "no.profe@identia.local",
-            "full_name": "Intento Profe",
-            "password": "Password123!",
-            "role": "teacher",
+            "correo": "no.profe@identia.local",
+            "nombre_completo": "Intento Profe",
+            "contrasena": "Password123!",
+            "rol": "teacher",
         },
     )
-    assert bad_ent_teacher.status_code == 400
+    assert profesor_en_empresa.status_code == 400
 
-    ok_ent_supervisor = client.post(
+    supervisor_valido = cliente.post(
         "/api/users",
-        headers=ent_admin_headers,
+        headers=encabezados_empresa,
         json={
-            "email": "sup@identia.local",
-            "full_name": "Supervisor Planta",
-            "password": "Password123!",
-            "role": "supervisor",
+            "correo": "sup@identia.local",
+            "nombre_completo": "Supervisor Planta",
+            "contrasena": "Password123!",
+            "rol": "supervisor",
         },
     )
-    assert ok_ent_supervisor.status_code == 201
-    sup_id = ok_ent_supervisor.json()["id"]
+    assert supervisor_valido.status_code == 201
+    id_supervisor = supervisor_valido.json()["id"]
 
-    # Actualizar usuario existente de empresa a 'teacher' también debe fallar (400)
-    bad_ent_patch = client.patch(
-        f"/api/users/{sup_id}",
-        headers=ent_admin_headers,
-        json={"role": "teacher"},
+    # Cambiar un usuario de empresa a teacher también debe fallar (400)
+    cambio_invalido = cliente.patch(
+        f"/api/users/{id_supervisor}",
+        headers=encabezados_empresa,
+        json={"rol": "teacher"},
     )
-    assert bad_ent_patch.status_code == 400
+    assert cambio_invalido.status_code == 400
 
-    # Escuela: rechaza 'supervisor' (400), acepta 'teacher' (201)
-    bad_edu_supervisor = client.post(
+    # Escuela: rechaza supervisor (400), acepta teacher (201)
+    supervisor_en_escuela = cliente.post(
         "/api/users",
-        headers=edu_admin_headers,
+        headers=encabezados_escuela,
         json={
-            "email": "no.sup@identia.local",
-            "full_name": "Intento Supervisor",
-            "password": "Password123!",
-            "role": "supervisor",
+            "correo": "no.sup@identia.local",
+            "nombre_completo": "Intento Supervisor",
+            "contrasena": "Password123!",
+            "rol": "supervisor",
         },
     )
-    assert bad_edu_supervisor.status_code == 400
+    assert supervisor_en_escuela.status_code == 400
 
-    ok_edu_teacher = client.post(
+    profesor_valido = cliente.post(
         "/api/users",
-        headers=edu_admin_headers,
+        headers=encabezados_escuela,
         json={
-            "email": "profe@identia.local",
-            "full_name": "Profesor Titular",
-            "password": "Password123!",
-            "role": "teacher",
+            "correo": "profe@identia.local",
+            "nombre_completo": "Profesor Titular",
+            "contrasena": "Password123!",
+            "rol": "teacher",
         },
     )
-    assert ok_edu_teacher.status_code == 201
-    assert ent_org["mode"] == "enterprise" and edu_org["mode"] == "education"
+    assert profesor_valido.status_code == 201
+    assert org_empresa["modo"] == "enterprise" and org_escuela["modo"] == "education"

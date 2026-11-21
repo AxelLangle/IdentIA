@@ -1,669 +1,733 @@
+/**
+ * Cliente HTTP centralizado para comunicarse con la API REST de IdentIA.
+ *
+ * Adjunta automáticamente el token JWT almacenado en `localStorage`, intercepta
+ * respuestas `401 Unauthorized` para cerrar sesiones expiradas y expone métodos
+ * tipados para autenticación, seguridad, organizaciones, biometría, sesiones,
+ * dominio académico y turnos empresariales.
+ */
 import type {
-  AcademicPeriodType,
-  AcademicStatsResponse,
-  ActionMode,
-  AttendanceEvent,
-  AttendanceSession,
-  AuditLogEntry,
-  AuthUser,
-  BatchBiometricsRevokeResponse,
-  Career,
-  ClassSchedule,
-  CourseAssignment,
-  DelegatedCredential,
-  DelegatedCredentialCreated,
-  EnrollFrameResponse,
-  EnterpriseStatsResponse,
-  GenerateSessionsResponse,
-  Group,
-  HealthResponse,
-  LoginResponse,
-  Organization,
-  OrgMode,
-  Person,
-  PersonRole,
-  PoseLabel,
-  RecognizeFrameResponse,
-  ShiftBulkAssignResponse,
-  Subject,
-  TeacherAgendaResponse,
-  UserRole,
-  WorkShift,
+  AsignacionCurso,
+  Carrera,
+  CredencialDelegada,
+  CredencialDelegadaCreada,
+  EntradaBitacoraAuditoria,
+  EtiquetaPose,
+  EventoAsistencia,
+  Grupo,
+  HorarioClase,
+  Materia,
+  ModoAccion,
+  ModoOrganizacion,
+  Organizacion,
+  Persona,
+  RespuestaAgendaDocente,
+  RespuestaAsignacionMasivaTurno,
+  RespuestaEnrolarFrame,
+  RespuestaEstadisticasAcademicas,
+  RespuestaEstadisticasEmpresariales,
+  RespuestaGenerarSesiones,
+  RespuestaInicioSesion,
+  RespuestaReconocerFrame,
+  RespuestaRevocarBiometriaLote,
+  RespuestaSalud,
+  RolPersona,
+  RolUsuario,
+  SesionAsistencia,
+  TipoPeriodoAcademico,
+  TurnoLaboral,
+  UsuarioAutenticado,
 } from "../types/api";
 
-const TOKEN_STORAGE_KEY = "identia_token";
-let onUnauthorizedCallback: (() => void) | null = null;
+const CLAVE_ALMACENAMIENTO_TOKEN = "identia_token";
+let manejadorNoAutorizado: (() => void) | null = null;
 
-export function getStoredToken(): string | null {
-  return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+/** Obtiene el token JWT almacenado localmente en el navegador. */
+export function obtenerTokenAlmacenado(): string | null {
+  return window.localStorage.getItem(CLAVE_ALMACENAMIENTO_TOKEN);
 }
 
-export function setStoredToken(token: string | null): void {
+/** Persiste o elimina el token JWT en `localStorage`. */
+export function guardarTokenAlmacenado(token: string | null): void {
   if (token) {
-    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    window.localStorage.setItem(CLAVE_ALMACENAMIENTO_TOKEN, token);
   } else {
-    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    window.localStorage.removeItem(CLAVE_ALMACENAMIENTO_TOKEN);
   }
 }
 
-export function setOnUnauthorizedHandler(handler: (() => void) | null): void {
-  onUnauthorizedCallback = handler;
+/** Registra una función callback que se dispara ante cualquier HTTP 401 protegido. */
+export function registrarManejadorNoAutorizado(manejador: (() => void) | null): void {
+  manejadorNoAutorizado = manejador;
 }
 
-async function fetchWithAuth(url: string, init: RequestInit = {}): Promise<Response> {
-  const token = getStoredToken();
-  const headers = new Headers(init.headers);
-  if (token && !headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
+/** Ejecuta `fetch` añadiendo el encabezado `Authorization: Bearer` si existe token. */
+async function peticionConAutenticacion(
+  url: string,
+  configuracion: RequestInit = {}
+): Promise<Response> {
+  const token = obtenerTokenAlmacenado();
+  const encabezados = new Headers(configuracion.headers);
+  if (token && !encabezados.has("Authorization")) {
+    encabezados.set("Authorization", `Bearer ${token}`);
   }
-  const response = await fetch(url, { ...init, headers });
-  if (response.status === 401 && !url.endsWith("/api/auth/login")) {
-    setStoredToken(null);
-    onUnauthorizedCallback?.();
+  const respuesta = await fetch(url, { ...configuracion, headers: encabezados });
+  if (respuesta.status === 401 && !url.endsWith("/api/auth/login")) {
+    guardarTokenAlmacenado(null);
+    manejadorNoAutorizado?.();
   }
-  return response;
+  return respuesta;
 }
 
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetchWithAuth(url, init);
-  if (!response.ok) {
-    let detail = `Error HTTP ${response.status}`;
+/** Envuelve `peticionConAutenticacion`, decodifica JSON y extrae mensajes `detail` en errores. */
+async function solicitarJson<T>(url: string, configuracion?: RequestInit): Promise<T> {
+  const respuesta = await peticionConAutenticacion(url, configuracion);
+  if (!respuesta.ok) {
+    let detalleError = `Error HTTP ${respuesta.status}`;
     try {
-      const payload = (await response.json()) as { detail?: string };
-      if (payload.detail) detail = payload.detail;
+      const cuerpoError = (await respuesta.json()) as { detail?: string };
+      if (cuerpoError.detail) detalleError = cuerpoError.detail;
     } catch {
-      // Ignora error si la respuesta no es JSON
+      // Ignora error de parseo si el cuerpo de respuesta no es JSON válido
     }
-    throw new Error(detail);
+    throw new Error(detalleError);
   }
-  if (response.status === 204) {
+  if (respuesta.status === 204) {
     return undefined as T;
   }
-  return (await response.json()) as T;
+  return (await respuesta.json()) as T;
 }
 
-export const api = {
-  getHealth: () => requestJson<HealthResponse>("/api/health"),
+/** Colección completa de llamadas REST tipadas contra el backend de IdentIA. */
+export const clienteApi = {
+  // --- Salud y Autenticación ---
+  obtenerSalud: () => solicitarJson<RespuestaSalud>("/api/health"),
 
-  login: async (email: string, password: string): Promise<LoginResponse> => {
-    const res = await requestJson<LoginResponse>("/api/auth/login", {
+  iniciarSesion: async (
+    correo: string,
+    contrasena: string
+  ): Promise<RespuestaInicioSesion> => {
+    const respuesta = await solicitarJson<RespuestaInicioSesion>("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ correo, contrasena }),
     });
-    setStoredToken(res.access_token);
-    return res;
+    guardarTokenAlmacenado(respuesta.token_acceso);
+    return respuesta;
   },
-  getMe: () => requestJson<AuthUser>("/api/auth/me"),
+  obtenerPerfilActual: () => solicitarJson<UsuarioAutenticado>("/api/auth/me"),
 
-  listUsers: (organizationId?: number | null) => {
-    const params = new URLSearchParams();
-    if (organizationId !== undefined && organizationId !== null) {
-      params.set("organization_id", String(organizationId));
+  // --- Usuarios RBAC ---
+  listarUsuarios: (idOrganizacion?: number | null) => {
+    const parametros = new URLSearchParams();
+    if (idOrganizacion !== undefined && idOrganizacion !== null) {
+      parametros.set("id_organizacion", String(idOrganizacion));
     }
-    const qs = params.toString();
-    return requestJson<AuthUser[]>(`/api/users${qs ? `?${qs}` : ""}`);
-  },
-  createUser: (data: {
-    email: string;
-    full_name: string;
-    password: string;
-    role: UserRole;
-    organization_id?: number | null;
-  }) =>
-    requestJson<AuthUser>("/api/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }),
-  updateUser: (
-    userId: number,
-    data: Partial<{ full_name: string; password: string; role: UserRole; is_active: boolean }>
-  ) =>
-    requestJson<AuthUser>(`/api/users/${userId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }),
-
-  listDelegatedCredentials: (organizationId?: number | null) => {
-    const params = new URLSearchParams();
-    if (organizationId !== undefined && organizationId !== null) {
-      params.set("organization_id", String(organizationId));
-    }
-    const qs = params.toString();
-    return requestJson<DelegatedCredential[]>(
-      `/api/security/delegated-credentials${qs ? `?${qs}` : ""}`
+    const cadenaConsulta = parametros.toString();
+    return solicitarJson<UsuarioAutenticado[]>(
+      `/api/users${cadenaConsulta ? `?${cadenaConsulta}` : ""}`
     );
   },
-  createDelegatedCredential: (data: {
-    organization_id?: number | null;
-    label: string;
-    assigned_to_user_id?: number | null;
-    assigned_to_name?: string | null;
-    custom_secret?: string | null;
-    expires_in_days?: number | null;
+  crearUsuario: (datos: {
+    correo: string;
+    nombre_completo: string;
+    contrasena: string;
+    rol: RolUsuario;
+    id_organizacion?: number | null;
   }) =>
-    requestJson<DelegatedCredentialCreated>("/api/security/delegated-credentials", {
+    solicitarJson<UsuarioAutenticado>("/api/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  revokeDelegatedCredential: (credId: number) =>
-    requestJson<DelegatedCredential>(`/api/security/delegated-credentials/${credId}/revoke`, {
-      method: "POST",
+  actualizarUsuario: (
+    idUsuario: number,
+    datos: Partial<{
+      nombre_completo: string;
+      contrasena: string;
+      rol: RolUsuario;
+      esta_activo: boolean;
+    }>
+  ) =>
+    solicitarJson<UsuarioAutenticado>(`/api/users/${idUsuario}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(datos),
     }),
-  listAuditLogs: (organizationId?: number | null, limit = 100) => {
-    const params = new URLSearchParams({ limit: String(limit) });
-    if (organizationId !== undefined && organizationId !== null) {
-      params.set("organization_id", String(organizationId));
+
+  // --- Seguridad Delegada y Auditoría ---
+  listarCredencialesDelegadas: (idOrganizacion?: number | null) => {
+    const parametros = new URLSearchParams();
+    if (idOrganizacion !== undefined && idOrganizacion !== null) {
+      parametros.set("id_organizacion", String(idOrganizacion));
     }
-    return requestJson<AuditLogEntry[]>(`/api/security/audit-logs?${params.toString()}`);
+    const cadenaConsulta = parametros.toString();
+    return solicitarJson<CredencialDelegada[]>(
+      `/api/security/delegated-credentials${cadenaConsulta ? `?${cadenaConsulta}` : ""}`
+    );
+  },
+  crearCredencialDelegada: (datos: {
+    id_organizacion?: number | null;
+    etiqueta: string;
+    id_usuario_asignado?: number | null;
+    nombre_asignado?: string | null;
+    secreto_personalizado?: string | null;
+    expira_en_dias?: number | null;
+  }) =>
+    solicitarJson<CredencialDelegadaCreada>("/api/security/delegated-credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(datos),
+    }),
+  revocarCredencialDelegada: (idCredencial: number) =>
+    solicitarJson<CredencialDelegada>(
+      `/api/security/delegated-credentials/${idCredencial}/revoke`,
+      { method: "POST" }
+    ),
+  listarBitacoraAuditoria: (idOrganizacion?: number | null, limite = 100) => {
+    const parametros = new URLSearchParams({ limite: String(limite) });
+    if (idOrganizacion !== undefined && idOrganizacion !== null) {
+      parametros.set("id_organizacion", String(idOrganizacion));
+    }
+    return solicitarJson<EntradaBitacoraAuditoria[]>(
+      `/api/security/audit-logs?${parametros.toString()}`
+    );
   },
 
-  listOrganizations: () => requestJson<Organization[]>("/api/organizations"),
-  createOrganization: (data: {
-    name: string;
-    mode: OrgMode;
-    academic_period_type?: AcademicPeriodType;
-    late_tolerance_minutes?: number;
-    cooldown_seconds?: number;
-    store_avatar_by_default?: boolean;
-    admin_user?: {
-      full_name: string;
-      email: string;
-      password: string;
+  // --- Organizaciones y Grupos / Departamentos ---
+  listarOrganizaciones: () => solicitarJson<Organizacion[]>("/api/organizations"),
+  crearOrganizacion: (datos: {
+    nombre: string;
+    modo: ModoOrganizacion;
+    tipo_periodo_academico?: TipoPeriodoAcademico;
+    minutos_tolerancia_retardo?: number;
+    segundos_enfriamiento?: number;
+    guardar_avatar_por_defecto?: boolean;
+    usuario_administrador?: {
+      nombre_completo: string;
+      correo: string;
+      contrasena: string;
     } | null;
   }) =>
-    requestJson<Organization>("/api/organizations", {
+    solicitarJson<Organizacion>("/api/organizations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  updateOrganization: (
-    orgId: number,
-    data: Partial<
+  actualizarOrganizacion: (
+    idOrganizacion: number,
+    datos: Partial<
       Pick<
-        Organization,
-        | "name"
-        | "mode"
-        | "academic_period_type"
-        | "late_tolerance_minutes"
-        | "cooldown_seconds"
-        | "store_avatar_by_default"
+        Organizacion,
+        | "nombre"
+        | "modo"
+        | "tipo_periodo_academico"
+        | "minutos_tolerancia_retardo"
+        | "segundos_enfriamiento"
+        | "guardar_avatar_por_defecto"
       >
-    > & { authorization_secret?: string }
+    > & { secreto_autorizacion?: string }
   ) =>
-    requestJson<Organization>(`/api/organizations/${orgId}`, {
+    solicitarJson<Organizacion>(`/api/organizations/${idOrganizacion}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
 
-  listGroups: (organizationId: number) =>
-    requestJson<Group[]>(`/api/groups?organization_id=${organizationId}`),
-  createGroup: (data: {
-    organization_id: number;
-    name: string;
-    code: string;
-    schedule_start?: string;
-    schedule_end?: string;
-    career_id?: number | null;
-    semester?: string | null;
-    period_type?: AcademicPeriodType | null;
-    default_classroom?: string | null;
-    default_work_shift_id?: number | null;
+  listarGrupos: (idOrganizacion: number) =>
+    solicitarJson<Grupo[]>(`/api/groups?id_organizacion=${idOrganizacion}`),
+  crearGrupo: (datos: {
+    id_organizacion: number;
+    nombre: string;
+    codigo: string;
+    hora_inicio_horario?: string;
+    hora_fin_horario?: string;
+    id_carrera?: number | null;
+    semestre?: string | null;
+    tipo_periodo?: TipoPeriodoAcademico | null;
+    aula_defecto?: string | null;
+    id_turno_laboral_defecto?: number | null;
   }) =>
-    requestJson<Group>("/api/groups", {
+    solicitarJson<Grupo>("/api/groups", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  updateGroup: (
-    groupId: number,
-    data: Partial<{
-      name: string;
-      code: string;
-      schedule_start: string;
-      schedule_end: string;
-      career_id: number | null;
-      semester: string | null;
-      period_type: AcademicPeriodType | null;
-      default_classroom: string | null;
-      default_work_shift_id: number | null;
-      authorization_secret: string;
+  actualizarGrupo: (
+    idGrupo: number,
+    datos: Partial<{
+      nombre: string;
+      codigo: string;
+      hora_inicio_horario: string;
+      hora_fin_horario: string;
+      id_carrera: number | null;
+      semestre: string | null;
+      tipo_periodo: TipoPeriodoAcademico | null;
+      aula_defecto: string | null;
+      id_turno_laboral_defecto: number | null;
+      secreto_autorizacion: string;
     }>
   ) =>
-    requestJson<Group>(`/api/groups/${groupId}`, {
+    solicitarJson<Grupo>(`/api/groups/${idGrupo}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  deleteGroup: (groupId: number) =>
-    requestJson<void>(`/api/groups/${groupId}`, { method: "DELETE" }),
+  eliminarGrupo: (idGrupo: number) =>
+    solicitarJson<void>(`/api/groups/${idGrupo}`, { method: "DELETE" }),
 
-  listPersons: (
-    organizationId: number,
-    search?: string,
-    groupId?: number | null,
-    workShiftId?: number | null
+  // --- Personas, Enrolamiento y Revocación ---
+  listarPersonas: (
+    idOrganizacion: number,
+    busqueda?: string,
+    idGrupo?: number | null,
+    idTurnoLaboral?: number | null
   ) => {
-    const params = new URLSearchParams({ organization_id: String(organizationId) });
-    if (search && search.trim()) params.set("search", search.trim());
-    if (groupId !== undefined && groupId !== null) params.set("group_id", String(groupId));
-    if (workShiftId !== undefined && workShiftId !== null) {
-      params.set("work_shift_id", String(workShiftId));
+    const parametros = new URLSearchParams({ id_organizacion: String(idOrganizacion) });
+    if (busqueda && busqueda.trim()) parametros.set("busqueda", busqueda.trim());
+    if (idGrupo !== undefined && idGrupo !== null) parametros.set("id_grupo", String(idGrupo));
+    if (idTurnoLaboral !== undefined && idTurnoLaboral !== null) {
+      parametros.set("id_turno_laboral", String(idTurnoLaboral));
     }
-    return requestJson<Person[]>(`/api/persons?${params.toString()}`);
+    return solicitarJson<Persona[]>(`/api/persons?${parametros.toString()}`);
   },
-  createPerson: (data: {
-    organization_id: number;
-    external_id: string;
-    full_name: string;
-    email?: string | null;
-    role: PersonRole;
-    biometric_consent: boolean;
-    group_ids: number[];
-    work_shift_id?: number | null;
+  crearPersona: (datos: {
+    id_organizacion: number;
+    identificador_externo: string;
+    nombre_completo: string;
+    correo?: string | null;
+    rol: RolPersona;
+    consentimiento_biometrico: boolean;
+    ids_grupos: number[];
+    id_turno_laboral?: number | null;
   }) =>
-    requestJson<Person>("/api/persons", {
+    solicitarJson<Persona>("/api/persons", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  updatePerson: (
-    personId: number,
-    data: Partial<{
-      full_name: string;
-      email: string | null;
-      role: PersonRole;
-      biometric_consent: boolean;
-      is_active: boolean;
-      group_ids: number[];
-      work_shift_id: number | null;
+  actualizarPersona: (
+    idPersona: number,
+    datos: Partial<{
+      nombre_completo: string;
+      correo: string | null;
+      rol: RolPersona;
+      consentimiento_biometrico: boolean;
+      esta_activo: boolean;
+      ids_grupos: number[];
+      id_turno_laboral: number | null;
     }>
   ) =>
-    requestJson<Person>(`/api/persons/${personId}`, {
+    solicitarJson<Persona>(`/api/persons/${idPersona}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  deletePerson: (personId: number) =>
-    requestJson<void>(`/api/persons/${personId}`, { method: "DELETE" }),
+  eliminarPersona: (idPersona: number) =>
+    solicitarJson<void>(`/api/persons/${idPersona}`, { method: "DELETE" }),
 
-  enrollFrame: (
-    personId: number,
-    imageBlob: Blob,
-    poseLabel: PoseLabel,
-    storeAvatar?: boolean,
-    dryRun = false
+  enrolarFrame: (
+    idPersona: number,
+    blobImagen: Blob,
+    etiquetaPose: EtiquetaPose,
+    guardarAvatar?: boolean,
+    soloValidacion = false
   ) => {
-    const form = new FormData();
-    form.append("image", imageBlob, "frame.jpg");
-    form.append("pose_label", poseLabel);
-    if (storeAvatar !== undefined) {
-      form.append("store_avatar", String(storeAvatar));
+    const formulario = new FormData();
+    formulario.append("imagen", blobImagen, "frame.jpg");
+    formulario.append("etiqueta_pose", etiquetaPose);
+    if (guardarAvatar !== undefined) {
+      formulario.append("guardar_avatar", String(guardarAvatar));
     }
-    if (dryRun) {
-      form.append("dry_run", "true");
+    if (soloValidacion) {
+      formulario.append("solo_validacion", "true");
     }
-    return requestJson<EnrollFrameResponse>(`/api/persons/${personId}/enroll-frame`, {
+    return solicitarJson<RespuestaEnrolarFrame>(`/api/persons/${idPersona}/enroll-frame`, {
       method: "POST",
-      body: form,
+      body: formulario,
     });
   },
-  revokeBiometricsBatch: (data: {
-    person_ids: number[];
-    authorization_secret: string;
-    reason?: string;
+  revocarBiometriaLote: (datos: {
+    ids_personas: number[];
+    secreto_autorizacion: string;
+    motivo?: string;
   }) =>
-    requestJson<BatchBiometricsRevokeResponse>("/api/persons/biometrics/revoke", {
+    solicitarJson<RespuestaRevocarBiometriaLote>("/api/persons/biometrics/revoke", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
 
-  listSessions: (organizationId: number, status?: "open" | "closed") => {
-    const params = new URLSearchParams({ organization_id: String(organizationId) });
-    if (status) params.set("status", status);
-    return requestJson<AttendanceSession[]>(`/api/sessions?${params.toString()}`);
+  // --- Sesiones, Reconocimiento y Reportes ---
+  listarSesiones: (idOrganizacion: number, estado?: "open" | "closed") => {
+    const parametros = new URLSearchParams({ id_organizacion: String(idOrganizacion) });
+    if (estado) parametros.set("estado", estado);
+    return solicitarJson<SesionAsistencia[]>(`/api/sessions?${parametros.toString()}`);
   },
-  createSession: (data: {
-    organization_id: number;
-    group_id?: number | null;
-    course_assignment_id?: number | null;
-    schedule_id?: number | null;
-    work_shift_id?: number | null;
-    title: string;
-    expected_start_time?: string | null;
+  crearSesion: (datos: {
+    id_organizacion: number;
+    id_grupo?: number | null;
+    id_asignacion_curso?: number | null;
+    id_horario?: number | null;
+    id_turno_laboral?: number | null;
+    titulo: string;
+    hora_inicio_esperada?: string | null;
   }) =>
-    requestJson<AttendanceSession>("/api/sessions", {
+    solicitarJson<SesionAsistencia>("/api/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  closeSession: (sessionId: number) =>
-    requestJson<AttendanceSession>(`/api/sessions/${sessionId}/close`, { method: "POST" }),
+  cerrarSesion: (idSesion: number) =>
+    solicitarJson<SesionAsistencia>(`/api/sessions/${idSesion}/close`, { method: "POST" }),
 
-  recognizeFrame: (params: {
-    imageBlob: Blob;
-    organizationId: number;
-    sessionId?: number | null;
-    groupId?: number | null;
-    actionMode?: ActionMode;
+  reconocerFrame: (parametros: {
+    blobImagen: Blob;
+    idOrganizacion: number;
+    idSesion?: number | null;
+    idGrupo?: number | null;
+    modoAccion?: ModoAccion;
   }) => {
-    const form = new FormData();
-    form.append("image", params.imageBlob, "frame.jpg");
-    form.append("organization_id", String(params.organizationId));
-    if (params.sessionId !== undefined && params.sessionId !== null) {
-      form.append("session_id", String(params.sessionId));
+    const formulario = new FormData();
+    formulario.append("imagen", parametros.blobImagen, "frame.jpg");
+    formulario.append("id_organizacion", String(parametros.idOrganizacion));
+    if (parametros.idSesion !== undefined && parametros.idSesion !== null) {
+      formulario.append("id_sesion", String(parametros.idSesion));
     }
-    if (params.groupId !== undefined && params.groupId !== null) {
-      form.append("group_id", String(params.groupId));
+    if (parametros.idGrupo !== undefined && parametros.idGrupo !== null) {
+      formulario.append("id_grupo", String(parametros.idGrupo));
     }
-    form.append("action_mode", params.actionMode ?? "auto");
-    return requestJson<RecognizeFrameResponse>("/api/attendance/recognize-frame", {
+    formulario.append("modo_accion", parametros.modoAccion ?? "auto");
+    return solicitarJson<RespuestaReconocerFrame>("/api/attendance/recognize-frame", {
       method: "POST",
-      body: form,
+      body: formulario,
     });
   },
 
-  listEvents: (organizationId: number, sessionId?: number | null, limit = 100) => {
-    const params = new URLSearchParams({
-      organization_id: String(organizationId),
-      limit: String(limit),
+  listarEventos: (idOrganizacion: number, idSesion?: number | null, limite = 100) => {
+    const parametros = new URLSearchParams({
+      id_organizacion: String(idOrganizacion),
+      limite: String(limite),
     });
-    if (sessionId !== undefined && sessionId !== null) {
-      params.set("session_id", String(sessionId));
+    if (idSesion !== undefined && idSesion !== null) {
+      parametros.set("id_sesion", String(idSesion));
     }
-    return requestJson<AttendanceEvent[]>(`/api/attendance/events?${params.toString()}`);
+    return solicitarJson<EventoAsistencia[]>(
+      `/api/attendance/events?${parametros.toString()}`
+    );
   },
 
-  createManualAttendance: (data: {
-    session_id: number;
-    person_id: number;
-    event_type: "check_in" | "check_out" | "present";
-    status?: "on_time" | "late" | "early_exit" | "manual";
-    notes?: string;
+  crearAsistenciaManual: (datos: {
+    id_sesion: number;
+    id_persona: number;
+    tipo_evento: "check_in" | "check_out" | "present";
+    estado?: "on_time" | "late" | "early_exit" | "manual";
+    notas?: string;
   }) =>
-    requestJson<AttendanceEvent>("/api/attendance/manual", {
+    solicitarJson<EventoAsistencia>("/api/attendance/manual", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
 
-  downloadCsv: async (organizationId: number, sessionId?: number | null): Promise<void> => {
-    const params = new URLSearchParams({ organization_id: String(organizationId) });
-    if (sessionId !== undefined && sessionId !== null) {
-      params.set("session_id", String(sessionId));
+  descargarCsv: async (idOrganizacion: number, idSesion?: number | null): Promise<void> => {
+    const parametros = new URLSearchParams({ id_organizacion: String(idOrganizacion) });
+    if (idSesion !== undefined && idSesion !== null) {
+      parametros.set("id_sesion", String(idSesion));
     }
-    const response = await fetchWithAuth(`/api/attendance/export.csv?${params.toString()}`);
-    if (!response.ok) {
-      throw new Error(`No se pudo descargar el reporte (HTTP ${response.status}).`);
+    const respuesta = await peticionConAutenticacion(
+      `/api/attendance/export.csv?${parametros.toString()}`
+    );
+    if (!respuesta.ok) {
+      throw new Error(`No se pudo descargar el reporte (HTTP ${respuesta.status}).`);
     }
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "asistencia_identia.csv";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    const archivoBlob = await respuesta.blob();
+    const urlTemporal = URL.createObjectURL(archivoBlob);
+    const enlaceDescarga = document.createElement("a");
+    enlaceDescarga.href = urlTemporal;
+    enlaceDescarga.download = "asistencia_identia.csv";
+    document.body.appendChild(enlaceDescarga);
+    enlaceDescarga.click();
+    enlaceDescarga.remove();
+    URL.revokeObjectURL(urlTemporal);
   },
 
-  // --- Modelo Educativo Completo (Bloque C) ---
-  listCareers: (organizationId: number) =>
-    requestJson<Career[]>(`/api/academic/careers?organization_id=${organizationId}`),
-  createCareer: (data: {
-    organization_id: number;
-    name: string;
-    code: string;
-    description?: string | null;
-    period_type?: AcademicPeriodType | null;
+  // --- Modelo Educativo Completo ---
+  listarCarreras: (idOrganizacion: number) =>
+    solicitarJson<Carrera[]>(`/api/academic/careers?id_organizacion=${idOrganizacion}`),
+  crearCarrera: (datos: {
+    id_organizacion: number;
+    nombre: string;
+    codigo: string;
+    descripcion?: string | null;
+    tipo_periodo?: TipoPeriodoAcademico | null;
   }) =>
-    requestJson<Career>("/api/academic/careers", {
+    solicitarJson<Carrera>("/api/academic/careers", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  updateCareer: (
-    careerId: number,
-    data: Partial<{
-      name: string;
-      code: string;
-      description: string | null;
-      period_type: AcademicPeriodType | null;
-      authorization_secret: string;
+  actualizarCarrera: (
+    idCarrera: number,
+    datos: Partial<{
+      nombre: string;
+      codigo: string;
+      descripcion: string | null;
+      tipo_periodo: TipoPeriodoAcademico | null;
+      secreto_autorizacion: string;
     }>
   ) =>
-    requestJson<Career>(`/api/academic/careers/${careerId}`, {
+    solicitarJson<Carrera>(`/api/academic/careers/${idCarrera}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  deleteCareer: (careerId: number) =>
-    requestJson<void>(`/api/academic/careers/${careerId}`, { method: "DELETE" }),
+  eliminarCarrera: (idCarrera: number) =>
+    solicitarJson<void>(`/api/academic/careers/${idCarrera}`, { method: "DELETE" }),
 
-  listSubjects: (organizationId: number, careerId?: number | null) => {
-    const params = new URLSearchParams({ organization_id: String(organizationId) });
-    if (careerId !== undefined && careerId !== null) params.set("career_id", String(careerId));
-    return requestJson<Subject[]>(`/api/academic/subjects?${params.toString()}`);
+  listarMaterias: (idOrganizacion: number, idCarrera?: number | null) => {
+    const parametros = new URLSearchParams({ id_organizacion: String(idOrganizacion) });
+    if (idCarrera !== undefined && idCarrera !== null) {
+      parametros.set("id_carrera", String(idCarrera));
+    }
+    return solicitarJson<Materia[]>(`/api/academic/subjects?${parametros.toString()}`);
   },
-  createSubject: (data: {
-    organization_id: number;
-    career_id?: number | null;
-    name: string;
-    code: string;
+  crearMateria: (datos: {
+    id_organizacion: number;
+    id_carrera?: number | null;
+    nombre: string;
+    codigo: string;
   }) =>
-    requestJson<Subject>("/api/academic/subjects", {
+    solicitarJson<Materia>("/api/academic/subjects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  deleteSubject: (subjectId: number) =>
-    requestJson<void>(`/api/academic/subjects/${subjectId}`, { method: "DELETE" }),
+  eliminarMateria: (idMateria: number) =>
+    solicitarJson<void>(`/api/academic/subjects/${idMateria}`, { method: "DELETE" }),
 
-  listCourses: (
-    organizationId: number,
-    groupId?: number | null,
-    teacherUserId?: number | null
+  listarCursos: (
+    idOrganizacion: number,
+    idGrupo?: number | null,
+    idUsuarioDocente?: number | null
   ) => {
-    const params = new URLSearchParams({ organization_id: String(organizationId) });
-    if (groupId !== undefined && groupId !== null) params.set("group_id", String(groupId));
-    if (teacherUserId !== undefined && teacherUserId !== null) {
-      params.set("teacher_user_id", String(teacherUserId));
+    const parametros = new URLSearchParams({ id_organizacion: String(idOrganizacion) });
+    if (idGrupo !== undefined && idGrupo !== null) parametros.set("id_grupo", String(idGrupo));
+    if (idUsuarioDocente !== undefined && idUsuarioDocente !== null) {
+      parametros.set("id_usuario_docente", String(idUsuarioDocente));
     }
-    return requestJson<CourseAssignment[]>(`/api/academic/courses?${params.toString()}`);
+    return solicitarJson<AsignacionCurso[]>(`/api/academic/courses?${parametros.toString()}`);
   },
-  createCourse: (data: {
-    organization_id: number;
-    group_id: number;
-    subject_id: number;
-    teacher_user_id?: number | null;
-    term?: string | null;
-    schedules: {
-      day_of_week: number;
-      start_time: string;
-      end_time: string;
-      classroom?: string | null;
+  crearCurso: (datos: {
+    id_organizacion: number;
+    id_grupo: number;
+    id_materia: number;
+    id_usuario_docente?: number | null;
+    periodo_lectivo?: string | null;
+    horarios: {
+      dia_semana: number;
+      hora_inicio: string;
+      hora_fin: string;
+      aula?: string | null;
     }[];
   }) =>
-    requestJson<CourseAssignment>("/api/academic/courses", {
+    solicitarJson<AsignacionCurso>("/api/academic/courses", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  updateCourse: (
-    courseId: number,
-    data: Partial<{ teacher_user_id: number | null; term: string | null; is_active: boolean }>
-  ) =>
-    requestJson<CourseAssignment>(`/api/academic/courses/${courseId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }),
-  deleteCourse: (courseId: number) =>
-    requestJson<void>(`/api/academic/courses/${courseId}`, { method: "DELETE" }),
-
-  addCourseSchedule: (
-    courseId: number,
-    data: {
-      day_of_week: number;
-      start_time: string;
-      end_time: string;
-      classroom?: string | null;
-    }
-  ) =>
-    requestJson<ClassSchedule>(`/api/academic/courses/${courseId}/schedules`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }),
-  deleteSchedule: (scheduleId: number) =>
-    requestJson<void>(`/api/academic/schedules/${scheduleId}`, { method: "DELETE" }),
-
-  getStudentCourses: (personId: number) =>
-    requestJson<CourseAssignment[]>(`/api/academic/students/${personId}/courses`),
-
-  generateAcademicSessions: (data: {
-    organization_id: number;
-    target_date?: string | null;
-    course_assignment_id?: number | null;
-  }) =>
-    requestJson<GenerateSessionsResponse>("/api/academic/sessions/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }),
-
-  startCourseSession: (
-    courseId: number,
-    data?: { schedule_id?: number | null; session_date?: string | null }
-  ) =>
-    requestJson<AttendanceSession>(`/api/academic/courses/${courseId}/start-session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data ?? {}),
-    }),
-
-  getTeacherAgenda: (params: {
-    organization_id: number;
-    target_date?: string | null;
-    current_time?: string | null;
-    teacher_user_id?: number | null;
-  }) => {
-    const qs = new URLSearchParams({ organization_id: String(params.organization_id) });
-    if (params.target_date) qs.set("target_date", params.target_date);
-    if (params.current_time) qs.set("current_time", params.current_time);
-    if (params.teacher_user_id !== undefined && params.teacher_user_id !== null) {
-      qs.set("teacher_user_id", String(params.teacher_user_id));
-    }
-    return requestJson<TeacherAgendaResponse>(`/api/academic/teacher/agenda?${qs.toString()}`);
-  },
-
-  getAcademicStats: (params: {
-    organization_id: number;
-    date_from?: string | null;
-    date_to?: string | null;
-    career_id?: number | null;
-    group_id?: number | null;
-  }) => {
-    const qs = new URLSearchParams({ organization_id: String(params.organization_id) });
-    if (params.date_from) qs.set("date_from", params.date_from);
-    if (params.date_to) qs.set("date_to", params.date_to);
-    if (params.career_id !== undefined && params.career_id !== null) {
-      qs.set("career_id", String(params.career_id));
-    }
-    if (params.group_id !== undefined && params.group_id !== null) {
-      qs.set("group_id", String(params.group_id));
-    }
-    return requestJson<AcademicStatsResponse>(`/api/academic/stats?${qs.toString()}`);
-  },
-
-  // --- Turnos Empresariales y Reglas de Jornada (Bloque D) ---
-  listWorkShifts: (organizationId: number, isActive?: boolean) => {
-    const qs = new URLSearchParams({ organization_id: String(organizationId) });
-    if (isActive !== undefined) qs.set("is_active", String(isActive));
-    return requestJson<WorkShift[]>(`/api/enterprise/shifts?${qs.toString()}`);
-  },
-  createWorkShift: (data: {
-    organization_id: number;
-    name: string;
-    code: string;
-    start_time: string;
-    end_time: string;
-    days_of_week: number[];
-    late_tolerance_minutes?: number | null;
-    early_exit_tolerance_minutes?: number;
-    is_active?: boolean;
-  }) =>
-    requestJson<WorkShift>("/api/enterprise/shifts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }),
-  updateWorkShift: (
-    shiftId: number,
-    data: Partial<{
-      name: string;
-      code: string;
-      start_time: string;
-      end_time: string;
-      days_of_week: number[];
-      late_tolerance_minutes: number | null;
-      early_exit_tolerance_minutes: number;
-      is_active: boolean;
+  actualizarCurso: (
+    idCurso: number,
+    datos: Partial<{
+      id_usuario_docente: number | null;
+      periodo_lectivo: string | null;
+      esta_activo: boolean;
     }>
   ) =>
-    requestJson<WorkShift>(`/api/enterprise/shifts/${shiftId}`, {
+    solicitarJson<AsignacionCurso>(`/api/academic/courses/${idCurso}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  deleteWorkShift: (shiftId: number) =>
-    requestJson<void>(`/api/enterprise/shifts/${shiftId}`, { method: "DELETE" }),
-  assignWorkShiftPersons: (
-    shiftId: number,
-    data: { person_ids?: number[]; group_id?: number | null; clear_shift?: boolean }
+  eliminarCurso: (idCurso: number) =>
+    solicitarJson<void>(`/api/academic/courses/${idCurso}`, { method: "DELETE" }),
+
+  agregarHorarioCurso: (
+    idCurso: number,
+    datos: {
+      dia_semana: number;
+      hora_inicio: string;
+      hora_fin: string;
+      aula?: string | null;
+    }
   ) =>
-    requestJson<ShiftBulkAssignResponse>(`/api/enterprise/shifts/${shiftId}/assign-persons`, {
+    solicitarJson<HorarioClase>(`/api/academic/courses/${idCurso}/schedules`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  startWorkShiftSession: (shiftId: number, data?: { session_date?: string | null }) =>
-    requestJson<AttendanceSession>(`/api/enterprise/shifts/${shiftId}/start-session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data ?? {}),
-    }),
-  generateEnterpriseSessions: (data: {
-    organization_id: number;
-    target_date?: string | null;
-    work_shift_id?: number | null;
+  eliminarHorario: (idHorario: number) =>
+    solicitarJson<void>(`/api/academic/schedules/${idHorario}`, { method: "DELETE" }),
+
+  obtenerCursosAlumno: (idPersona: number) =>
+    solicitarJson<AsignacionCurso[]>(`/api/academic/students/${idPersona}/courses`),
+
+  generarSesionesAcademicas: (datos: {
+    id_organizacion: number;
+    fecha_objetivo?: string | null;
+    id_asignacion_curso?: number | null;
   }) =>
-    requestJson<GenerateSessionsResponse>("/api/enterprise/sessions/generate", {
+    solicitarJson<RespuestaGenerarSesiones>("/api/academic/sessions/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(datos),
     }),
-  getEnterpriseStats: (params: {
-    organization_id: number;
-    date_from?: string | null;
-    date_to?: string | null;
-    work_shift_id?: number | null;
-    group_id?: number | null;
+
+  iniciarSesionCurso: (
+    idCurso: number,
+    datos?: { id_horario?: number | null; fecha_sesion?: string | null }
+  ) =>
+    solicitarJson<SesionAsistencia>(`/api/academic/courses/${idCurso}/start-session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(datos ?? {}),
+    }),
+
+  obtenerAgendaDocente: (parametros: {
+    id_organizacion: number;
+    fecha_objetivo?: string | null;
+    hora_actual?: string | null;
+    id_usuario_docente?: number | null;
   }) => {
-    const qs = new URLSearchParams({ organization_id: String(params.organization_id) });
-    if (params.date_from) qs.set("date_from", params.date_from);
-    if (params.date_to) qs.set("date_to", params.date_to);
-    if (params.work_shift_id !== undefined && params.work_shift_id !== null) {
-      qs.set("work_shift_id", String(params.work_shift_id));
+    const consulta = new URLSearchParams({
+      id_organizacion: String(parametros.id_organizacion),
+    });
+    if (parametros.fecha_objetivo) consulta.set("fecha_objetivo", parametros.fecha_objetivo);
+    if (parametros.hora_actual) consulta.set("hora_actual", parametros.hora_actual);
+    if (
+      parametros.id_usuario_docente !== undefined &&
+      parametros.id_usuario_docente !== null
+    ) {
+      consulta.set("id_usuario_docente", String(parametros.id_usuario_docente));
     }
-    if (params.group_id !== undefined && params.group_id !== null) {
-      qs.set("group_id", String(params.group_id));
+    return solicitarJson<RespuestaAgendaDocente>(
+      `/api/academic/teacher/agenda?${consulta.toString()}`
+    );
+  },
+
+  obtenerEstadisticasAcademicas: (parametros: {
+    id_organizacion: number;
+    fecha_desde?: string | null;
+    fecha_hasta?: string | null;
+    id_carrera?: number | null;
+    id_grupo?: number | null;
+  }) => {
+    const consulta = new URLSearchParams({
+      id_organizacion: String(parametros.id_organizacion),
+    });
+    if (parametros.fecha_desde) consulta.set("fecha_desde", parametros.fecha_desde);
+    if (parametros.fecha_hasta) consulta.set("fecha_hasta", parametros.fecha_hasta);
+    if (parametros.id_carrera !== undefined && parametros.id_carrera !== null) {
+      consulta.set("id_carrera", String(parametros.id_carrera));
     }
-    return requestJson<EnterpriseStatsResponse>(`/api/enterprise/stats?${qs.toString()}`);
+    if (parametros.id_grupo !== undefined && parametros.id_grupo !== null) {
+      consulta.set("id_grupo", String(parametros.id_grupo));
+    }
+    return solicitarJson<RespuestaEstadisticasAcademicas>(
+      `/api/academic/stats?${consulta.toString()}`
+    );
+  },
+
+  // --- Turnos Empresariales y Reglas de Jornada ---
+  listarTurnosLaborales: (idOrganizacion: number, estaActivo?: boolean) => {
+    const consulta = new URLSearchParams({ id_organizacion: String(idOrganizacion) });
+    if (estaActivo !== undefined) consulta.set("esta_activo", String(estaActivo));
+    return solicitarJson<TurnoLaboral[]>(`/api/enterprise/shifts?${consulta.toString()}`);
+  },
+  crearTurnoLaboral: (datos: {
+    id_organizacion: number;
+    nombre: string;
+    codigo: string;
+    hora_inicio: string;
+    hora_fin: string;
+    dias_semana: number[];
+    minutos_tolerancia_retardo?: number | null;
+    minutos_tolerancia_salida_anticipada?: number;
+    esta_activo?: boolean;
+  }) =>
+    solicitarJson<TurnoLaboral>("/api/enterprise/shifts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(datos),
+    }),
+  actualizarTurnoLaboral: (
+    idTurno: number,
+    datos: Partial<{
+      nombre: string;
+      codigo: string;
+      hora_inicio: string;
+      hora_fin: string;
+      dias_semana: number[];
+      minutos_tolerancia_retardo: number | null;
+      minutos_tolerancia_salida_anticipada: number;
+      esta_activo: boolean;
+    }>
+  ) =>
+    solicitarJson<TurnoLaboral>(`/api/enterprise/shifts/${idTurno}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(datos),
+    }),
+  eliminarTurnoLaboral: (idTurno: number) =>
+    solicitarJson<void>(`/api/enterprise/shifts/${idTurno}`, { method: "DELETE" }),
+  asignarTurnoAPersonas: (
+    idTurno: number,
+    datos: { ids_personas?: number[]; id_grupo?: number | null; limpiar_turno?: boolean }
+  ) =>
+    solicitarJson<RespuestaAsignacionMasivaTurno>(
+      `/api/enterprise/shifts/${idTurno}/assign-persons`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(datos),
+      }
+    ),
+  iniciarSesionTurno: (idTurno: number, datos?: { fecha_sesion?: string | null }) =>
+    solicitarJson<SesionAsistencia>(`/api/enterprise/shifts/${idTurno}/start-session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(datos ?? {}),
+    }),
+  generarSesionesEmpresariales: (datos: {
+    id_organizacion: number;
+    fecha_objetivo?: string | null;
+    id_turno_laboral?: number | null;
+  }) =>
+    solicitarJson<RespuestaGenerarSesiones>("/api/enterprise/sessions/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(datos),
+    }),
+  obtenerEstadisticasEmpresariales: (parametros: {
+    id_organizacion: number;
+    fecha_desde?: string | null;
+    fecha_hasta?: string | null;
+    id_turno_laboral?: number | null;
+    id_grupo?: number | null;
+  }) => {
+    const consulta = new URLSearchParams({
+      id_organizacion: String(parametros.id_organizacion),
+    });
+    if (parametros.fecha_desde) consulta.set("fecha_desde", parametros.fecha_desde);
+    if (parametros.fecha_hasta) consulta.set("fecha_hasta", parametros.fecha_hasta);
+    if (parametros.id_turno_laboral !== undefined && parametros.id_turno_laboral !== null) {
+      consulta.set("id_turno_laboral", String(parametros.id_turno_laboral));
+    }
+    if (parametros.id_grupo !== undefined && parametros.id_grupo !== null) {
+      consulta.set("id_grupo", String(parametros.id_grupo));
+    }
+    return solicitarJson<RespuestaEstadisticasEmpresariales>(
+      `/api/enterprise/stats?${consulta.toString()}`
+    );
   },
 };

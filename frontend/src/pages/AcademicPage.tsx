@@ -1,3 +1,10 @@
+/**
+ * Módulo de Estructura Académica y Estadísticas Escolares de IdentIA.
+ * Administra la jerarquía Institución -> Carreras -> Grupos -> Asignaturas,
+ * docentes y múltiples bloques de horario semanal (incluyendo aulas editables),
+ * el cambio protegido de régimen académico (bimestral/trimestral/cuatrimestral/
+ * semestral/ciclo) con contraseña de administrador y los tableros de asistencia.
+ */
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   ArrowUpDown,
@@ -16,711 +23,945 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { PasswordInput } from "../components/PasswordInput";
+import { EntradaContrasena } from "../components/PasswordInput";
 import {
-  ACADEMIC_PERIOD_OPTIONS,
-  comparePeriodsNatural,
-  formatGroupPeriodLabel,
-  getPeriodMeta,
+  compararPeriodosNatural,
+  formatearEtiquetaPeriodoGrupo,
+  obtenerMetadatosPeriodo,
+  OPCIONES_PERIODO_ACADEMICO,
 } from "../lib/academicPeriods";
-import { api } from "../lib/api";
+import { clienteApi } from "../lib/api";
 import type {
-  AcademicPeriodType,
-  AcademicStatsResponse,
-  AuthUser,
-  Career,
-  CourseAssignment,
-  Group,
-  Organization,
-  Subject,
+  AsignacionCurso,
+  Carrera,
+  Grupo,
+  Materia,
+  Organizacion,
+  RespuestaEstadisticasAcademicas,
+  TipoPeriodoAcademico,
+  UsuarioAutenticado,
 } from "../types/api";
 
-interface AcademicPageProps {
-  currentUser: AuthUser;
-  organization: Organization;
-  groups: Group[];
-  onRefreshOrg: () => Promise<void>;
-  onOpenSessionInKiosk: (sessionId: number) => void;
+/** Propiedades recibidas por `PaginaAcademico`. */
+interface PropiedadesPaginaAcademico {
+  /** Usuario administrador autenticado actualmente. */
+  usuarioActual: UsuarioAutenticado;
+  /** Organización educativa seleccionada. */
+  organizacion: Organizacion;
+  /** Grupos académicos cargados para la institución. */
+  grupos: Grupo[];
+  /** Callback para recargar los datos compartidos tras cambios estructurales. */
+  alRecargarOrganizacion: () => Promise<void>;
+  /** Callback para abrir en el kiosco la sesión generada de un curso. */
+  alAbrirSesionEnKiosco: (idSesion: number) => void;
 }
 
-type AcademicSubTab = "structure" | "courses" | "stats";
-type SubjectSortField = "career_period" | "period_career" | "rate" | "subject";
-type GroupSortField = "career_period" | "period_career" | "rate" | "group";
+type SubPestanaAcademica = "structure" | "courses" | "stats";
+type CampoOrdenMateria = "career_period" | "period_career" | "rate" | "subject";
+type CampoOrdenGrupo = "career_period" | "period_career" | "rate" | "group";
 
-interface PendingScheduleDraft {
-  day_of_week: number;
-  start_time: string;
-  end_time: string;
-  classroom: string;
+/** Borrador temporal de un bloque semanal antes de crear la asignación de curso. */
+interface BorradorHorarioPendiente {
+  dia_semana: number;
+  hora_inicio: string;
+  hora_fin: string;
+  aula: string;
 }
 
-type PendingPeriodChange =
+/** Representa una solicitud pendiente de cambio de periodo protegida por secreto admin. */
+type CambioPeriodoPendiente =
   | {
-      scope: "organization";
-      nextPeriodType: AcademicPeriodType;
-      summary: string;
+      alcance: "organization";
+      siguienteTipoPeriodo: TipoPeriodoAcademico;
+      resumen: string;
     }
   | {
-      scope: "career";
-      careerId: number;
-      careerName: string;
-      nextPeriodType: string;
-      summary: string;
+      alcance: "career";
+      idCarrera: number;
+      nombreCarrera: string;
+      siguienteTipoPeriodo: string;
+      resumen: string;
     }
   | {
-      scope: "group";
-      groupId: number;
-      groupName: string;
-      nextPeriodType: string;
-      semester: string | null;
-      classroom: string | null;
-      summary: string;
+      alcance: "group";
+      idGrupo: number;
+      nombreGrupo: string;
+      siguienteTipoPeriodo: string;
+      semestre: string | null;
+      aula: string | null;
+      resumen: string;
     };
 
-const WEEKDAYS = [
-  { value: 0, short: "Lun", mini: "L", label: "Lunes" },
-  { value: 1, short: "Mar", mini: "M", label: "Martes" },
-  { value: 2, short: "Mié", mini: "X", label: "Miércoles" },
-  { value: 3, short: "Jue", mini: "J", label: "Jueves" },
-  { value: 4, short: "Vie", mini: "V", label: "Viernes" },
-  { value: 5, short: "Sáb", mini: "S", label: "Sábado" },
-  { value: 6, short: "Dom", mini: "D", label: "Domingo" },
+/** Catálogo semanal de días hábiles y fin de semana (`0 = Lunes` .. `6 = Domingo`). */
+const DIAS_SEMANA = [
+  { valor: 0, corto: "Lun", inicial: "L", etiqueta: "Lunes" },
+  { valor: 1, corto: "Mar", inicial: "M", etiqueta: "Martes" },
+  { valor: 2, corto: "Mié", inicial: "X", etiqueta: "Miércoles" },
+  { valor: 3, corto: "Jue", inicial: "J", etiqueta: "Jueves" },
+  { valor: 4, corto: "Vie", inicial: "V", etiqueta: "Viernes" },
+  { valor: 5, corto: "Sáb", inicial: "S", etiqueta: "Sábado" },
+  { valor: 6, corto: "Dom", inicial: "D", etiqueta: "Domingo" },
 ];
 
-function dayLabel(day: number): string {
-  return WEEKDAYS.find((d) => d.value === day)?.label ?? `Día ${day}`;
+/** Convierte el índice numérico del día (0-6) a su nombre completo en español. */
+function etiquetaDiaSemana(dia: number): string {
+  return (
+    DIAS_SEMANA.find((elemento) => elemento.valor === dia)?.etiqueta ?? `Día ${dia}`
+  );
 }
 
-function getTodayIso(): string {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+/** Devuelve la fecha local de hoy en formato ISO (`YYYY-MM-DD`). */
+function obtenerHoyIso(): string {
+  const ahora = new Date();
+  const anio = ahora.getFullYear();
+  const mes = String(ahora.getMonth() + 1).padStart(2, "0");
+  const dia = String(ahora.getDate()).padStart(2, "0");
+  return `${anio}-${mes}-${dia}`;
 }
 
-function getDefaultWeekday(): number {
-  return new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
+/** Convierte `Date.getDay()` al índice `0 = Lunes` .. `6 = Domingo` del backend. */
+function obtenerDiaSemanaPorDefecto(): number {
+  const diaJs = new Date().getDay();
+  return diaJs === 0 ? 6 : diaJs - 1;
 }
 
-export function AcademicPage({
-  organization,
-  groups,
-  onRefreshOrg,
-  onOpenSessionInKiosk,
-}: AcademicPageProps) {
-  const [subTab, setSubTab] = useState<AcademicSubTab>("structure");
-  const [careers, setCareers] = useState<Career[]>([]);
-  const [subjects, setSubjects] = useState<Subject[]>([]);
-  const [courses, setCourses] = useState<CourseAssignment[]>([]);
-  const [teachers, setTeachers] = useState<AuthUser[]>([]);
-  const [stats, setStats] = useState<AcademicStatsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [statusMsg, setStatusMsg] = useState<string | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+/**
+ * Renderiza las sub-pestañas de Carreras/Grupos, Materias/Horarios y Estadísticas
+ * Académicas con ordenamiento natural por periodo escolar.
+ */
+export function PaginaAcademico({
+  organizacion,
+  grupos,
+  alRecargarOrganizacion,
+  alAbrirSesionEnKiosco,
+}: PropiedadesPaginaAcademico) {
+  const [subPestana, establecerSubPestana] = useState<SubPestanaAcademica>("structure");
+  const [carreras, establecerCarreras] = useState<Carrera[]>([]);
+  const [materias, establecerMaterias] = useState<Materia[]>([]);
+  const [cursos, establecerCursos] = useState<AsignacionCurso[]>([]);
+  const [docentes, establecerDocentes] = useState<UsuarioAutenticado[]>([]);
+  const [estadisticas, establecerEstadisticas] =
+    useState<RespuestaEstadisticasAcademicas | null>(null);
+  const [cargando, establecerCargando] = useState(true);
+  const [mensajeEstado, establecerMensajeEstado] = useState<string | null>(null);
+  const [mensajeError, establecerMensajeError] = useState<string | null>(null);
 
-  // Periodo académico general de la institución
-  const [orgPeriodType, setOrgPeriodType] = useState<AcademicPeriodType>(
-    organization.academic_period_type ?? "semestral"
+  // Régimen académico general de la institución.
+  const [tipoPeriodoOrg, establecerTipoPeriodoOrg] = useState<TipoPeriodoAcademico>(
+    organizacion.tipo_periodo_academico ?? "semestral"
   );
 
-  // Alta de carrera
-  const [careerName, setCareerName] = useState("");
-  const [careerCode, setCareerCode] = useState("");
-  const [careerDesc, setCareerDesc] = useState("");
-  const [careerPeriodType, setCareerPeriodType] = useState<string>("");
+  // Formulario de alta de carrera.
+  const [nombreCarrera, establecerNombreCarrera] = useState("");
+  const [codigoCarrera, establecerCodigoCarrera] = useState("");
+  const [descripcionCarrera, establecerDescripcionCarrera] = useState("");
+  const [tipoPeriodoCarrera, establecerTipoPeriodoCarrera] = useState<string>("");
 
-  // Alta de grupo académico
-  const [groupName, setGroupName] = useState("");
-  const [groupCode, setGroupCode] = useState("");
-  const [groupCareerId, setGroupCareerId] = useState<string>("");
-  const [groupSemester, setGroupSemester] = useState("");
-  const [groupPeriodType, setGroupPeriodType] = useState<string>("");
-  const [groupDefaultClassroom, setGroupDefaultClassroom] = useState("");
+  // Formulario de alta de grupo académico.
+  const [nombreGrupo, establecerNombreGrupo] = useState("");
+  const [codigoGrupo, establecerCodigoGrupo] = useState("");
+  const [idCarreraGrupo, establecerIdCarreraGrupo] = useState<string>("");
+  const [semestreGrupo, establecerSemestreGrupo] = useState("");
+  const [tipoPeriodoGrupo, establecerTipoPeriodoGrupo] = useState<string>("");
+  const [aulaDefectoGrupo, establecerAulaDefectoGrupo] = useState("");
 
-  // Edición rápida de grupo (aula fija / periodo)
-  const [editingGroupId, setEditingGroupId] = useState<number | null>(null);
-  const [editGroupSemester, setEditGroupSemester] = useState("");
-  const [editGroupPeriodType, setEditGroupPeriodType] = useState<string>("");
-  const [editGroupClassroom, setEditGroupClassroom] = useState("");
+  // Edición rápida de grupo (aula fija, semestre y régimen propio).
+  const [idGrupoEditando, establecerIdGrupoEditando] = useState<number | null>(null);
+  const [semestreGrupoEditado, establecerSemestreGrupoEditado] = useState("");
+  const [tipoPeriodoGrupoEditado, establecerTipoPeriodoGrupoEditado] = useState<string>("");
+  const [aulaGrupoEditada, establecerAulaGrupoEditada] = useState("");
 
-  // Autorización de administrador para cambiar tipo de periodo
-  const [pendingPeriodChange, setPendingPeriodChange] = useState<PendingPeriodChange | null>(null);
-  const [periodAuthSecret, setPeriodAuthSecret] = useState("");
-  const [periodAuthError, setPeriodAuthError] = useState<string | null>(null);
-  const [periodAuthSubmitting, setPeriodAuthSubmitting] = useState(false);
+  // Modal de autorización con contraseña de administrador al modificar periodos.
+  const [cambioPeriodoPendiente, establecerCambioPeriodoPendiente] =
+    useState<CambioPeriodoPendiente | null>(null);
+  const [secretoAutorizacionPeriodo, establecerSecretoAutorizacionPeriodo] = useState("");
+  const [errorAutorizacionPeriodo, establecerErrorAutorizacionPeriodo] = useState<
+    string | null
+  >(null);
+  const [enviandoAutorizacionPeriodo, establecerEnviandoAutorizacionPeriodo] =
+    useState(false);
 
-  // Alta de asignatura
-  const [subjectName, setSubjectName] = useState("");
-  const [subjectCode, setSubjectCode] = useState("");
-  const [subjectCareerId, setSubjectCareerId] = useState<string>("");
+  // Formulario de alta de asignatura.
+  const [nombreMateria, establecerNombreMateria] = useState("");
+  const [codigoMateria, establecerCodigoMateria] = useState("");
+  const [idCarreraMateria, establecerIdCarreraMateria] = useState<string>("");
 
-  // Alta de curso (Grupo + Materia + Profesor + horarios multi-día)
-  const [courseGroupId, setCourseGroupId] = useState<string>("");
-  const [courseSubjectId, setCourseSubjectId] = useState<string>("");
-  const [courseTeacherId, setCourseTeacherId] = useState<string>("");
-  const [courseTerm, setCourseTerm] = useState("");
-  const [selectedDays, setSelectedDays] = useState<number[]>([getDefaultWeekday()]);
-  const [initStart, setInitStart] = useState("10:00");
-  const [initEnd, setInitEnd] = useState("11:00");
-  const [initClassroom, setInitClassroom] = useState("");
-  const [pendingSchedules, setPendingSchedules] = useState<PendingScheduleDraft[]>([]);
+  // Formulario de asignación de curso (Grupo + Materia + Docente + horarios multi-día).
+  const [idGrupoCurso, establecerIdGrupoCurso] = useState<string>("");
+  const [idMateriaCurso, establecerIdMateriaCurso] = useState<string>("");
+  const [idDocenteCurso, establecerIdDocenteCurso] = useState<string>("");
+  const [periodoLectivoCurso, establecerPeriodoLectivoCurso] = useState("");
+  const [diasSeleccionados, establecerDiasSeleccionados] = useState<number[]>([
+    obtenerDiaSemanaPorDefecto(),
+  ]);
+  const [horaInicioInicial, establecerHoraInicioInicial] = useState("10:00");
+  const [horaFinInicial, establecerHoraFinInicial] = useState("11:00");
+  const [aulaInicial, establecerAulaInicial] = useState("");
+  const [horariosPendientes, establecerHorariosPendientes] = useState<
+    BorradorHorarioPendiente[]
+  >([]);
 
-  // Bloques horarios inline por curso existente (multi-día + aula prellenada editable)
-  const [scheduleDrafts, setScheduleDrafts] = useState<
-    Record<number, { days: number[]; start: string; end: string; classroom?: string }>
+  // Borradores inline para agregar bloques horarios a asignaciones existentes.
+  const [borradoresHorarioCurso, establecerBorradoresHorarioCurso] = useState<
+    Record<
+      number,
+      { dias: number[]; inicio: string; fin: string; aula?: string }
+    >
   >({});
 
-  // Filtros y ordenamiento de estadísticas
-  const [statsDateFrom, setStatsDateFrom] = useState("");
-  const [statsDateTo, setStatsDateTo] = useState("");
-  const [statsCareerId, setStatsCareerId] = useState<string>("");
-  const [statsGroupId, setStatsGroupId] = useState<string>("");
-  const [expandedGroupIds, setExpandedGroupIds] = useState<Record<number, boolean>>({});
-  const [subjectSortBy, setSubjectSortBy] = useState<SubjectSortField>("career_period");
-  const [subjectSortAsc, setSubjectSortAsc] = useState(true);
-  const [groupSortBy, setGroupSortBy] = useState<GroupSortField>("career_period");
-  const [groupSortAsc, setGroupSortAsc] = useState(true);
+  // Filtros, acordeones y criterios de ordenamiento en Estadísticas Académicas.
+  const [fechaDesdeEstadisticas, establecerFechaDesdeEstadisticas] = useState("");
+  const [fechaHastaEstadisticas, establecerFechaHastaEstadisticas] = useState("");
+  const [idCarreraEstadisticas, establecerIdCarreraEstadisticas] = useState<string>("");
+  const [idGrupoEstadisticas, establecerIdGrupoEstadisticas] = useState<string>("");
+  const [gruposExpandidos, establecerGruposExpandidos] = useState<
+    Record<number, boolean>
+  >({});
+  const [ordenMateriaPor, establecerOrdenMateriaPor] =
+    useState<CampoOrdenMateria>("career_period");
+  const [ordenMateriaAscendente, establecerOrdenMateriaAscendente] = useState(true);
+  const [ordenGrupoPor, establecerOrdenGrupoPor] =
+    useState<CampoOrdenGrupo>("career_period");
+  const [ordenGrupoAscendente, establecerOrdenGrupoAscendente] = useState(true);
 
   useEffect(() => {
-    setOrgPeriodType(organization.academic_period_type ?? "semestral");
-  }, [organization.academic_period_type, organization.id]);
+    establecerTipoPeriodoOrg(organizacion.tipo_periodo_academico ?? "semestral");
+  }, [organizacion.tipo_periodo_academico, organizacion.id]);
 
-  const loadAcademicData = useCallback(async () => {
-    setLoading(true);
-    setErrorMsg(null);
+  /** Carga carreras, asignaturas, asignaciones de curso y usuarios docentes disponibles. */
+  const cargarDatosAcademicos = useCallback(async () => {
+    establecerCargando(true);
+    establecerMensajeError(null);
     try {
-      const [carList, subjList, courseList, usersList] = await Promise.all([
-        api.listCareers(organization.id),
-        api.listSubjects(organization.id),
-        api.listCourses(organization.id),
-        api.listUsers(organization.id),
+      const [listaCarreras, listaMaterias, listaCursos, listaUsuarios] = await Promise.all([
+        clienteApi.listarCarreras(organizacion.id),
+        clienteApi.listarMaterias(organizacion.id),
+        clienteApi.listarCursos(organizacion.id),
+        clienteApi.listarUsuarios(organizacion.id),
       ]);
-      setCareers(carList);
-      setSubjects(subjList);
-      setCourses(courseList);
-      setTeachers(
-        usersList.filter((u) => u.is_active && (u.role === "teacher" || u.role === "org_admin"))
+      establecerCarreras(listaCarreras);
+      establecerMaterias(listaMaterias);
+      establecerCursos(listaCursos);
+      establecerDocentes(
+        listaUsuarios.filter(
+          (usuario) =>
+            usuario.esta_activo &&
+            (usuario.rol === "teacher" || usuario.rol === "org_admin")
+        )
       );
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo cargar la estructura académica.");
+    } catch (errorCarga) {
+      establecerMensajeError(
+        errorCarga instanceof Error
+          ? errorCarga.message
+          : "No se pudo cargar la estructura académica."
+      );
     } finally {
-      setLoading(false);
+      establecerCargando(false);
     }
-  }, [organization.id]);
+  }, [organizacion.id]);
 
-  const loadStats = useCallback(async () => {
+  /** Consulta estadísticas agregadas por asignatura, grupo y desglose por estudiante. */
+  const cargarEstadisticas = useCallback(async () => {
     try {
-      const res = await api.getAcademicStats({
-        organization_id: organization.id,
-        date_from: statsDateFrom || null,
-        date_to: statsDateTo || null,
-        career_id: statsCareerId ? Number(statsCareerId) : null,
-        group_id: statsGroupId ? Number(statsGroupId) : null,
+      const respuesta = await clienteApi.obtenerEstadisticasAcademicas({
+        id_organizacion: organizacion.id,
+        fecha_desde: fechaDesdeEstadisticas || null,
+        fecha_hasta: fechaHastaEstadisticas || null,
+        id_carrera: idCarreraEstadisticas ? Number(idCarreraEstadisticas) : null,
+        id_grupo: idGrupoEstadisticas ? Number(idGrupoEstadisticas) : null,
       });
-      setStats(res);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error cargando estadísticas.");
+      establecerEstadisticas(respuesta);
+    } catch (errorCarga) {
+      establecerMensajeError(
+        errorCarga instanceof Error ? errorCarga.message : "Error cargando estadísticas."
+      );
     }
-  }, [organization.id, statsCareerId, statsDateFrom, statsDateTo, statsGroupId]);
+  }, [
+    organizacion.id,
+    idCarreraEstadisticas,
+    fechaDesdeEstadisticas,
+    fechaHastaEstadisticas,
+    idGrupoEstadisticas,
+  ]);
 
   useEffect(() => {
-    void loadAcademicData();
-  }, [loadAcademicData]);
+    void cargarDatosAcademicos();
+  }, [cargarDatosAcademicos]);
 
   useEffect(() => {
-    if (subTab === "stats") {
-      void loadStats();
+    if (subPestana === "stats") {
+      void cargarEstadisticas();
     }
-  }, [subTab, loadStats]);
+  }, [subPestana, cargarEstadisticas]);
 
-  function requestOrganizationPeriodChange(e: FormEvent) {
-    e.preventDefault();
-    setErrorMsg(null);
-    setStatusMsg(null);
-    const currentOrgPeriod = organization.academic_period_type ?? "semestral";
-    if (orgPeriodType === currentOrgPeriod) {
-      setStatusMsg(`El periodo general actual ya es ${getPeriodMeta(orgPeriodType).label}.`);
+  /** Abre confirmación con clave admin para modificar el tipo de periodo institucional. */
+  function solicitarCambioPeriodoOrganizacion(evento: FormEvent) {
+    evento.preventDefault();
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
+    const periodoActualOrg = organizacion.tipo_periodo_academico ?? "semestral";
+    if (tipoPeriodoOrg === periodoActualOrg) {
+      establecerMensajeEstado(
+        `El periodo general actual ya es ${obtenerMetadatosPeriodo(tipoPeriodoOrg).etiqueta}.`
+      );
       return;
     }
-    setPeriodAuthSecret("");
-    setPeriodAuthError(null);
-    setPendingPeriodChange({
-      scope: "organization",
-      nextPeriodType: orgPeriodType,
-      summary: `Institución "${organization.name}": ${getPeriodMeta(currentOrgPeriod).label} → ${getPeriodMeta(orgPeriodType).label}`,
+    establecerSecretoAutorizacionPeriodo("");
+    establecerErrorAutorizacionPeriodo(null);
+    establecerCambioPeriodoPendiente({
+      alcance: "organization",
+      siguienteTipoPeriodo: tipoPeriodoOrg,
+      resumen: `Institución "${organizacion.nombre}": ${
+        obtenerMetadatosPeriodo(periodoActualOrg).etiqueta
+      } → ${obtenerMetadatosPeriodo(tipoPeriodoOrg).etiqueta}`,
     });
   }
 
-  async function handleCreateCareer(e: FormEvent) {
-    e.preventDefault();
-    setErrorMsg(null);
-    setStatusMsg(null);
+  /** Crea una nueva carrera o programa académico dentro de la institución. */
+  async function manejarCrearCarrera(evento: FormEvent) {
+    evento.preventDefault();
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
     try {
-      await api.createCareer({
-        organization_id: organization.id,
-        name: careerName.trim(),
-        code: careerCode.trim(),
-        description: careerDesc.trim() || null,
-        period_type: careerPeriodType ? (careerPeriodType as AcademicPeriodType) : null,
+      await clienteApi.crearCarrera({
+        id_organizacion: organizacion.id,
+        nombre: nombreCarrera.trim(),
+        codigo: codigoCarrera.trim(),
+        descripcion: descripcionCarrera.trim() || null,
+        tipo_periodo: tipoPeriodoCarrera
+          ? (tipoPeriodoCarrera as TipoPeriodoAcademico)
+          : null,
       });
-      setCareerName("");
-      setCareerCode("");
-      setCareerDesc("");
-      setCareerPeriodType("");
-      setStatusMsg("Carrera registrada.");
-      await loadAcademicData();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error creando carrera.");
+      establecerNombreCarrera("");
+      establecerCodigoCarrera("");
+      establecerDescripcionCarrera("");
+      establecerTipoPeriodoCarrera("");
+      establecerMensajeEstado("Carrera registrada.");
+      await cargarDatosAcademicos();
+    } catch (errorCreacion) {
+      establecerMensajeError(
+        errorCreacion instanceof Error ? errorCreacion.message : "Error creando carrera."
+      );
     }
   }
 
-  function requestCareerPeriodChange(career: Career, nextValue: string) {
-    const currentVal = career.period_type ?? "";
-    if (nextValue === currentVal) return;
-    setErrorMsg(null);
-    setStatusMsg(null);
-    const nextLabel = nextValue
-      ? getPeriodMeta(nextValue).label
-      : `Heredar general (${getPeriodMeta(organization.academic_period_type).label})`;
-    setPeriodAuthSecret("");
-    setPeriodAuthError(null);
-    setPendingPeriodChange({
-      scope: "career",
-      careerId: career.id,
-      careerName: career.name,
-      nextPeriodType: nextValue,
-      summary: `Carrera "${career.name}": ${getPeriodMeta(career.effective_period_type).label} → ${nextLabel}`,
+  /** Abre confirmación con clave admin antes de cambiar el régimen de una carrera. */
+  function solicitarCambioPeriodoCarrera(carrera: Carrera, siguienteValor: string) {
+    const valorActual = carrera.tipo_periodo ?? "";
+    if (siguienteValor === valorActual) return;
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
+    const etiquetaSiguiente = siguienteValor
+      ? obtenerMetadatosPeriodo(siguienteValor).etiqueta
+      : `Heredar general (${
+          obtenerMetadatosPeriodo(organizacion.tipo_periodo_academico).etiqueta
+        })`;
+    establecerSecretoAutorizacionPeriodo("");
+    establecerErrorAutorizacionPeriodo(null);
+    establecerCambioPeriodoPendiente({
+      alcance: "career",
+      idCarrera: carrera.id,
+      nombreCarrera: carrera.nombre,
+      siguienteTipoPeriodo: siguienteValor,
+      resumen: `Carrera "${carrera.nombre}": ${
+        obtenerMetadatosPeriodo(carrera.tipo_periodo_efectivo).etiqueta
+      } → ${etiquetaSiguiente}`,
     });
   }
 
-  async function handleConfirmPeriodChange(e: FormEvent) {
-    e.preventDefault();
-    if (!pendingPeriodChange) return;
-    setPeriodAuthError(null);
-    setPeriodAuthSubmitting(true);
+  /** Envía al backend la actualización de periodo respaldada por secreto administrativo. */
+  async function manejarConfirmarCambioPeriodo(evento: FormEvent) {
+    evento.preventDefault();
+    if (!cambioPeriodoPendiente) return;
+    establecerErrorAutorizacionPeriodo(null);
+    establecerEnviandoAutorizacionPeriodo(true);
     try {
-      if (pendingPeriodChange.scope === "organization") {
-        await api.updateOrganization(organization.id, {
-          academic_period_type: pendingPeriodChange.nextPeriodType,
-          authorization_secret: periodAuthSecret,
+      if (cambioPeriodoPendiente.alcance === "organization") {
+        await clienteApi.actualizarOrganizacion(organizacion.id, {
+          tipo_periodo_academico: cambioPeriodoPendiente.siguienteTipoPeriodo,
+          secreto_autorizacion: secretoAutorizacionPeriodo,
         });
-        setStatusMsg(
-          `Periodo académico general actualizado a ${getPeriodMeta(pendingPeriodChange.nextPeriodType).label}.`
+        establecerMensajeEstado(
+          `Periodo académico general actualizado a ${
+            obtenerMetadatosPeriodo(cambioPeriodoPendiente.siguienteTipoPeriodo).etiqueta
+          }.`
         );
-      } else if (pendingPeriodChange.scope === "career") {
-        await api.updateCareer(pendingPeriodChange.careerId, {
-          period_type: pendingPeriodChange.nextPeriodType
-            ? (pendingPeriodChange.nextPeriodType as AcademicPeriodType)
+      } else if (cambioPeriodoPendiente.alcance === "career") {
+        await clienteApi.actualizarCarrera(cambioPeriodoPendiente.idCarrera, {
+          tipo_periodo: cambioPeriodoPendiente.siguienteTipoPeriodo
+            ? (cambioPeriodoPendiente.siguienteTipoPeriodo as TipoPeriodoAcademico)
             : null,
-          authorization_secret: periodAuthSecret,
+          secreto_autorizacion: secretoAutorizacionPeriodo,
         });
-        setStatusMsg(`Tipo de periodo de "${pendingPeriodChange.careerName}" actualizado.`);
+        establecerMensajeEstado(
+          `Tipo de periodo de "${cambioPeriodoPendiente.nombreCarrera}" actualizado.`
+        );
       } else {
-        await api.updateGroup(pendingPeriodChange.groupId, {
-          semester: pendingPeriodChange.semester,
-          default_classroom: pendingPeriodChange.classroom,
-          period_type: pendingPeriodChange.nextPeriodType
-            ? (pendingPeriodChange.nextPeriodType as AcademicPeriodType)
+        await clienteApi.actualizarGrupo(cambioPeriodoPendiente.idGrupo, {
+          semestre: cambioPeriodoPendiente.semestre,
+          aula_defecto: cambioPeriodoPendiente.aula,
+          tipo_periodo: cambioPeriodoPendiente.siguienteTipoPeriodo
+            ? (cambioPeriodoPendiente.siguienteTipoPeriodo as TipoPeriodoAcademico)
             : null,
-          authorization_secret: periodAuthSecret,
+          secreto_autorizacion: secretoAutorizacionPeriodo,
         });
-        setEditingGroupId(null);
-        setStatusMsg(`Tipo de periodo de "${pendingPeriodChange.groupName}" actualizado.`);
+        establecerIdGrupoEditando(null);
+        establecerMensajeEstado(
+          `Tipo de periodo de "${cambioPeriodoPendiente.nombreGrupo}" actualizado.`
+        );
       }
-      setPendingPeriodChange(null);
-      setPeriodAuthSecret("");
-      await Promise.all([onRefreshOrg(), loadAcademicData()]);
-    } catch (err) {
-      setPeriodAuthError(
-        err instanceof Error ? err.message : "No se pudo autorizar el cambio de periodo."
+      establecerCambioPeriodoPendiente(null);
+      establecerSecretoAutorizacionPeriodo("");
+      await Promise.all([alRecargarOrganizacion(), cargarDatosAcademicos()]);
+    } catch (errorAutorizacion) {
+      establecerErrorAutorizacionPeriodo(
+        errorAutorizacion instanceof Error
+          ? errorAutorizacion.message
+          : "No se pudo autorizar el cambio de periodo."
       );
     } finally {
-      setPeriodAuthSubmitting(false);
+      establecerEnviandoAutorizacionPeriodo(false);
     }
   }
 
-  async function handleDeleteCareer(careerId: number) {
-    setErrorMsg(null);
+  /** Elimina una carrera del catálogo institucional. */
+  async function manejarEliminarCarrera(idCarrera: number) {
+    establecerMensajeError(null);
     try {
-      await api.deleteCareer(careerId);
-      await Promise.all([loadAcademicData(), onRefreshOrg()]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo eliminar la carrera.");
+      await clienteApi.eliminarCarrera(idCarrera);
+      await Promise.all([cargarDatosAcademicos(), alRecargarOrganizacion()]);
+    } catch (errorEliminacion) {
+      establecerMensajeError(
+        errorEliminacion instanceof Error
+          ? errorEliminacion.message
+          : "No se pudo eliminar la carrera."
+      );
     }
   }
 
-  async function handleCreateGroup(e: FormEvent) {
-    e.preventDefault();
-    setErrorMsg(null);
-    setStatusMsg(null);
+  /** Crea un nuevo grupo escolar vinculado opcionalmente a una carrera y aula fija. */
+  async function manejarCrearGrupo(evento: FormEvent) {
+    evento.preventDefault();
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
     try {
-      await api.createGroup({
-        organization_id: organization.id,
-        name: groupName.trim(),
-        code: groupCode.trim(),
-        career_id: groupCareerId ? Number(groupCareerId) : null,
-        semester: groupSemester.trim() || null,
-        period_type: groupPeriodType ? (groupPeriodType as AcademicPeriodType) : null,
-        default_classroom: groupDefaultClassroom.trim() || null,
-        schedule_start: "07:00",
-        schedule_end: "15:00",
+      await clienteApi.crearGrupo({
+        id_organizacion: organizacion.id,
+        nombre: nombreGrupo.trim(),
+        codigo: codigoGrupo.trim(),
+        id_carrera: idCarreraGrupo ? Number(idCarreraGrupo) : null,
+        semestre: semestreGrupo.trim() || null,
+        tipo_periodo: tipoPeriodoGrupo
+          ? (tipoPeriodoGrupo as TipoPeriodoAcademico)
+          : null,
+        aula_defecto: aulaDefectoGrupo.trim() || null,
+        hora_inicio_horario: "07:00",
+        hora_fin_horario: "15:00",
       });
-      setGroupName("");
-      setGroupCode("");
-      setGroupSemester("");
-      setGroupPeriodType("");
-      setGroupDefaultClassroom("");
-      setStatusMsg("Grupo académico creado.");
-      await Promise.all([onRefreshOrg(), loadAcademicData()]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error creando grupo.");
+      establecerNombreGrupo("");
+      establecerCodigoGrupo("");
+      establecerSemestreGrupo("");
+      establecerTipoPeriodoGrupo("");
+      establecerAulaDefectoGrupo("");
+      establecerMensajeEstado("Grupo académico creado.");
+      await Promise.all([alRecargarOrganizacion(), cargarDatosAcademicos()]);
+    } catch (errorCreacion) {
+      establecerMensajeError(
+        errorCreacion instanceof Error ? errorCreacion.message : "Error creando grupo."
+      );
     }
   }
 
-  function startEditGroup(g: Group) {
-    setEditingGroupId(g.id);
-    setEditGroupSemester(g.semester ?? "");
-    setEditGroupPeriodType(g.custom_period_type ?? "");
-    setEditGroupClassroom(g.default_classroom ?? "");
+  /** Activa el panel inline de edición de semestre, tipo de periodo y aula de un grupo. */
+  function iniciarEdicionGrupo(grupo: Grupo) {
+    establecerIdGrupoEditando(grupo.id);
+    establecerSemestreGrupoEditado(grupo.semestre ?? "");
+    establecerTipoPeriodoGrupoEditado(grupo.tipo_periodo_personalizado ?? "");
+    establecerAulaGrupoEditada(grupo.aula_defecto ?? "");
   }
 
-  async function handleSaveGroupEdit(group: Group) {
-    setErrorMsg(null);
-    const currentCustom = group.custom_period_type ?? "";
-    const trimmedSemester = editGroupSemester.trim() || null;
-    const trimmedClassroom = editGroupClassroom.trim() || null;
+  /** Guarda modificaciones de grupo o pide autorización admin si cambió su régimen. */
+  async function manejarGuardarEdicionGrupo(grupo: Grupo) {
+    establecerMensajeError(null);
+    const personalizadoActual = grupo.tipo_periodo_personalizado ?? "";
+    const semestreLimpio = semestreGrupoEditado.trim() || null;
+    const aulaLimpia = aulaGrupoEditada.trim() || null;
 
-    if (editGroupPeriodType !== currentCustom) {
-      const nextLabel = editGroupPeriodType
-        ? getPeriodMeta(editGroupPeriodType).label
+    if (tipoPeriodoGrupoEditado !== personalizadoActual) {
+      const etiquetaSiguiente = tipoPeriodoGrupoEditado
+        ? obtenerMetadatosPeriodo(tipoPeriodoGrupoEditado).etiqueta
         : "Heredar de carrera/institución";
-      setPeriodAuthSecret("");
-      setPeriodAuthError(null);
-      setPendingPeriodChange({
-        scope: "group",
-        groupId: group.id,
-        groupName: group.name,
-        nextPeriodType: editGroupPeriodType,
-        semester: trimmedSemester,
-        classroom: trimmedClassroom,
-        summary: `Grupo "${group.name}": ${getPeriodMeta(group.period_type).label} → ${nextLabel}`,
+      establecerSecretoAutorizacionPeriodo("");
+      establecerErrorAutorizacionPeriodo(null);
+      establecerCambioPeriodoPendiente({
+        alcance: "group",
+        idGrupo: grupo.id,
+        nombreGrupo: grupo.nombre,
+        siguienteTipoPeriodo: tipoPeriodoGrupoEditado,
+        semestre: semestreLimpio,
+        aula: aulaLimpia,
+        resumen: `Grupo "${grupo.nombre}": ${
+          obtenerMetadatosPeriodo(grupo.tipo_periodo).etiqueta
+        } → ${etiquetaSiguiente}`,
       });
       return;
     }
 
     try {
-      await api.updateGroup(group.id, {
-        semester: trimmedSemester,
-        default_classroom: trimmedClassroom,
+      await clienteApi.actualizarGrupo(grupo.id, {
+        semestre: semestreLimpio,
+        aula_defecto: aulaLimpia,
       });
-      setEditingGroupId(null);
-      await Promise.all([onRefreshOrg(), loadAcademicData()]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo actualizar el grupo.");
+      establecerIdGrupoEditando(null);
+      await Promise.all([alRecargarOrganizacion(), cargarDatosAcademicos()]);
+    } catch (errorActualizacion) {
+      establecerMensajeError(
+        errorActualizacion instanceof Error
+          ? errorActualizacion.message
+          : "No se pudo actualizar el grupo."
+      );
     }
   }
 
-  async function handleLinkGroupCareer(groupId: number, careerIdStr: string) {
-    setErrorMsg(null);
+  /** Asocia rápidamente un grupo sin carrera a una carrera existente. */
+  async function manejarVincularGrupoACarrera(idGrupo: number, valorIdCarrera: string) {
+    establecerMensajeError(null);
     try {
-      await api.updateGroup(groupId, {
-        career_id: careerIdStr ? Number(careerIdStr) : null,
+      await clienteApi.actualizarGrupo(idGrupo, {
+        id_carrera: valorIdCarrera ? Number(valorIdCarrera) : null,
       });
-      await Promise.all([onRefreshOrg(), loadAcademicData()]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo actualizar la carrera del grupo.");
+      await Promise.all([alRecargarOrganizacion(), cargarDatosAcademicos()]);
+    } catch (errorVinculo) {
+      establecerMensajeError(
+        errorVinculo instanceof Error
+          ? errorVinculo.message
+          : "No se pudo actualizar la carrera del grupo."
+      );
     }
   }
 
-  async function handleDeleteGroup(groupId: number) {
-    setErrorMsg(null);
+  /** Elimina un grupo académico por su identificador. */
+  async function manejarEliminarGrupo(idGrupo: number) {
+    establecerMensajeError(null);
     try {
-      await api.deleteGroup(groupId);
-      await Promise.all([onRefreshOrg(), loadAcademicData()]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error eliminando grupo.");
+      await clienteApi.eliminarGrupo(idGrupo);
+      await Promise.all([alRecargarOrganizacion(), cargarDatosAcademicos()]);
+    } catch (errorEliminacion) {
+      establecerMensajeError(
+        errorEliminacion instanceof Error
+          ? errorEliminacion.message
+          : "Error eliminando grupo."
+      );
     }
   }
 
-  async function handleCreateSubject(e: FormEvent) {
-    e.preventDefault();
-    setErrorMsg(null);
-    setStatusMsg(null);
+  /** Crea una nueva asignatura en el catálogo institucional. */
+  async function manejarCrearMateria(evento: FormEvent) {
+    evento.preventDefault();
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
     try {
-      await api.createSubject({
-        organization_id: organization.id,
-        career_id: subjectCareerId ? Number(subjectCareerId) : null,
-        name: subjectName.trim(),
-        code: subjectCode.trim(),
+      await clienteApi.crearMateria({
+        id_organizacion: organizacion.id,
+        id_carrera: idCarreraMateria ? Number(idCarreraMateria) : null,
+        nombre: nombreMateria.trim(),
+        codigo: codigoMateria.trim(),
       });
-      setSubjectName("");
-      setSubjectCode("");
-      setStatusMsg("Asignatura agregada al catálogo.");
-      await loadAcademicData();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error creando asignatura.");
+      establecerNombreMateria("");
+      establecerCodigoMateria("");
+      establecerMensajeEstado("Asignatura agregada al catálogo.");
+      await cargarDatosAcademicos();
+    } catch (errorCreacion) {
+      establecerMensajeError(
+        errorCreacion instanceof Error
+          ? errorCreacion.message
+          : "Error creando asignatura."
+      );
     }
   }
 
-  async function handleDeleteSubject(subjectId: number) {
-    setErrorMsg(null);
+  /** Elimina una asignatura del catálogo. */
+  async function manejarEliminarMateria(idMateria: number) {
+    establecerMensajeError(null);
     try {
-      await api.deleteSubject(subjectId);
-      await loadAcademicData();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error eliminando asignatura.");
+      await clienteApi.eliminarMateria(idMateria);
+      await cargarDatosAcademicos();
+    } catch (errorEliminacion) {
+      establecerMensajeError(
+        errorEliminacion instanceof Error
+          ? errorEliminacion.message
+          : "Error eliminando asignatura."
+      );
     }
   }
 
-  function handleSelectCourseGroup(groupIdStr: string) {
-    setCourseGroupId(groupIdStr);
-    const selected = groups.find((g) => String(g.id) === groupIdStr);
-    // Prellena el aula fija del grupo pero deja editarla libremente
-    setInitClassroom(selected?.default_classroom ?? "");
+  /** Al elegir un grupo en el formulario de curso, prellena su aula fija si existe. */
+  function manejarSeleccionarGrupoCurso(valorIdGrupo: string) {
+    establecerIdGrupoCurso(valorIdGrupo);
+    const grupoSeleccionado = grupos.find(
+      (grupo) => String(grupo.id) === valorIdGrupo
+    );
+    establecerAulaInicial(grupoSeleccionado?.aula_defecto ?? "");
   }
 
-  function toggleSelectedDay(day: number) {
-    setSelectedDays((prev) =>
-      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day].sort((a, b) => a - b)
+  /** Alterna un día semanal dentro del selector de horarios para nuevo curso. */
+  function alternarDiaSeleccionado(dia: number) {
+    establecerDiasSeleccionados((previos) =>
+      previos.includes(dia)
+        ? previos.filter((elemento) => elemento !== dia)
+        : [...previos, dia].sort((diaA, diaB) => diaA - diaB)
     );
   }
 
-  function appendSelectedDaysToPending() {
-    if (selectedDays.length === 0) return;
-    setPendingSchedules((prev) => {
-      const next = [...prev];
-      const existingKeys = new Set(
-        next.map((s) => `${s.day_of_week}-${s.start_time}-${s.end_time}`)
+  /** Acumula los días actualmente marcados como borradores antes de guardar el curso. */
+  function agregarDiasSeleccionadosAPendientes() {
+    if (diasSeleccionados.length === 0) return;
+    establecerHorariosPendientes((previos) => {
+      const siguientes = [...previos];
+      const clavesExistentes = new Set(
+        siguientes.map(
+          (bloque) =>
+            `${bloque.dia_semana}-${bloque.hora_inicio}-${bloque.hora_fin}`
+        )
       );
-      for (const day of [...selectedDays].sort((a, b) => a - b)) {
-        const key = `${day}-${initStart}-${initEnd}`;
-        if (!existingKeys.has(key)) {
-          next.push({
-            day_of_week: day,
-            start_time: initStart,
-            end_time: initEnd,
-            classroom: initClassroom.trim(),
+      for (const dia of [...diasSeleccionados].sort((diaA, diaB) => diaA - diaB)) {
+        const clave = `${dia}-${horaInicioInicial}-${horaFinInicial}`;
+        if (!clavesExistentes.has(clave)) {
+          siguientes.push({
+            dia_semana: dia,
+            hora_inicio: horaInicioInicial,
+            hora_fin: horaFinInicial,
+            aula: aulaInicial.trim(),
           });
-          existingKeys.add(key);
+          clavesExistentes.add(clave);
         }
       }
-      return next;
+      return siguientes;
     });
-    setSelectedDays([]);
+    establecerDiasSeleccionados([]);
   }
 
-  async function handleCreateCourse(e: FormEvent) {
-    e.preventDefault();
-    if (!courseGroupId || !courseSubjectId) return;
-    setErrorMsg(null);
-    setStatusMsg(null);
+  /** Crea la asignación de curso combinando los bloques acumulados y los días seleccionados. */
+  async function manejarCrearCurso(evento: FormEvent) {
+    evento.preventDefault();
+    if (!idGrupoCurso || !idMateriaCurso) return;
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
 
-    const combined: PendingScheduleDraft[] = [...pendingSchedules];
-    const seen = new Set(combined.map((s) => `${s.day_of_week}-${s.start_time}-${s.end_time}`));
-    for (const day of [...selectedDays].sort((a, b) => a - b)) {
-      const key = `${day}-${initStart}-${initEnd}`;
-      if (!seen.has(key)) {
-        combined.push({
-          day_of_week: day,
-          start_time: initStart,
-          end_time: initEnd,
-          classroom: initClassroom.trim(),
+    const bloquesCombinados: BorradorHorarioPendiente[] = [...horariosPendientes];
+    const clavesVistas = new Set(
+      bloquesCombinados.map(
+        (bloque) => `${bloque.dia_semana}-${bloque.hora_inicio}-${bloque.hora_fin}`
+      )
+    );
+    for (const dia of [...diasSeleccionados].sort((diaA, diaB) => diaA - diaB)) {
+      const clave = `${dia}-${horaInicioInicial}-${horaFinInicial}`;
+      if (!clavesVistas.has(clave)) {
+        bloquesCombinados.push({
+          dia_semana: dia,
+          hora_inicio: horaInicioInicial,
+          hora_fin: horaFinInicial,
+          aula: aulaInicial.trim(),
         });
-        seen.add(key);
+        clavesVistas.add(clave);
       }
     }
 
-    if (combined.length === 0) {
-      setErrorMsg("Selecciona al menos un día para el horario de la materia.");
+    if (bloquesCombinados.length === 0) {
+      establecerMensajeError(
+        "Selecciona al menos un día para el horario de la materia."
+      );
       return;
     }
 
     try {
-      await api.createCourse({
-        organization_id: organization.id,
-        group_id: Number(courseGroupId),
-        subject_id: Number(courseSubjectId),
-        teacher_user_id: courseTeacherId ? Number(courseTeacherId) : null,
-        term: courseTerm.trim() || null,
-        schedules: combined.map((sl) => ({
-          day_of_week: sl.day_of_week,
-          start_time: sl.start_time,
-          end_time: sl.end_time,
-          classroom: sl.classroom.trim() || null,
+      await clienteApi.crearCurso({
+        id_organizacion: organizacion.id,
+        id_grupo: Number(idGrupoCurso),
+        id_materia: Number(idMateriaCurso),
+        id_usuario_docente: idDocenteCurso ? Number(idDocenteCurso) : null,
+        periodo_lectivo: periodoLectivoCurso.trim() || null,
+        horarios: bloquesCombinados.map((bloque) => ({
+          dia_semana: bloque.dia_semana,
+          hora_inicio: bloque.hora_inicio,
+          hora_fin: bloque.hora_fin,
+          aula: bloque.aula.trim() || null,
         })),
       });
-      const grp = groups.find((g) => String(g.id) === courseGroupId);
-      setPendingSchedules([]);
-      setSelectedDays([getDefaultWeekday()]);
-      setInitClassroom(grp?.default_classroom ?? "");
-      setStatusMsg(
-        `Asignatura vinculada al grupo con ${combined.length} bloque${combined.length === 1 ? "" : "s"} de horario.`
+      const grupoEncontrado = grupos.find(
+        (grupo) => String(grupo.id) === idGrupoCurso
       );
-      await Promise.all([loadAcademicData(), onRefreshOrg()]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error asignando asignatura.");
+      establecerHorariosPendientes([]);
+      establecerDiasSeleccionados([obtenerDiaSemanaPorDefecto()]);
+      establecerAulaInicial(grupoEncontrado?.aula_defecto ?? "");
+      establecerMensajeEstado(
+        `Asignatura vinculada al grupo con ${bloquesCombinados.length} bloque${
+          bloquesCombinados.length === 1 ? "" : "s"
+        } de horario.`
+      );
+      await Promise.all([cargarDatosAcademicos(), alRecargarOrganizacion()]);
+    } catch (errorCreacion) {
+      establecerMensajeError(
+        errorCreacion instanceof Error
+          ? errorCreacion.message
+          : "Error asignando asignatura."
+      );
     }
   }
 
-  async function handleReassignTeacher(courseId: number, teacherIdStr: string) {
-    setErrorMsg(null);
+  /** Reasigna inmediatamente el profesor responsable de una asignatura. */
+  async function manejarReasignarDocente(idCurso: number, valorIdDocente: string) {
+    establecerMensajeError(null);
     try {
-      await api.updateCourse(courseId, {
-        teacher_user_id: teacherIdStr ? Number(teacherIdStr) : null,
+      await clienteApi.actualizarCurso(idCurso, {
+        id_usuario_docente: valorIdDocente ? Number(valorIdDocente) : null,
       });
-      await loadAcademicData();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo cambiar el profesor.");
+      await cargarDatosAcademicos();
+    } catch (errorReasignacion) {
+      establecerMensajeError(
+        errorReasignacion instanceof Error
+          ? errorReasignacion.message
+          : "No se pudo cambiar el profesor."
+      );
     }
   }
 
-  function getCourseScheduleDraft(course: CourseAssignment) {
+  /** Obtiene o inicializa el estado local para añadir horarios inline en un curso. */
+  function obtenerBorradorHorarioCurso(curso: AsignacionCurso) {
     return (
-      scheduleDrafts[course.id] ?? {
-        days: [0],
-        start: "08:00",
-        end: "09:00",
-        classroom: course.group_default_classroom ?? "",
+      borradoresHorarioCurso[curso.id] ?? {
+        dias: [0],
+        inicio: "08:00",
+        fin: "09:00",
+        aula: curso.aula_defecto_grupo ?? "",
       }
     );
   }
 
-  function toggleInlineDraftDay(course: CourseAssignment, day: number) {
-    const draft = getCourseScheduleDraft(course);
-    const nextDays = draft.days.includes(day)
-      ? draft.days.filter((d) => d !== day)
-      : [...draft.days, day].sort((a, b) => a - b);
-    setScheduleDrafts((prev) => ({
-      ...prev,
-      [course.id]: { ...draft, days: nextDays },
+  /** Marca o desmarca un día en el editor inline de horarios de un curso existente. */
+  function alternarDiaBorradorInline(curso: AsignacionCurso, dia: number) {
+    const borrador = obtenerBorradorHorarioCurso(curso);
+    const siguientesDias = borrador.dias.includes(dia)
+      ? borrador.dias.filter((elemento) => elemento !== dia)
+      : [...borrador.dias, dia].sort((diaA, diaB) => diaA - diaB);
+    establecerBorradoresHorarioCurso((previos) => ({
+      ...previos,
+      [curso.id]: { ...borrador, dias: siguientesDias },
     }));
   }
 
-  async function handleAddSchedulesToCourse(course: CourseAssignment) {
-    const draft = getCourseScheduleDraft(course);
-    if (draft.days.length === 0) {
-      setErrorMsg("Marca al menos un día para agregar el horario.");
+  /** Agrega uno o varios bloques semanales a un curso existente desde la tarjeta inline. */
+  async function manejarAgregarHorariosACurso(curso: AsignacionCurso) {
+    const borrador = obtenerBorradorHorarioCurso(curso);
+    if (borrador.dias.length === 0) {
+      establecerMensajeError("Marca al menos un día para agregar el horario.");
       return;
     }
-    setErrorMsg(null);
-    const resolvedClassroom = (draft.classroom ?? course.group_default_classroom ?? "").trim() || null;
+    establecerMensajeError(null);
+    const aulaResuelta =
+      (borrador.aula ?? curso.aula_defecto_grupo ?? "").trim() || null;
     try {
-      for (const day of draft.days) {
-        await api.addCourseSchedule(course.id, {
-          day_of_week: day,
-          start_time: draft.start,
-          end_time: draft.end,
-          classroom: resolvedClassroom,
+      for (const dia of borrador.dias) {
+        await clienteApi.agregarHorarioCurso(curso.id, {
+          dia_semana: dia,
+          hora_inicio: borrador.inicio,
+          hora_fin: borrador.fin,
+          aula: aulaResuelta,
         });
       }
-      setScheduleDrafts((prev) => ({
-        ...prev,
-        [course.id]: {
-          ...draft,
-          days: [],
-          classroom: course.group_default_classroom ?? "",
+      establecerBorradoresHorarioCurso((previos) => ({
+        ...previos,
+        [curso.id]: {
+          ...borrador,
+          dias: [],
+          aula: curso.aula_defecto_grupo ?? "",
         },
       }));
-      await loadAcademicData();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error agregando horario.");
-    }
-  }
-
-  async function handleDeleteSchedule(scheduleId: number) {
-    setErrorMsg(null);
-    try {
-      await api.deleteSchedule(scheduleId);
-      await loadAcademicData();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error eliminando horario.");
-    }
-  }
-
-  async function handleDeleteCourse(courseId: number) {
-    setErrorMsg(null);
-    try {
-      await api.deleteCourse(courseId);
-      await Promise.all([loadAcademicData(), onRefreshOrg()]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Error eliminando asignación.");
-    }
-  }
-
-  async function handleGenerateTodaySessions() {
-    setErrorMsg(null);
-    setStatusMsg(null);
-    try {
-      const res = await api.generateAcademicSessions({
-        organization_id: organization.id,
-        target_date: getTodayIso(),
-      });
-      setStatusMsg(
-        `Sesiones del ${res.target_date}: ${res.created_count} creadas, ${res.existing_count} ya existían.`
+      await cargarDatosAcademicos();
+    } catch (errorHorario) {
+      establecerMensajeError(
+        errorHorario instanceof Error ? errorHorario.message : "Error agregando horario."
       );
-      await onRefreshOrg();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudieron generar las sesiones.");
     }
   }
 
-  async function handleOpenCourseKiosk(courseId: number) {
-    setErrorMsg(null);
+  /** Elimina un bloque horario semanal específico. */
+  async function manejarEliminarHorario(idHorario: number) {
+    establecerMensajeError(null);
     try {
-      const sess = await api.startCourseSession(courseId, { session_date: getTodayIso() });
-      await onRefreshOrg();
-      onOpenSessionInKiosk(sess.id);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo abrir la sesión en Kiosco.");
+      await clienteApi.eliminarHorario(idHorario);
+      await cargarDatosAcademicos();
+    } catch (errorEliminacion) {
+      establecerMensajeError(
+        errorEliminacion instanceof Error
+          ? errorEliminacion.message
+          : "Error eliminando horario."
+      );
     }
   }
 
-  const selectedCareerForNewGroup = careers.find((c) => String(c.id) === groupCareerId);
-  const newGroupPeriodMeta = getPeriodMeta(
-    groupPeriodType || selectedCareerForNewGroup?.effective_period_type || orgPeriodType
-  );
-  const orgPeriodMeta = getPeriodMeta(orgPeriodType);
+  /** Elimina la asignación completa de una materia en un grupo. */
+  async function manejarEliminarCurso(idCurso: number) {
+    establecerMensajeError(null);
+    try {
+      await clienteApi.eliminarCurso(idCurso);
+      await Promise.all([cargarDatosAcademicos(), alRecargarOrganizacion()]);
+    } catch (errorEliminacion) {
+      establecerMensajeError(
+        errorEliminacion instanceof Error
+          ? errorEliminacion.message
+          : "Error eliminando asignación."
+      );
+    }
+  }
 
-  const sortedBySubject = stats
-    ? [...stats.by_subject].sort((a, b) => {
-        const dir = subjectSortAsc ? 1 : -1;
-        let cmp = 0;
-        if (subjectSortBy === "career_period") {
-          cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
-          if (cmp === 0) cmp = comparePeriodsNatural(a.semester, b.semester);
-          if (cmp === 0) cmp = a.subject_name.localeCompare(b.subject_name, "es");
-        } else if (subjectSortBy === "period_career") {
-          cmp = comparePeriodsNatural(a.semester, b.semester);
-          if (cmp === 0) cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
-          if (cmp === 0) cmp = a.subject_name.localeCompare(b.subject_name, "es");
-        } else if (subjectSortBy === "rate") {
-          cmp = a.attendance_rate - b.attendance_rate;
+  /** Genera en lote todas las sesiones programadas para la fecha de hoy. */
+  async function manejarGenerarSesionesHoy() {
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
+    try {
+      const respuesta = await clienteApi.generarSesionesAcademicas({
+        id_organizacion: organizacion.id,
+        fecha_objetivo: obtenerHoyIso(),
+      });
+      establecerMensajeEstado(
+        `Sesiones del ${respuesta.fecha_objetivo}: ${respuesta.cantidad_creadas} creadas, ${respuesta.cantidad_existentes} ya existían.`
+      );
+      await alRecargarOrganizacion();
+    } catch (errorGeneracion) {
+      establecerMensajeError(
+        errorGeneracion instanceof Error
+          ? errorGeneracion.message
+          : "No se pudieron generar las sesiones."
+      );
+    }
+  }
+
+  /** Abre o reutiliza la sesión de clase del día y redirige al kiosco biométrico. */
+  async function manejarAbrirCursoEnKiosco(idCurso: number) {
+    establecerMensajeError(null);
+    try {
+      const sesion = await clienteApi.iniciarSesionCurso(idCurso, {
+        fecha_sesion: obtenerHoyIso(),
+      });
+      await alRecargarOrganizacion();
+      alAbrirSesionEnKiosco(sesion.id);
+    } catch (errorApertura) {
+      establecerMensajeError(
+        errorApertura instanceof Error
+          ? errorApertura.message
+          : "No se pudo abrir la sesión en Kiosco."
+      );
+    }
+  }
+
+  const carreraSeleccionadaNuevoGrupo = carreras.find(
+    (carrera) => String(carrera.id) === idCarreraGrupo
+  );
+  const metadatosPeriodoNuevoGrupo = obtenerMetadatosPeriodo(
+    tipoPeriodoGrupo ||
+      carreraSeleccionadaNuevoGrupo?.tipo_periodo_efectivo ||
+      tipoPeriodoOrg
+  );
+  const metadatosPeriodoOrg = obtenerMetadatosPeriodo(tipoPeriodoOrg);
+
+  const materiasOrdenadas = estadisticas
+    ? [...estadisticas.por_materia].sort((primerItem, segundoItem) => {
+        const direccion = ordenMateriaAscendente ? 1 : -1;
+        let comparacion = 0;
+        if (ordenMateriaPor === "career_period") {
+          comparacion = (primerItem.nombre_carrera ?? "ZZZ").localeCompare(
+            segundoItem.nombre_carrera ?? "ZZZ",
+            "es"
+          );
+          if (comparacion === 0)
+            comparacion = compararPeriodosNatural(
+              primerItem.semestre,
+              segundoItem.semestre
+            );
+          if (comparacion === 0)
+            comparacion = primerItem.nombre_materia.localeCompare(
+              segundoItem.nombre_materia,
+              "es"
+            );
+        } else if (ordenMateriaPor === "period_career") {
+          comparacion = compararPeriodosNatural(
+            primerItem.semestre,
+            segundoItem.semestre
+          );
+          if (comparacion === 0) {
+            comparacion = (primerItem.nombre_carrera ?? "ZZZ").localeCompare(
+              segundoItem.nombre_carrera ?? "ZZZ",
+              "es"
+            );
+          }
+          if (comparacion === 0)
+            comparacion = primerItem.nombre_materia.localeCompare(
+              segundoItem.nombre_materia,
+              "es"
+            );
+        } else if (ordenMateriaPor === "rate") {
+          comparacion = primerItem.tasa_asistencia - segundoItem.tasa_asistencia;
         } else {
-          cmp = a.subject_name.localeCompare(b.subject_name, "es");
+          comparacion = primerItem.nombre_materia.localeCompare(
+            segundoItem.nombre_materia,
+            "es"
+          );
         }
-        return cmp * dir;
+        return comparacion * direccion;
       })
     : [];
 
-  const sortedByGroup = stats
-    ? [...stats.by_group].sort((a, b) => {
-        const dir = groupSortAsc ? 1 : -1;
-        let cmp = 0;
-        if (groupSortBy === "career_period") {
-          cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
-          if (cmp === 0) cmp = comparePeriodsNatural(a.semester, b.semester);
-          if (cmp === 0) cmp = a.group_name.localeCompare(b.group_name, "es", { numeric: true });
-        } else if (groupSortBy === "period_career") {
-          cmp = comparePeriodsNatural(a.semester, b.semester);
-          if (cmp === 0) cmp = (a.career_name ?? "ZZZ").localeCompare(b.career_name ?? "ZZZ", "es");
-          if (cmp === 0) cmp = a.group_name.localeCompare(b.group_name, "es", { numeric: true });
-        } else if (groupSortBy === "rate") {
-          cmp = a.overall_attendance_rate - b.overall_attendance_rate;
+  const gruposOrdenados = estadisticas
+    ? [...estadisticas.por_grupo].sort((primerGrupo, segundoGrupo) => {
+        const direccion = ordenGrupoAscendente ? 1 : -1;
+        let comparacion = 0;
+        if (ordenGrupoPor === "career_period") {
+          comparacion = (primerGrupo.nombre_carrera ?? "ZZZ").localeCompare(
+            segundoGrupo.nombre_carrera ?? "ZZZ",
+            "es"
+          );
+          if (comparacion === 0)
+            comparacion = compararPeriodosNatural(
+              primerGrupo.semestre,
+              segundoGrupo.semestre
+            );
+          if (comparacion === 0) {
+            comparacion = primerGrupo.nombre_grupo.localeCompare(
+              segundoGrupo.nombre_grupo,
+              "es",
+              { numeric: true }
+            );
+          }
+        } else if (ordenGrupoPor === "period_career") {
+          comparacion = compararPeriodosNatural(
+            primerGrupo.semestre,
+            segundoGrupo.semestre
+          );
+          if (comparacion === 0) {
+            comparacion = (primerGrupo.nombre_carrera ?? "ZZZ").localeCompare(
+              segundoGrupo.nombre_carrera ?? "ZZZ",
+              "es"
+            );
+          }
+          if (comparacion === 0) {
+            comparacion = primerGrupo.nombre_grupo.localeCompare(
+              segundoGrupo.nombre_grupo,
+              "es",
+              { numeric: true }
+            );
+          }
+        } else if (ordenGrupoPor === "rate") {
+          comparacion =
+            primerGrupo.tasa_asistencia_general - segundoGrupo.tasa_asistencia_general;
         } else {
-          cmp = a.group_name.localeCompare(b.group_name, "es", { numeric: true });
+          comparacion = primerGrupo.nombre_grupo.localeCompare(
+            segundoGrupo.nombre_grupo,
+            "es",
+            { numeric: true }
+          );
         }
-        return cmp * dir;
+        return comparacion * direccion;
       })
     : [];
 
@@ -733,14 +974,14 @@ export function AcademicPage({
             Estructura Académica y Estadísticas
           </h2>
           <p className="text-sm text-slate-400">
-            Jerarquía: Institución ({orgPeriodMeta.label}) → Carrera → Grupo → Materias,
-            Profesores y Horarios
+            Jerarquía: Institución ({metadatosPeriodoOrg.etiqueta}) → Carrera → Grupo →
+            Materias, Profesores y Horarios
           </p>
         </div>
 
         <button
           type="button"
-          onClick={() => void handleGenerateTodaySessions()}
+          onClick={() => void manejarGenerarSesionesHoy()}
           className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold"
         >
           <CalendarCheck className="w-4 h-4" />
@@ -751,48 +992,50 @@ export function AcademicPage({
       {/* Sub-pestañas */}
       <div className="flex flex-wrap gap-2 bg-slate-900 border border-slate-800 rounded-xl p-1.5 w-fit">
         {[
-          { id: "structure" as const, label: "Carreras y Grupos", icon: Layers },
-          { id: "courses" as const, label: "Materias y Horarios", icon: BookOpen },
-          { id: "stats" as const, label: "Estadísticas", icon: BarChart3 },
-        ].map((tab) => {
-          const Icon = tab.icon;
-          const active = subTab === tab.id;
+          { id: "structure" as const, etiqueta: "Carreras y Grupos", icono: Layers },
+          { id: "courses" as const, etiqueta: "Materias y Horarios", icono: BookOpen },
+          { id: "stats" as const, etiqueta: "Estadísticas", icono: BarChart3 },
+        ].map((pestana) => {
+          const Icono = pestana.icono;
+          const activa = subPestana === pestana.id;
           return (
             <button
-              key={tab.id}
+              key={pestana.id}
               type="button"
-              onClick={() => setSubTab(tab.id)}
+              onClick={() => establecerSubPestana(pestana.id)}
               className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                active ? "bg-indigo-600 text-white" : "text-slate-300 hover:bg-slate-800"
+                activa ? "bg-indigo-600 text-white" : "text-slate-300 hover:bg-slate-800"
               }`}
             >
-              <Icon className="w-4 h-4" />
-              {tab.label}
+              <Icono className="w-4 h-4" />
+              {pestana.etiqueta}
             </button>
           );
         })}
       </div>
 
-      {statusMsg && (
+      {mensajeEstado && (
         <div className="rounded-xl bg-emerald-500/15 border border-emerald-500/40 px-4 py-3 text-sm text-emerald-200">
-          {statusMsg}
+          {mensajeEstado}
         </div>
       )}
-      {errorMsg && (
+      {mensajeError && (
         <div className="rounded-xl bg-red-500/15 border border-red-500/40 px-4 py-3 text-sm text-red-200">
-          {errorMsg}
+          {mensajeError}
         </div>
       )}
 
-      {loading ? (
-        <div className="py-10 text-center text-sm text-slate-400">Cargando estructura académica...</div>
+      {cargando ? (
+        <div className="py-10 text-center text-sm text-slate-400">
+          Cargando estructura académica...
+        </div>
       ) : (
         <>
-          {subTab === "structure" && (
+          {subPestana === "structure" && (
             <div className="space-y-6">
               {/* Periodo general de la institución */}
               <form
-                onSubmit={requestOrganizationPeriodChange}
+                onSubmit={solicitarCambioPeriodoOrganizacion}
                 className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4"
               >
                 <div>
@@ -803,24 +1046,30 @@ export function AcademicPage({
                     </span>
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Se hereda por defecto en carreras y grupos (cada carrera o grupo puede usar otro sistema; cambiarlo requiere contraseña admin).
+                    Se hereda por defecto en carreras y grupos (cada carrera o grupo puede
+                    usar otro sistema; cambiarlo requiere contraseña admin).
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
                   <select
-                    value={orgPeriodType}
-                    onChange={(e) => setOrgPeriodType(e.target.value as AcademicPeriodType)}
+                    value={tipoPeriodoOrg}
+                    onChange={(evento) =>
+                      establecerTipoPeriodoOrg(evento.target.value as TipoPeriodoAcademico)
+                    }
                     className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                   >
-                    {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
+                    {OPCIONES_PERIODO_ACADEMICO.map((opcion) => (
+                      <option key={opcion.valor} value={opcion.valor}>
+                        {opcion.etiqueta}
                       </option>
                     ))}
                   </select>
                   <button
                     type="submit"
-                    disabled={orgPeriodType === (organization.academic_period_type ?? "semestral")}
+                    disabled={
+                      tipoPeriodoOrg ===
+                      (organizacion.tipo_periodo_academico ?? "semestral")
+                    }
                     className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-semibold"
                   >
                     Cambiar periodo
@@ -831,7 +1080,7 @@ export function AcademicPage({
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Alta de Carrera */}
                 <form
-                  onSubmit={handleCreateCareer}
+                  onSubmit={manejarCrearCarrera}
                   className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
                 >
                   <h3 className="font-semibold text-base">Nueva Carrera</h3>
@@ -839,16 +1088,16 @@ export function AcademicPage({
                     <input
                       type="text"
                       required
-                      value={careerName}
-                      onChange={(e) => setCareerName(e.target.value)}
+                      value={nombreCarrera}
+                      onChange={(evento) => establecerNombreCarrera(evento.target.value)}
                       placeholder="Ej. Ingeniería en Software"
                       className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
                     <input
                       type="text"
                       required
-                      value={careerCode}
-                      onChange={(e) => setCareerCode(e.target.value)}
+                      value={codigoCarrera}
+                      onChange={(evento) => establecerCodigoCarrera(evento.target.value)}
                       placeholder="Código (ISW)"
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm uppercase"
                     />
@@ -856,20 +1105,26 @@ export function AcademicPage({
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                     <input
                       type="text"
-                      value={careerDesc}
-                      onChange={(e) => setCareerDesc(e.target.value)}
+                      value={descripcionCarrera}
+                      onChange={(evento) =>
+                        establecerDescripcionCarrera(evento.target.value)
+                      }
                       placeholder="Descripción opcional"
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
                     <select
-                      value={careerPeriodType}
-                      onChange={(e) => setCareerPeriodType(e.target.value)}
+                      value={tipoPeriodoCarrera}
+                      onChange={(evento) =>
+                        establecerTipoPeriodoCarrera(evento.target.value)
+                      }
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     >
-                      <option value="">Usar general ({orgPeriodMeta.label})</option>
-                      {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
+                      <option value="">
+                        Usar general ({metadatosPeriodoOrg.etiqueta})
+                      </option>
+                      {OPCIONES_PERIODO_ACADEMICO.map((opcion) => (
+                        <option key={opcion.valor} value={opcion.valor}>
+                          {opcion.etiqueta}
                         </option>
                       ))}
                     </select>
@@ -887,7 +1142,7 @@ export function AcademicPage({
 
                 {/* Alta de Grupo Académico */}
                 <form
-                  onSubmit={handleCreateGroup}
+                  onSubmit={manejarCrearGrupo}
                   className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
                 >
                   <h3 className="font-semibold text-base">Nuevo Grupo Académico</h3>
@@ -895,67 +1150,80 @@ export function AcademicPage({
                     <input
                       type="text"
                       required
-                      value={groupName}
-                      onChange={(e) => setGroupName(e.target.value)}
+                      value={nombreGrupo}
+                      onChange={(evento) => establecerNombreGrupo(evento.target.value)}
                       placeholder="Nombre (Ej. 21026 IS)"
                       className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
                     <input
                       type="text"
                       required
-                      value={groupCode}
-                      onChange={(e) => setGroupCode(e.target.value)}
+                      value={codigoGrupo}
+                      onChange={(evento) => establecerCodigoGrupo(evento.target.value)}
                       placeholder="Código"
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
                     <select
-                      value={groupCareerId}
-                      onChange={(e) => setGroupCareerId(e.target.value)}
+                      value={idCarreraGrupo}
+                      onChange={(evento) => establecerIdCarreraGrupo(evento.target.value)}
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     >
                       <option value="">Sin carrera vinculada</option>
-                      {careers.map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.name} ({c.code})
+                      {carreras.map((carrera) => (
+                        <option key={carrera.id} value={carrera.id}>
+                          {carrera.nombre} ({carrera.codigo})
                         </option>
                       ))}
                     </select>
                     <select
-                      value={groupPeriodType}
-                      onChange={(e) => setGroupPeriodType(e.target.value)}
+                      value={tipoPeriodoGrupo}
+                      onChange={(evento) =>
+                        establecerTipoPeriodoGrupo(evento.target.value)
+                      }
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       title="Tipo de periodo del grupo"
                     >
                       <option value="">
-                        Heredar ({getPeriodMeta(selectedCareerForNewGroup?.effective_period_type ?? orgPeriodType).label})
+                        Heredar (
+                        {
+                          obtenerMetadatosPeriodo(
+                            carreraSeleccionadaNuevoGrupo?.tipo_periodo_efectivo ??
+                              tipoPeriodoOrg
+                          ).etiqueta
+                        }
+                        )
                       </option>
-                      {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
+                      {OPCIONES_PERIODO_ACADEMICO.map((opcion) => (
+                        <option key={opcion.valor} value={opcion.valor}>
+                          {opcion.etiqueta}
                         </option>
                       ))}
                     </select>
                     <input
                       type="text"
-                      value={groupSemester}
-                      onChange={(e) => setGroupSemester(e.target.value)}
-                      placeholder={newGroupPeriodMeta.placeholder}
-                      title={newGroupPeriodMeta.singular}
+                      value={semestreGrupo}
+                      onChange={(evento) => establecerSemestreGrupo(evento.target.value)}
+                      placeholder={metadatosPeriodoNuevoGrupo.marcadorEjemplo}
+                      title={metadatosPeriodoNuevoGrupo.singular}
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
                     <input
                       type="text"
-                      value={groupDefaultClassroom}
-                      onChange={(e) => setGroupDefaultClassroom(e.target.value)}
+                      value={aulaDefectoGrupo}
+                      onChange={(evento) =>
+                        establecerAulaDefectoGrupo(evento.target.value)
+                      }
                       placeholder="Aula fija (ej. Aula 33)"
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
                   </div>
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] text-slate-400">
-                      Periodo aplicable: <strong>{newGroupPeriodMeta.singular}</strong> ({newGroupPeriodMeta.label})
+                      Periodo aplicable:{" "}
+                      <strong>{metadatosPeriodoNuevoGrupo.singular}</strong> (
+                      {metadatosPeriodoNuevoGrupo.etiqueta})
                     </span>
                     <button
                       type="submit"
@@ -970,56 +1238,71 @@ export function AcademicPage({
 
               {/* Árbol Carrera -> Grupos */}
               <div className="space-y-4">
-                {careers.length === 0 ? (
+                {carreras.length === 0 ? (
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center text-sm text-slate-400">
-                    Aún no hay carreras registradas. Crea la primera carrera arriba y vincula sus grupos.
+                    Aún no hay carreras registradas. Crea la primera carrera arriba y vincula
+                    sus grupos.
                   </div>
                 ) : (
-                  careers.map((career) => {
-                    const careerGroups = groups
-                      .filter((g) => g.career_id === career.id)
-                      .sort((a, b) => comparePeriodsNatural(a.semester, b.semester));
-                    const cMeta = getPeriodMeta(career.effective_period_type);
+                  carreras.map((carrera) => {
+                    const gruposCarrera = grupos
+                      .filter((grupo) => grupo.id_carrera === carrera.id)
+                      .sort((grupoA, grupoB) =>
+                        compararPeriodosNatural(grupoA.semestre, grupoB.semestre)
+                      );
+                    const metaCarrera = obtenerMetadatosPeriodo(
+                      carrera.tipo_periodo_efectivo
+                    );
                     return (
                       <div
-                        key={career.id}
+                        key={carrera.id}
                         className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
                       >
                         <div className="flex flex-wrap items-start justify-between gap-4">
                           <div>
                             <div className="flex items-center gap-2 flex-wrap">
                               <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-xs font-semibold">
-                                {career.code}
+                                {carrera.codigo}
                               </span>
-                              <h4 className="text-base font-bold">{career.name}</h4>
+                              <h4 className="text-base font-bold">{carrera.nombre}</h4>
                               <span className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[11px] text-slate-300">
-                                {cMeta.label}
-                                {career.period_type ? "" : " (heredado)"}
+                                {metaCarrera.etiqueta}
+                                {carrera.tipo_periodo ? "" : " (heredado)"}
                               </span>
                             </div>
-                            {career.description && (
-                              <p className="text-xs text-slate-400 mt-1">{career.description}</p>
+                            {carrera.descripcion && (
+                              <p className="text-xs text-slate-400 mt-1">
+                                {carrera.descripcion}
+                              </p>
                             )}
                           </div>
                           <div className="flex items-center gap-2">
                             <select
-                              value={career.period_type ?? ""}
-                              onChange={(e) =>
-                                requestCareerPeriodChange(career, e.target.value)
+                              value={carrera.tipo_periodo ?? ""}
+                              onChange={(evento) =>
+                                solicitarCambioPeriodoCarrera(carrera, evento.target.value)
                               }
                               className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
                               title="Tipo de periodo de esta carrera (requiere contraseña de administrador)"
                             >
-                              <option value="">Usar general ({getPeriodMeta(organization.academic_period_type).label})</option>
-                              {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
-                                <option key={opt.value} value={opt.value}>
-                                  {opt.label}
+                              <option value="">
+                                Usar general (
+                                {
+                                  obtenerMetadatosPeriodo(
+                                    organizacion.tipo_periodo_academico
+                                  ).etiqueta
+                                }
+                                )
+                              </option>
+                              {OPCIONES_PERIODO_ACADEMICO.map((opcion) => (
+                                <option key={opcion.valor} value={opcion.valor}>
+                                  {opcion.etiqueta}
                                 </option>
                               ))}
                             </select>
                             <button
                               type="button"
-                              onClick={() => void handleDeleteCareer(career.id)}
+                              onClick={() => void manejarEliminarCarrera(carrera.id)}
                               className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/10"
                               title="Eliminar carrera"
                             >
@@ -1028,51 +1311,63 @@ export function AcademicPage({
                           </div>
                         </div>
 
-                        {careerGroups.length === 0 ? (
+                        {gruposCarrera.length === 0 ? (
                           <p className="text-xs text-slate-500 italic">
                             Sin grupos vinculados todavía.
                           </p>
                         ) : (
                           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                            {careerGroups.map((g) => {
-                              const gMeta = getPeriodMeta(g.period_type);
-                              const formattedPeriod = formatGroupPeriodLabel(g.semester, g.period_type);
+                            {gruposCarrera.map((grupo) => {
+                              const metaGrupo = obtenerMetadatosPeriodo(grupo.tipo_periodo);
+                              const periodoFormateado = formatearEtiquetaPeriodoGrupo(
+                                grupo.semestre,
+                                grupo.tipo_periodo
+                              );
                               return (
                                 <div
-                                  key={g.id}
+                                  key={grupo.id}
                                   className="rounded-xl bg-slate-800/60 border border-slate-700/70 p-3.5 space-y-2"
                                 >
                                   <div className="flex items-start justify-between gap-2">
                                     <div>
                                       <p className="text-sm font-semibold">
-                                        {g.name}{" "}
+                                        {grupo.nombre}{" "}
                                         <span className="text-xs font-normal text-slate-400">
-                                          ({g.code})
+                                          ({grupo.codigo})
                                         </span>
                                       </p>
                                       <p className="text-xs text-slate-400 mt-0.5">
-                                        {formattedPeriod ? (
+                                        {periodoFormateado ? (
                                           <span className="text-indigo-300 font-medium">
-                                            {formattedPeriod}
-                                            {g.custom_period_type ? " (propio)" : ""} ·{" "}
+                                            {periodoFormateado}
+                                            {grupo.tipo_periodo_personalizado
+                                              ? " (propio)"
+                                              : ""}{" "}
+                                            ·{" "}
                                           </span>
                                         ) : (
                                           <span>
-                                            {gMeta.label}
-                                            {g.custom_period_type ? " (propio)" : ""} ·{" "}
+                                            {metaGrupo.etiqueta}
+                                            {grupo.tipo_periodo_personalizado
+                                              ? " (propio)"
+                                              : ""}{" "}
+                                            ·{" "}
                                           </span>
                                         )}
-                                        {g.default_classroom ? `${g.default_classroom} · ` : ""}
-                                        {g.members_count} alumnos · {g.courses_count} materias
+                                        {grupo.aula_defecto
+                                          ? `${grupo.aula_defecto} · `
+                                          : ""}
+                                        {grupo.cantidad_integrantes} alumnos ·{" "}
+                                        {grupo.cantidad_cursos} materias
                                       </p>
                                     </div>
                                     <div className="flex items-center gap-1">
                                       <button
                                         type="button"
                                         onClick={() =>
-                                          editingGroupId === g.id
-                                            ? setEditingGroupId(null)
-                                            : startEditGroup(g)
+                                          idGrupoEditando === grupo.id
+                                            ? establecerIdGrupoEditando(null)
+                                            : iniciarEdicionGrupo(grupo)
                                         }
                                         className="p-1 text-slate-500 hover:text-indigo-300"
                                         title="Editar periodo, tipo de periodo y aula fija"
@@ -1081,7 +1376,7 @@ export function AcademicPage({
                                       </button>
                                       <button
                                         type="button"
-                                        onClick={() => void handleDeleteGroup(g.id)}
+                                        onClick={() => void manejarEliminarGrupo(grupo.id)}
                                         className="p-1 text-slate-500 hover:text-red-400"
                                         title="Eliminar grupo"
                                       >
@@ -1090,41 +1385,58 @@ export function AcademicPage({
                                     </div>
                                   </div>
 
-                                  {editingGroupId === g.id && (
+                                  {idGrupoEditando === grupo.id && (
                                     <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-700/60">
                                       <select
-                                        value={editGroupPeriodType}
-                                        onChange={(e) => setEditGroupPeriodType(e.target.value)}
+                                        value={tipoPeriodoGrupoEditado}
+                                        onChange={(evento) =>
+                                          establecerTipoPeriodoGrupoEditado(
+                                            evento.target.value
+                                          )
+                                        }
                                         className="col-span-2 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
                                         title="Cambiar tipo de periodo requiere contraseña de administrador"
                                       >
-                                        <option value="">Heredar de carrera/institución</option>
-                                        {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
-                                          <option key={opt.value} value={opt.value}>
-                                            {opt.label}
+                                        <option value="">
+                                          Heredar de carrera/institución
+                                        </option>
+                                        {OPCIONES_PERIODO_ACADEMICO.map((opcion) => (
+                                          <option key={opcion.valor} value={opcion.valor}>
+                                            {opcion.etiqueta}
                                           </option>
                                         ))}
                                       </select>
                                       <input
                                         type="text"
-                                        value={editGroupSemester}
-                                        onChange={(e) => setEditGroupSemester(e.target.value)}
-                                        placeholder={`Núm. (${getPeriodMeta(editGroupPeriodType || g.period_type).prefix} ...)`}
+                                        value={semestreGrupoEditado}
+                                        onChange={(evento) =>
+                                          establecerSemestreGrupoEditado(
+                                            evento.target.value
+                                          )
+                                        }
+                                        placeholder={`Núm. (${
+                                          obtenerMetadatosPeriodo(
+                                            tipoPeriodoGrupoEditado || grupo.tipo_periodo
+                                          ).prefijo
+                                        } ...)`}
                                         className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
                                       />
                                       <input
                                         type="text"
-                                        value={editGroupClassroom}
-                                        onChange={(e) => setEditGroupClassroom(e.target.value)}
+                                        value={aulaGrupoEditada}
+                                        onChange={(evento) =>
+                                          establecerAulaGrupoEditada(evento.target.value)
+                                        }
                                         placeholder="Aula fija (ej. Aula 33)"
                                         className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
                                       />
                                       <button
                                         type="button"
-                                        onClick={() => void handleSaveGroupEdit(g)}
+                                        onClick={() => void manejarGuardarEdicionGrupo(grupo)}
                                         className="col-span-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold"
                                       >
-                                        {editGroupPeriodType !== (g.custom_period_type ?? "")
+                                        {tipoPeriodoGrupoEditado !==
+                                        (grupo.tipo_periodo_personalizado ?? "")
                                           ? "Continuar (requiere clave admin)"
                                           : "Guardar cambios"}
                                       </button>
@@ -1140,44 +1452,53 @@ export function AcademicPage({
                   })
                 )}
 
-                {groups.some((g) => g.career_id === null) && (
+                {grupos.some((grupo) => grupo.id_carrera === null) && (
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
-                    <h4 className="text-sm font-semibold text-slate-300">Grupos sin carrera asignada</h4>
+                    <h4 className="text-sm font-semibold text-slate-300">
+                      Grupos sin carrera asignada
+                    </h4>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                      {groups
-                        .filter((g) => g.career_id === null)
-                        .map((g) => {
-                          const gMeta = getPeriodMeta(g.period_type);
-                          const formattedPeriod = formatGroupPeriodLabel(g.semester, g.period_type);
+                      {grupos
+                        .filter((grupo) => grupo.id_carrera === null)
+                        .map((grupo) => {
+                          const metaGrupo = obtenerMetadatosPeriodo(grupo.tipo_periodo);
+                          const periodoFormateado = formatearEtiquetaPeriodoGrupo(
+                            grupo.semestre,
+                            grupo.tipo_periodo
+                          );
                           return (
                             <div
-                              key={g.id}
+                              key={grupo.id}
                               className="rounded-xl bg-slate-800/50 border border-slate-700/60 p-3 space-y-2"
                             >
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
                                   <p className="text-sm font-medium">
-                                    {g.name} <span className="text-xs text-slate-400">({g.code})</span>
+                                    {grupo.nombre}{" "}
+                                    <span className="text-xs text-slate-400">
+                                      ({grupo.codigo})
+                                    </span>
                                   </p>
                                   <p className="text-xs text-slate-400">
-                                    {formattedPeriod ? (
+                                    {periodoFormateado ? (
                                       <span className="text-indigo-300 font-medium">
-                                        {formattedPeriod} ·{" "}
+                                        {periodoFormateado} ·{" "}
                                       </span>
                                     ) : (
-                                      <span>{gMeta.label} · </span>
+                                      <span>{metaGrupo.etiqueta} · </span>
                                     )}
-                                    {g.default_classroom ? `${g.default_classroom} · ` : ""}
-                                    {g.members_count} alumnos · {g.courses_count} materias
+                                    {grupo.aula_defecto ? `${grupo.aula_defecto} · ` : ""}
+                                    {grupo.cantidad_integrantes} alumnos ·{" "}
+                                    {grupo.cantidad_cursos} materias
                                   </p>
                                 </div>
                                 <div className="flex items-center gap-1.5">
                                   <button
                                     type="button"
                                     onClick={() =>
-                                      editingGroupId === g.id
-                                        ? setEditingGroupId(null)
-                                        : startEditGroup(g)
+                                      idGrupoEditando === grupo.id
+                                        ? establecerIdGrupoEditando(null)
+                                        : iniciarEdicionGrupo(grupo)
                                     }
                                     className="p-1 text-slate-500 hover:text-indigo-300"
                                     title="Editar periodo, tipo de periodo y aula fija"
@@ -1186,53 +1507,73 @@ export function AcademicPage({
                                   </button>
                                   <select
                                     defaultValue=""
-                                    onChange={(e) => void handleLinkGroupCareer(g.id, e.target.value)}
+                                    onChange={(evento) =>
+                                      void manejarVincularGrupoACarrera(
+                                        grupo.id,
+                                        evento.target.value
+                                      )
+                                    }
                                     className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs"
                                   >
                                     <option value="">Asignar carrera...</option>
-                                    {careers.map((c) => (
-                                      <option key={c.id} value={c.id}>
-                                        {c.name}
+                                    {carreras.map((carrera) => (
+                                      <option key={carrera.id} value={carrera.id}>
+                                        {carrera.nombre}
                                       </option>
                                     ))}
                                   </select>
                                 </div>
                               </div>
 
-                              {editingGroupId === g.id && (
+                              {idGrupoEditando === grupo.id && (
                                 <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-700/60">
                                   <select
-                                    value={editGroupPeriodType}
-                                    onChange={(e) => setEditGroupPeriodType(e.target.value)}
+                                    value={tipoPeriodoGrupoEditado}
+                                    onChange={(evento) =>
+                                      establecerTipoPeriodoGrupoEditado(
+                                        evento.target.value
+                                      )
+                                    }
                                     className="col-span-2 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
                                   >
-                                    <option value="">Heredar de carrera/institución</option>
-                                    {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
-                                      <option key={opt.value} value={opt.value}>
-                                        {opt.label}
+                                    <option value="">
+                                      Heredar de carrera/institución
+                                    </option>
+                                    {OPCIONES_PERIODO_ACADEMICO.map((opcion) => (
+                                      <option key={opcion.valor} value={opcion.valor}>
+                                        {opcion.etiqueta}
                                       </option>
                                     ))}
                                   </select>
                                   <input
                                     type="text"
-                                    value={editGroupSemester}
-                                    onChange={(e) => setEditGroupSemester(e.target.value)}
-                                    placeholder={`Núm. (${getPeriodMeta(editGroupPeriodType || g.period_type).prefix} ...)`}
+                                    value={semestreGrupoEditado}
+                                    onChange={(evento) =>
+                                      establecerSemestreGrupoEditado(evento.target.value)
+                                    }
+                                    placeholder={`Núm. (${
+                                      obtenerMetadatosPeriodo(
+                                        tipoPeriodoGrupoEditado || grupo.tipo_periodo
+                                      ).prefijo
+                                    } ...)`}
                                     className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
                                   />
                                   <input
                                     type="text"
-                                    value={editGroupClassroom}
-                                    onChange={(e) => setEditGroupClassroom(e.target.value)}
+                                    value={aulaGrupoEditada}
+                                    onChange={(evento) =>
+                                      establecerAulaGrupoEditada(evento.target.value)
+                                    }
                                     placeholder="Aula fija (ej. Aula 33)"
                                     className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
                                   />
                                   <button
                                     type="button"
-                                    onClick={() => void handleSaveGroupEdit(g)}
+                                    onClick={() => void manejarGuardarEdicionGrupo(grupo)}
                                     className="col-span-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold"
                                   >
-                                    {editGroupPeriodType !== (g.custom_period_type ?? "")
+                                    {tipoPeriodoGrupoEditado !==
+                                    (grupo.tipo_periodo_personalizado ?? "")
                                       ? "Continuar (requiere clave admin)"
                                       : "Guardar cambios"}
                                   </button>
@@ -1248,41 +1589,43 @@ export function AcademicPage({
             </div>
           )}
 
-          {subTab === "courses" && (
+          {subPestana === "courses" && (
             <div className="space-y-6">
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Catálogo de Asignaturas */}
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
                   <h3 className="font-semibold text-base">Catálogo de Asignaturas</h3>
-                  <form onSubmit={handleCreateSubject} className="space-y-2.5">
+                  <form onSubmit={manejarCrearMateria} className="space-y-2.5">
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                       <input
                         type="text"
                         required
-                        value={subjectName}
-                        onChange={(e) => setSubjectName(e.target.value)}
+                        value={nombreMateria}
+                        onChange={(evento) => establecerNombreMateria(evento.target.value)}
                         placeholder="Ej. Arquitectura de Software"
                         className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       />
                       <input
                         type="text"
                         required
-                        value={subjectCode}
-                        onChange={(e) => setSubjectCode(e.target.value)}
+                        value={codigoMateria}
+                        onChange={(evento) => establecerCodigoMateria(evento.target.value)}
                         placeholder="Clave (ARQ-101)"
                         className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm uppercase"
                       />
                     </div>
                     <div className="flex gap-2.5">
                       <select
-                        value={subjectCareerId}
-                        onChange={(e) => setSubjectCareerId(e.target.value)}
+                        value={idCarreraMateria}
+                        onChange={(evento) =>
+                          establecerIdCarreraMateria(evento.target.value)
+                        }
                         className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       >
                         <option value="">Carrera general / Todas</option>
-                        {careers.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.name}
+                        {carreras.map((carrera) => (
+                          <option key={carrera.id} value={carrera.id}>
+                            {carrera.nombre}
                           </option>
                         ))}
                       </select>
@@ -1297,23 +1640,27 @@ export function AcademicPage({
                   </form>
 
                   <div className="space-y-2 max-h-64 overflow-y-auto">
-                    {subjects.map((subj) => (
+                    {materias.map((materia) => (
                       <div
-                        key={subj.id}
+                        key={materia.id}
                         className="flex items-center justify-between px-3 py-2 rounded-xl bg-slate-800/50 border border-slate-800"
                       >
                         <div>
                           <p className="text-sm font-medium">
-                            {subj.name}{" "}
-                            <span className="text-xs text-indigo-300">({subj.code})</span>
+                            {materia.nombre}{" "}
+                            <span className="text-xs text-indigo-300">
+                              ({materia.codigo})
+                            </span>
                           </p>
-                          {subj.career_name && (
-                            <p className="text-[11px] text-slate-400">{subj.career_name}</p>
+                          {materia.nombre_carrera && (
+                            <p className="text-[11px] text-slate-400">
+                              {materia.nombre_carrera}
+                            </p>
                           )}
                         </div>
                         <button
                           type="button"
-                          onClick={() => void handleDeleteSubject(subj.id)}
+                          onClick={() => void manejarEliminarMateria(materia.id)}
                           className="p-1 text-slate-400 hover:text-red-400"
                           title="Eliminar asignatura"
                         >
@@ -1321,7 +1668,7 @@ export function AcademicPage({
                         </button>
                       </div>
                     ))}
-                    {subjects.length === 0 && (
+                    {materias.length === 0 && (
                       <p className="text-xs text-slate-500 text-center py-4">
                         Agrega las materias que se imparten en la institución.
                       </p>
@@ -1331,50 +1678,58 @@ export function AcademicPage({
 
                 {/* Vincular Grupo + Materia + Profesor + Múltiples Días */}
                 <form
-                  onSubmit={handleCreateCourse}
+                  onSubmit={manejarCrearCurso}
                   className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
                 >
                   <h3 className="font-semibold text-base">
                     Asignar Materia y Profesor a un Grupo
                   </h3>
 
-                  {teachers.filter((t) => t.role === "teacher").length === 0 && (
+                  {docentes.filter((docente) => docente.rol === "teacher").length ===
+                    0 && (
                     <div className="rounded-xl bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-xs text-amber-200">
                       Tip: crea cuentas con rol <strong>Profesor</strong> en la pestaña{" "}
-                      <em>Seguridad y Usuarios</em> para que cada docente vea únicamente sus materias.
+                      <em>Seguridad y Usuarios</em> para que cada docente vea únicamente sus
+                      materias.
                     </div>
                   )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                     <div>
-                      <label className="block text-[11px] text-slate-400 mb-1">Grupo</label>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Grupo
+                      </label>
                       <select
                         required
-                        value={courseGroupId}
-                        onChange={(e) => handleSelectCourseGroup(e.target.value)}
+                        value={idGrupoCurso}
+                        onChange={(evento) =>
+                          manejarSeleccionarGrupoCurso(evento.target.value)
+                        }
                         className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       >
                         <option value="">Selecciona grupo...</option>
-                        {groups.map((g) => (
-                          <option key={g.id} value={g.id}>
-                            {g.name} ({g.code})
-                            {g.default_classroom ? ` · ${g.default_classroom}` : ""}
+                        {grupos.map((grupo) => (
+                          <option key={grupo.id} value={grupo.id}>
+                            {grupo.nombre} ({grupo.codigo})
+                            {grupo.aula_defecto ? ` · ${grupo.aula_defecto}` : ""}
                           </option>
                         ))}
                       </select>
                     </div>
                     <div>
-                      <label className="block text-[11px] text-slate-400 mb-1">Asignatura</label>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Asignatura
+                      </label>
                       <select
                         required
-                        value={courseSubjectId}
-                        onChange={(e) => setCourseSubjectId(e.target.value)}
+                        value={idMateriaCurso}
+                        onChange={(evento) => establecerIdMateriaCurso(evento.target.value)}
                         className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       >
                         <option value="">Selecciona materia...</option>
-                        {subjects.map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name} ({s.code})
+                        {materias.map((materia) => (
+                          <option key={materia.id} value={materia.id}>
+                            {materia.nombre} ({materia.codigo})
                           </option>
                         ))}
                       </select>
@@ -1383,16 +1738,19 @@ export function AcademicPage({
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                     <div>
-                      <label className="block text-[11px] text-slate-400 mb-1">Profesor</label>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Profesor
+                      </label>
                       <select
-                        value={courseTeacherId}
-                        onChange={(e) => setCourseTeacherId(e.target.value)}
+                        value={idDocenteCurso}
+                        onChange={(evento) => establecerIdDocenteCurso(evento.target.value)}
                         className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       >
                         <option value="">Sin asignar aún</option>
-                        {teachers.map((t) => (
-                          <option key={t.id} value={t.id}>
-                            {t.full_name} ({t.role === "teacher" ? "Profesor" : "Admin"})
+                        {docentes.map((docente) => (
+                          <option key={docente.id} value={docente.id}>
+                            {docente.nombre_completo} (
+                            {docente.rol === "teacher" ? "Profesor" : "Admin"})
                           </option>
                         ))}
                       </select>
@@ -1403,8 +1761,10 @@ export function AcademicPage({
                       </label>
                       <input
                         type="text"
-                        value={courseTerm}
-                        onChange={(e) => setCourseTerm(e.target.value)}
+                        value={periodoLectivoCurso}
+                        onChange={(evento) =>
+                          establecerPeriodoLectivoCurso(evento.target.value)
+                        }
                         placeholder="Ej. 2026-3"
                         className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                       />
@@ -1417,25 +1777,26 @@ export function AcademicPage({
                         Días y horario de clase (marca uno o varios días)
                       </p>
                       <span className="text-[11px] text-slate-400">
-                        {selectedDays.length} día{selectedDays.length === 1 ? "" : "s"}
+                        {diasSeleccionados.length} día
+                        {diasSeleccionados.length === 1 ? "" : "s"}
                       </span>
                     </div>
 
                     <div className="flex flex-wrap gap-1.5">
-                      {WEEKDAYS.map((d) => {
-                        const active = selectedDays.includes(d.value);
+                      {DIAS_SEMANA.map((dia) => {
+                        const activo = diasSeleccionados.includes(dia.valor);
                         return (
                           <button
-                            key={d.value}
+                            key={dia.valor}
                             type="button"
-                            onClick={() => toggleSelectedDay(d.value)}
+                            onClick={() => alternarDiaSeleccionado(dia.valor)}
                             className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
-                              active
+                              activo
                                 ? "bg-indigo-600 border-indigo-500 text-white"
                                 : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
                             }`}
                           >
-                            {d.short}
+                            {dia.corto}
                           </button>
                         );
                       })}
@@ -1443,20 +1804,28 @@ export function AcademicPage({
 
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end">
                       <div>
-                        <label className="block text-[10px] text-slate-400 mb-1">Inicio</label>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Inicio
+                        </label>
                         <input
                           type="time"
-                          value={initStart}
-                          onChange={(e) => setInitStart(e.target.value)}
+                          value={horaInicioInicial}
+                          onChange={(evento) =>
+                            establecerHoraInicioInicial(evento.target.value)
+                          }
                           className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
                         />
                       </div>
                       <div>
-                        <label className="block text-[10px] text-slate-400 mb-1">Fin</label>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Fin
+                        </label>
                         <input
                           type="time"
-                          value={initEnd}
-                          onChange={(e) => setInitEnd(e.target.value)}
+                          value={horaFinInicial}
+                          onChange={(evento) =>
+                            establecerHoraFinInicial(evento.target.value)
+                          }
                           className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
                         />
                       </div>
@@ -1466,16 +1835,16 @@ export function AcademicPage({
                         </label>
                         <input
                           type="text"
-                          value={initClassroom}
-                          onChange={(e) => setInitClassroom(e.target.value)}
+                          value={aulaInicial}
+                          onChange={(evento) => establecerAulaInicial(evento.target.value)}
                           placeholder="Aula / Lab"
                           className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs"
                         />
                       </div>
                       <button
                         type="button"
-                        disabled={selectedDays.length === 0}
-                        onClick={appendSelectedDaysToPending}
+                        disabled={diasSeleccionados.length === 0}
+                        onClick={agregarDiasSeleccionadosAPendientes}
                         className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 border border-emerald-400/50 text-white shadow-md shadow-emerald-950/50 ring-1 ring-emerald-400/30 disabled:opacity-40 disabled:shadow-none text-xs font-semibold transition-all"
                         title="Añade estos días para combinar con otros horarios o aulas distintas"
                       >
@@ -1484,24 +1853,27 @@ export function AcademicPage({
                       </button>
                     </div>
 
-                    {pendingSchedules.length > 0 && (
+                    {horariosPendientes.length > 0 && (
                       <div className="space-y-1.5 rounded-xl bg-slate-800/40 border border-slate-800 p-2.5">
                         <p className="text-[11px] text-slate-400">
-                          Horarios acumulados para esta materia ({pendingSchedules.length}):
+                          Horarios acumulados para esta materia (
+                          {horariosPendientes.length}):
                         </p>
                         <div className="flex flex-wrap gap-1.5">
-                          {pendingSchedules.map((sl, idx) => (
+                          {horariosPendientes.map((bloque, indice) => (
                             <span
-                              key={`${sl.day_of_week}-${sl.start_time}-${idx}`}
+                              key={`${bloque.dia_semana}-${bloque.hora_inicio}-${indice}`}
                               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-500/15 border border-indigo-500/30 text-[11px] text-indigo-200"
                             >
-                              <strong>{dayLabel(sl.day_of_week)}</strong> {sl.start_time}–
-                              {sl.end_time}
-                              {sl.classroom ? ` · ${sl.classroom}` : ""}
+                              <strong>{etiquetaDiaSemana(bloque.dia_semana)}</strong>{" "}
+                              {bloque.hora_inicio}–{bloque.hora_fin}
+                              {bloque.aula ? ` · ${bloque.aula}` : ""}
                               <button
                                 type="button"
                                 onClick={() =>
-                                  setPendingSchedules((prev) => prev.filter((_, i) => i !== idx))
+                                  establecerHorariosPendientes((previos) =>
+                                    previos.filter((_, pos) => pos !== indice)
+                                  )
                                 }
                                 className="text-indigo-300 hover:text-white"
                               >
@@ -1523,52 +1895,60 @@ export function AcademicPage({
                 </form>
               </div>
 
-              {/* Lista de asignaciones activas con bloques de horario */}
+              {/* Lista de asignaciones activas con editor inline de bloques */}
               <div className="space-y-3">
                 <h3 className="font-semibold text-base">
-                  Asignaciones y Horarios ({courses.length})
+                  Asignaciones y Horarios ({cursos.length})
                 </h3>
 
-                {courses.length === 0 ? (
+                {cursos.length === 0 ? (
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center text-sm text-slate-400">
                     No hay asignaturas vinculadas a grupos todavía.
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {courses.map((course) => {
-                      const draft = getCourseScheduleDraft(course);
-                      const inlineClassroom =
-                        draft.classroom ?? course.group_default_classroom ?? "";
+                    {cursos.map((curso) => {
+                      const borrador = obtenerBorradorHorarioCurso(curso);
+                      const aulaInline =
+                        borrador.aula ?? curso.aula_defecto_grupo ?? "";
                       return (
                         <div
-                          key={course.id}
+                          key={curso.id}
                           className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
                         >
                           <div className="flex items-start justify-between gap-2">
                             <div>
                               <div className="flex items-center gap-2 flex-wrap">
                                 <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-xs font-semibold">
-                                  {course.subject_code}
+                                  {curso.codigo_materia}
                                 </span>
-                                <h4 className="font-bold text-base">{course.subject_name}</h4>
+                                <h4 className="font-bold text-base">
+                                  {curso.nombre_materia}
+                                </h4>
                               </div>
                               <p className="text-xs text-slate-400 mt-1">
-                                Grupo: <strong className="text-slate-200">{course.group_name}</strong>
-                                {course.career_name ? ` · ${course.career_name}` : ""}
-                                {course.semester
-                                  ? ` · ${formatGroupPeriodLabel(course.semester, course.period_type)}`
+                                Grupo:{" "}
+                                <strong className="text-slate-200">
+                                  {curso.nombre_grupo}
+                                </strong>
+                                {curso.nombre_carrera ? ` · ${curso.nombre_carrera}` : ""}
+                                {curso.semestre
+                                  ? ` · ${formatearEtiquetaPeriodoGrupo(
+                                      curso.semestre,
+                                      curso.tipo_periodo
+                                    )}`
                                   : ""}
-                                {course.group_default_classroom
-                                  ? ` · Aula base: ${course.group_default_classroom}`
+                                {curso.aula_defecto_grupo
+                                  ? ` · Aula base: ${curso.aula_defecto_grupo}`
                                   : ""}{" "}
-                                · {course.students_count} alumnos heredados
+                                · {curso.cantidad_estudiantes} alumnos heredados
                               </p>
                             </div>
 
                             <div className="flex items-center gap-1.5">
                               <button
                                 type="button"
-                                onClick={() => void handleOpenCourseKiosk(course.id)}
+                                onClick={() => void manejarAbrirCursoEnKiosco(curso.id)}
                                 className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600/20 border border-emerald-500/40 hover:bg-emerald-600/30 text-emerald-300 text-xs font-semibold"
                                 title="Abrir pase de lista en Kiosco"
                               >
@@ -1577,7 +1957,7 @@ export function AcademicPage({
                               </button>
                               <button
                                 type="button"
-                                onClick={() => void handleDeleteCourse(course.id)}
+                                onClick={() => void manejarEliminarCurso(curso.id)}
                                 className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/10"
                                 title="Eliminar asignación"
                               >
@@ -1589,37 +1969,43 @@ export function AcademicPage({
                           <div className="flex items-center gap-2 text-xs">
                             <span className="text-slate-400">Profesor:</span>
                             <select
-                              value={course.teacher_user_id ?? ""}
-                              onChange={(e) => void handleReassignTeacher(course.id, e.target.value)}
+                              value={curso.id_usuario_docente ?? ""}
+                              onChange={(evento) =>
+                                void manejarReasignarDocente(curso.id, evento.target.value)
+                              }
                               className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
                             >
                               <option value="">Sin profesor asignado</option>
-                              {teachers.map((t) => (
-                                <option key={t.id} value={t.id}>
-                                  {t.full_name}
+                              {docentes.map((docente) => (
+                                <option key={docente.id} value={docente.id}>
+                                  {docente.nombre_completo}
                                 </option>
                               ))}
                             </select>
                           </div>
 
-                          {/* Bloques de horario */}
+                          {/* Bloques de horario semanales */}
                           <div className="space-y-1.5 pt-1">
-                            {course.schedules.map((sl) => (
+                            {curso.horarios.map((horario) => (
                               <div
-                                key={sl.id}
+                                key={horario.id}
                                 className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-slate-800/60 text-xs"
                               >
                                 <span className="flex items-center gap-2">
                                   <Clock className="w-3.5 h-3.5 text-indigo-400" />
-                                  <strong>{dayLabel(sl.day_of_week)}</strong> {sl.start_time} –{" "}
-                                  {sl.end_time}
-                                  {sl.classroom && (
-                                    <span className="text-slate-400">· {sl.classroom}</span>
+                                  <strong>
+                                    {etiquetaDiaSemana(horario.dia_semana)}
+                                  </strong>{" "}
+                                  {horario.hora_inicio} – {horario.hora_fin}
+                                  {horario.aula && (
+                                    <span className="text-slate-400">
+                                      · {horario.aula}
+                                    </span>
                                   )}
                                 </span>
                                 <button
                                   type="button"
-                                  onClick={() => void handleDeleteSchedule(sl.id)}
+                                  onClick={() => void manejarEliminarHorario(horario.id)}
                                   className="text-slate-500 hover:text-red-400"
                                   title="Quitar bloque"
                                 >
@@ -1630,21 +2016,23 @@ export function AcademicPage({
 
                             <div className="pt-1.5 space-y-1.5 border-t border-slate-800/70">
                               <div className="flex flex-wrap gap-1">
-                                {WEEKDAYS.map((d) => {
-                                  const checked = draft.days.includes(d.value);
+                                {DIAS_SEMANA.map((dia) => {
+                                  const marcado = borrador.dias.includes(dia.valor);
                                   return (
                                     <button
-                                      key={d.value}
+                                      key={dia.valor}
                                       type="button"
-                                      onClick={() => toggleInlineDraftDay(course, d.value)}
+                                      onClick={() =>
+                                        alternarDiaBorradorInline(curso, dia.valor)
+                                      }
                                       className={`px-2 py-0.5 rounded text-[11px] font-medium border ${
-                                        checked
+                                        marcado
                                           ? "bg-indigo-600 border-indigo-500 text-white"
                                           : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
                                       }`}
-                                      title={d.label}
+                                      title={dia.etiqueta}
                                     >
-                                      {d.mini}
+                                      {dia.inicial}
                                     </button>
                                   );
                                 })}
@@ -1652,33 +2040,42 @@ export function AcademicPage({
                               <div className="grid grid-cols-4 gap-1.5">
                                 <input
                                   type="time"
-                                  value={draft.start}
-                                  onChange={(e) =>
-                                    setScheduleDrafts((prev) => ({
-                                      ...prev,
-                                      [course.id]: { ...draft, start: e.target.value },
+                                  value={borrador.inicio}
+                                  onChange={(evento) =>
+                                    establecerBorradoresHorarioCurso((previos) => ({
+                                      ...previos,
+                                      [curso.id]: {
+                                        ...borrador,
+                                        inicio: evento.target.value,
+                                      },
                                     }))
                                   }
                                   className="bg-slate-800 border border-slate-700 rounded px-1.5 py-1 text-[11px]"
                                 />
                                 <input
                                   type="time"
-                                  value={draft.end}
-                                  onChange={(e) =>
-                                    setScheduleDrafts((prev) => ({
-                                      ...prev,
-                                      [course.id]: { ...draft, end: e.target.value },
+                                  value={borrador.fin}
+                                  onChange={(evento) =>
+                                    establecerBorradoresHorarioCurso((previos) => ({
+                                      ...previos,
+                                      [curso.id]: {
+                                        ...borrador,
+                                        fin: evento.target.value,
+                                      },
                                     }))
                                   }
                                   className="bg-slate-800 border border-slate-700 rounded px-1.5 py-1 text-[11px]"
                                 />
                                 <input
                                   type="text"
-                                  value={inlineClassroom}
-                                  onChange={(e) =>
-                                    setScheduleDrafts((prev) => ({
-                                      ...prev,
-                                      [course.id]: { ...draft, classroom: e.target.value },
+                                  value={aulaInline}
+                                  onChange={(evento) =>
+                                    establecerBorradoresHorarioCurso((previos) => ({
+                                      ...previos,
+                                      [curso.id]: {
+                                        ...borrador,
+                                        aula: evento.target.value,
+                                      },
                                     }))
                                   }
                                   placeholder="Aula"
@@ -1686,7 +2083,9 @@ export function AcademicPage({
                                 />
                                 <button
                                   type="button"
-                                  onClick={() => void handleAddSchedulesToCourse(course)}
+                                  onClick={() =>
+                                    void manejarAgregarHorariosACurso(curso)
+                                  }
                                   className="inline-flex items-center justify-center gap-1 rounded bg-emerald-600 hover:bg-emerald-500 border border-emerald-400/40 text-white text-[11px] font-semibold px-2 py-1 shadow-sm"
                                 >
                                   <Plus className="w-3 h-3" />
@@ -1704,7 +2103,7 @@ export function AcademicPage({
             </div>
           )}
 
-          {subTab === "stats" && (
+          {subPestana === "stats" && (
             <div className="space-y-6">
               {/* Filtros */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 grid grid-cols-1 sm:grid-cols-5 gap-3 items-end">
@@ -1712,8 +2111,10 @@ export function AcademicPage({
                   <label className="block text-[11px] text-slate-400 mb-1">Desde</label>
                   <input
                     type="date"
-                    value={statsDateFrom}
-                    onChange={(e) => setStatsDateFrom(e.target.value)}
+                    value={fechaDesdeEstadisticas}
+                    onChange={(evento) =>
+                      establecerFechaDesdeEstadisticas(evento.target.value)
+                    }
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs"
                   />
                 </div>
@@ -1721,22 +2122,26 @@ export function AcademicPage({
                   <label className="block text-[11px] text-slate-400 mb-1">Hasta</label>
                   <input
                     type="date"
-                    value={statsDateTo}
-                    onChange={(e) => setStatsDateTo(e.target.value)}
+                    value={fechaHastaEstadisticas}
+                    onChange={(evento) =>
+                      establecerFechaHastaEstadisticas(evento.target.value)
+                    }
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs"
                   />
                 </div>
                 <div>
                   <label className="block text-[11px] text-slate-400 mb-1">Carrera</label>
                   <select
-                    value={statsCareerId}
-                    onChange={(e) => setStatsCareerId(e.target.value)}
+                    value={idCarreraEstadisticas}
+                    onChange={(evento) =>
+                      establecerIdCarreraEstadisticas(evento.target.value)
+                    }
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs"
                   >
                     <option value="">Todas</option>
-                    {careers.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
+                    {carreras.map((carrera) => (
+                      <option key={carrera.id} value={carrera.id}>
+                        {carrera.nombre}
                       </option>
                     ))}
                   </select>
@@ -1744,47 +2149,52 @@ export function AcademicPage({
                 <div>
                   <label className="block text-[11px] text-slate-400 mb-1">Grupo</label>
                   <select
-                    value={statsGroupId}
-                    onChange={(e) => setStatsGroupId(e.target.value)}
+                    value={idGrupoEstadisticas}
+                    onChange={(evento) =>
+                      establecerIdGrupoEstadisticas(evento.target.value)
+                    }
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs"
                   >
                     <option value="">Todos</option>
-                    {groups.map((g) => (
-                      <option key={g.id} value={g.id}>
-                        {g.name}
+                    {grupos.map((grupo) => (
+                      <option key={grupo.id} value={grupo.id}>
+                        {grupo.nombre}
                       </option>
                     ))}
                   </select>
                 </div>
                 <button
                   type="button"
-                  onClick={() => void loadStats()}
+                  onClick={() => void cargarEstadisticas()}
                   className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold"
                 >
                   Aplicar filtros
                 </button>
               </div>
 
-              {stats && (
+              {estadisticas && (
                 <>
                   {/* KPIs globales */}
                   <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
                     {[
-                      { label: "Carreras", value: stats.summary.total_careers },
-                      { label: "Grupos", value: stats.summary.total_groups },
-                      { label: "Materias activas", value: stats.summary.total_courses },
-                      { label: "Sesiones", value: stats.summary.total_sessions },
+                      { etiqueta: "Carreras", valor: estadisticas.resumen.total_carreras },
+                      { etiqueta: "Grupos", valor: estadisticas.resumen.total_grupos },
                       {
-                        label: "Asistencia global",
-                        value: `${stats.summary.overall_attendance_rate.toFixed(1)}%`,
+                        etiqueta: "Materias activas",
+                        valor: estadisticas.resumen.total_cursos,
                       },
-                    ].map((kpi) => (
+                      { etiqueta: "Sesiones", valor: estadisticas.resumen.total_sesiones },
+                      {
+                        etiqueta: "Asistencia global",
+                        valor: `${estadisticas.resumen.tasa_asistencia_general.toFixed(1)}%`,
+                      },
+                    ].map((indicador) => (
                       <div
-                        key={kpi.label}
+                        key={indicador.etiqueta}
                         className="bg-slate-900 border border-slate-800 rounded-2xl p-4"
                       >
-                        <p className="text-xs text-slate-400">{kpi.label}</p>
-                        <p className="text-2xl font-bold mt-1">{kpi.value}</p>
+                        <p className="text-xs text-slate-400">{indicador.etiqueta}</p>
+                        <p className="text-2xl font-bold mt-1">{indicador.valor}</p>
                       </div>
                     ))}
                   </div>
@@ -1792,12 +2202,18 @@ export function AcademicPage({
                   {/* Por Asignatura */}
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-3">
-                      <h3 className="font-semibold text-base">Asistencia por Asignatura</h3>
+                      <h3 className="font-semibold text-base">
+                        Asistencia por Asignatura
+                      </h3>
                       <div className="flex items-center gap-2 text-xs">
                         <span className="text-slate-400">Ordenar por:</span>
                         <select
-                          value={subjectSortBy}
-                          onChange={(e) => setSubjectSortBy(e.target.value as SubjectSortField)}
+                          value={ordenMateriaPor}
+                          onChange={(evento) =>
+                            establecerOrdenMateriaPor(
+                              evento.target.value as CampoOrdenMateria
+                            )
+                          }
                           className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
                         >
                           <option value="career_period">Carrera y Periodo</option>
@@ -1807,11 +2223,13 @@ export function AcademicPage({
                         </select>
                         <button
                           type="button"
-                          onClick={() => setSubjectSortAsc((v) => !v)}
+                          onClick={() =>
+                            establecerOrdenMateriaAscendente((previa) => !previa)
+                          }
                           className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 text-xs"
                         >
                           <ArrowUpDown className="w-3.5 h-3.5" />
-                          {subjectSortAsc ? "Asc" : "Desc"}
+                          {ordenMateriaAscendente ? "Asc" : "Desc"}
                         </button>
                       </div>
                     </div>
@@ -1833,41 +2251,52 @@ export function AcademicPage({
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/80">
-                          {sortedBySubject.map((row) => (
-                            <tr key={row.course_assignment_id}>
+                          {materiasOrdenadas.map((fila) => (
+                            <tr key={fila.id_asignacion_curso}>
                               <td className="py-2.5 pr-3 text-xs text-slate-300">
-                                {row.career_name ?? "—"}
+                                {fila.nombre_carrera ?? "—"}
                               </td>
                               <td className="py-2.5 pr-3 text-xs text-slate-300">
-                                {formatGroupPeriodLabel(row.semester, row.period_type) ??
-                                  getPeriodMeta(row.period_type).label}
+                                {formatearEtiquetaPeriodoGrupo(
+                                  fila.semestre,
+                                  fila.tipo_periodo
+                                ) ?? obtenerMetadatosPeriodo(fila.tipo_periodo).etiqueta}
                               </td>
-                              <td className="py-2.5 pr-3 text-xs font-medium">{row.group_name}</td>
+                              <td className="py-2.5 pr-3 text-xs font-medium">
+                                {fila.nombre_grupo}
+                              </td>
                               <td className="py-2.5 pr-3">
-                                <span className="font-medium">{row.subject_name}</span>{" "}
-                                <span className="text-xs text-slate-400">({row.subject_code})</span>
+                                <span className="font-medium">{fila.nombre_materia}</span>{" "}
+                                <span className="text-xs text-slate-400">
+                                  ({fila.codigo_materia})
+                                </span>
                               </td>
                               <td className="py-2.5 pr-3 text-xs text-slate-300">
-                                {row.teacher_name ?? "—"}
+                                {fila.nombre_docente ?? "—"}
                               </td>
-                              <td className="py-2.5 pr-3 text-xs">{row.sessions_count}</td>
+                              <td className="py-2.5 pr-3 text-xs">
+                                {fila.cantidad_sesiones}
+                              </td>
                               <td className="py-2.5 pr-3 text-xs text-emerald-300">
-                                {row.present_count} / {row.expected_records}
+                                {fila.cantidad_asistencias} / {fila.registros_esperados}
                               </td>
                               <td className="py-2.5 pr-3 text-xs text-amber-300">
-                                {row.late_count}
+                                {fila.cantidad_retardos}
                               </td>
                               <td className="py-2.5 pr-3 text-xs text-red-300">
-                                {row.absent_count}
+                                {fila.cantidad_faltas}
                               </td>
                               <td className="py-2.5 pr-3 font-semibold text-indigo-300">
-                                {row.attendance_rate.toFixed(1)}%
+                                {fila.tasa_asistencia.toFixed(1)}%
                               </td>
                             </tr>
                           ))}
-                          {sortedBySubject.length === 0 && (
+                          {materiasOrdenadas.length === 0 && (
                             <tr>
-                              <td colSpan={10} className="py-6 text-center text-xs text-slate-500">
+                              <td
+                                colSpan={10}
+                                className="py-6 text-center text-xs text-slate-500"
+                              >
                                 No hay asignaturas para mostrar con estos filtros.
                               </td>
                             </tr>
@@ -1886,8 +2315,10 @@ export function AcademicPage({
                       <div className="flex items-center gap-2 text-xs">
                         <span className="text-slate-400">Ordenar por:</span>
                         <select
-                          value={groupSortBy}
-                          onChange={(e) => setGroupSortBy(e.target.value as GroupSortField)}
+                          value={ordenGrupoPor}
+                          onChange={(evento) =>
+                            establecerOrdenGrupoPor(evento.target.value as CampoOrdenGrupo)
+                          }
                           className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
                         >
                           <option value="career_period">Carrera y Periodo</option>
@@ -1897,55 +2328,63 @@ export function AcademicPage({
                         </select>
                         <button
                           type="button"
-                          onClick={() => setGroupSortAsc((v) => !v)}
+                          onClick={() =>
+                            establecerOrdenGrupoAscendente((previa) => !previa)
+                          }
                           className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 text-xs"
                         >
                           <ArrowUpDown className="w-3.5 h-3.5" />
-                          {groupSortAsc ? "Asc" : "Desc"}
+                          {ordenGrupoAscendente ? "Asc" : "Desc"}
                         </button>
                       </div>
                     </div>
 
                     <div className="space-y-3">
-                      {sortedByGroup.map((grp) => {
-                        const expanded = Boolean(expandedGroupIds[grp.group_id]);
-                        const gMeta = getPeriodMeta(grp.period_type);
+                      {gruposOrdenados.map((grupoStat) => {
+                        const expandido = Boolean(gruposExpandidos[grupoStat.id_grupo]);
+                        const metaGrupo = obtenerMetadatosPeriodo(grupoStat.tipo_periodo);
                         return (
                           <div
-                            key={grp.group_id}
+                            key={grupoStat.id_grupo}
                             className="rounded-xl bg-slate-800/40 border border-slate-800 overflow-hidden"
                           >
                             <button
                               type="button"
                               onClick={() =>
-                                setExpandedGroupIds((prev) => ({
-                                  ...prev,
-                                  [grp.group_id]: !expanded,
+                                establecerGruposExpandidos((previos) => ({
+                                  ...previos,
+                                  [grupoStat.id_grupo]: !expandido,
                                 }))
                               }
                               className="w-full px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-left hover:bg-slate-800/70"
                             >
                               <div>
                                 <p className="font-semibold text-sm">
-                                  {grp.group_name}{" "}
-                                  <span className="text-xs text-slate-400">({grp.group_code})</span>
+                                  {grupoStat.nombre_grupo}{" "}
+                                  <span className="text-xs text-slate-400">
+                                    ({grupoStat.codigo_grupo})
+                                  </span>
                                 </p>
                                 <p className="text-xs text-slate-400">
-                                  {grp.career_name ?? "Sin carrera"} ·{" "}
-                                  {formatGroupPeriodLabel(grp.semester, grp.period_type) ??
-                                    `${gMeta.label} (sin núm.)`}{" "}
-                                  · {grp.subjects_count} materias · {grp.students_count} alumnos ·{" "}
-                                  {grp.total_sessions} sesiones
+                                  {grupoStat.nombre_carrera ?? "Sin carrera"} ·{" "}
+                                  {formatearEtiquetaPeriodoGrupo(
+                                    grupoStat.semestre,
+                                    grupoStat.tipo_periodo
+                                  ) ?? `${metaGrupo.etiqueta} (sin núm.)`}{" "}
+                                  · {grupoStat.cantidad_materias} materias ·{" "}
+                                  {grupoStat.cantidad_estudiantes} alumnos ·{" "}
+                                  {grupoStat.total_sesiones} sesiones
                                 </p>
                               </div>
                               <div className="flex items-center gap-4 text-xs">
                                 <span className="text-emerald-300">
-                                  {grp.total_present}/{grp.total_expected} asist.
+                                  {grupoStat.total_asistencias}/
+                                  {grupoStat.total_esperados} asist.
                                 </span>
                                 <span className="px-2.5 py-1 rounded-full bg-indigo-500/20 text-indigo-300 font-bold">
-                                  {grp.overall_attendance_rate.toFixed(1)}%
+                                  {grupoStat.tasa_asistencia_general.toFixed(1)}%
                                 </span>
-                                {expanded ? (
+                                {expandido ? (
                                   <ChevronUp className="w-4 h-4 text-slate-400" />
                                 ) : (
                                   <ChevronDown className="w-4 h-4 text-slate-400" />
@@ -1953,9 +2392,9 @@ export function AcademicPage({
                               </div>
                             </button>
 
-                            {expanded && (
+                            {expandido && (
                               <div className="px-4 pb-3 border-t border-slate-800/80 pt-2.5">
-                                {grp.students_breakdown.length === 0 ? (
+                                {grupoStat.desglose_estudiantes.length === 0 ? (
                                   <p className="text-xs text-slate-500">
                                     Sin alumnos asignados a este grupo.
                                   </p>
@@ -1972,19 +2411,26 @@ export function AcademicPage({
                                       </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-800/60">
-                                      {grp.students_breakdown.map((st) => (
-                                        <tr key={st.person_id}>
+                                      {grupoStat.desglose_estudiantes.map((alumno) => (
+                                        <tr key={alumno.id_persona}>
                                           <td className="py-1.5 font-mono text-slate-300">
-                                            {st.external_id}
+                                            {alumno.identificador_externo}
                                           </td>
-                                          <td className="py-1.5 font-medium">{st.full_name}</td>
+                                          <td className="py-1.5 font-medium">
+                                            {alumno.nombre_completo}
+                                          </td>
                                           <td className="py-1.5 text-emerald-300">
-                                            {st.present_count} / {st.expected_records}
+                                            {alumno.cantidad_asistencias} /{" "}
+                                            {alumno.registros_esperados}
                                           </td>
-                                          <td className="py-1.5 text-amber-300">{st.late_count}</td>
-                                          <td className="py-1.5 text-red-300">{st.absent_count}</td>
+                                          <td className="py-1.5 text-amber-300">
+                                            {alumno.cantidad_retardos}
+                                          </td>
+                                          <td className="py-1.5 text-red-300">
+                                            {alumno.cantidad_faltas}
+                                          </td>
                                           <td className="py-1.5 font-semibold text-indigo-300">
-                                            {st.attendance_rate.toFixed(1)}%
+                                            {alumno.tasa_asistencia.toFixed(1)}%
                                           </td>
                                         </tr>
                                       ))}
@@ -2005,10 +2451,10 @@ export function AcademicPage({
         </>
       )}
 
-      {pendingPeriodChange && (
+      {cambioPeriodoPendiente && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <form
-            onSubmit={handleConfirmPeriodChange}
+            onSubmit={manejarConfirmarCambioPeriodo}
             className="w-full max-w-md bg-slate-900 border border-amber-500/40 rounded-2xl p-6 space-y-4 shadow-2xl"
           >
             <div className="flex items-start justify-between gap-3">
@@ -2019,16 +2465,17 @@ export function AcademicPage({
                 <div>
                   <h3 className="font-bold text-base">Autorización de Administrador</h3>
                   <p className="text-xs text-slate-400">
-                    Cambiar el tipo de periodo académico requiere contraseña de administrador.
+                    Cambiar el tipo de periodo académico requiere contraseña de
+                    administrador.
                   </p>
                 </div>
               </div>
               <button
                 type="button"
                 onClick={() => {
-                  setPendingPeriodChange(null);
-                  setPeriodAuthSecret("");
-                  setPeriodAuthError(null);
+                  establecerCambioPeriodoPendiente(null);
+                  establecerSecretoAutorizacionPeriodo("");
+                  establecerErrorAutorizacionPeriodo(null);
                 }}
                 className="text-slate-400 hover:text-white"
               >
@@ -2037,26 +2484,28 @@ export function AcademicPage({
             </div>
 
             <div className="rounded-xl bg-slate-800/70 border border-slate-700 px-3.5 py-2.5 text-xs text-slate-200">
-              {pendingPeriodChange.summary}
+              {cambioPeriodoPendiente.resumen}
             </div>
 
             <div>
               <label className="block text-xs text-slate-400 mb-1">
                 Contraseña de administrador
               </label>
-              <PasswordInput
+              <EntradaContrasena
                 required
                 autoFocus
-                value={periodAuthSecret}
-                onChange={(e) => setPeriodAuthSecret(e.target.value)}
+                value={secretoAutorizacionPeriodo}
+                onChange={(evento) =>
+                  establecerSecretoAutorizacionPeriodo(evento.target.value)
+                }
                 placeholder="Ingresa la contraseña de administrador"
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
               />
             </div>
 
-            {periodAuthError && (
+            {errorAutorizacionPeriodo && (
               <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
-                {periodAuthError}
+                {errorAutorizacionPeriodo}
               </p>
             )}
 
@@ -2064,9 +2513,9 @@ export function AcademicPage({
               <button
                 type="button"
                 onClick={() => {
-                  setPendingPeriodChange(null);
-                  setPeriodAuthSecret("");
-                  setPeriodAuthError(null);
+                  establecerCambioPeriodoPendiente(null);
+                  establecerSecretoAutorizacionPeriodo("");
+                  establecerErrorAutorizacionPeriodo(null);
                 }}
                 className="px-4 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200"
               >
@@ -2074,10 +2523,12 @@ export function AcademicPage({
               </button>
               <button
                 type="submit"
-                disabled={periodAuthSubmitting || !periodAuthSecret.trim()}
+                disabled={
+                  enviandoAutorizacionPeriodo || !secretoAutorizacionPeriodo.trim()
+                }
                 className="px-4 py-2 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white"
               >
-                {periodAuthSubmitting ? "Validando..." : "Confirmar cambio"}
+                {enviandoAutorizacionPeriodo ? "Validando..." : "Confirmar cambio"}
               </button>
             </div>
           </form>

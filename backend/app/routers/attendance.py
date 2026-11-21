@@ -1,583 +1,626 @@
+"""Enrutador HTTP para sesiones de asistencia, reconocimiento en kiosco y exportación CSV.
+
+Orquesta la apertura y cierre de sesiones, el pipeline de reconocimiento en
+memoria RAM (`decode -> detect -> quality -> extract -> 1:N match -> cooldown/reglas`),
+el registro manual de respaldo y la descarga de reportes CSV.
+"""
+
 from datetime import date, datetime
 import time
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
-from sqlalchemy import func, select
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import get_settings
-from app.db import get_db
+from app.config import obtener_configuracion
+from app.db import obtener_bd
 from app.models import (
-    AttendanceEvent,
-    AttendanceSession,
-    ClassSchedule,
-    CourseAssignment,
-    FaceEmbedding,
-    Group,
-    Organization,
-    Person,
-    PersonGroup,
-    User,
-    WorkShift,
+    AsignacionCurso,
+    EventoAsistencia,
+    Grupo,
+    HorarioClase,
+    Organizacion,
+    Persona,
+    PersonaGrupo,
+    SesionAsistencia,
+    TurnoLaboral,
+    Usuario,
+    VectorFacial,
 )
-from app.routers import to_face_box_schema, to_quality_schema
+from app.routers import convertir_a_esquema_calidad, convertir_a_esquema_cuadro_rostro
 from app.schemas import (
-    ActionMode,
-    AttendanceEventRead,
-    ManualAttendanceRequest,
-    PersonSummaryBrief,
-    RecognizeFrameResponse,
-    SessionCreate,
-    SessionRead,
+    EventoAsistenciaLeer,
+    ModoAccion,
+    RespuestaReconocerFrame,
+    ResumenBrevePersona,
+    SesionCrear,
+    SesionLeer,
+    SolicitudAsistenciaManual,
 )
-from app.security import assert_org_access, get_current_user, resolve_org_scope
+from app.security import (
+    obtener_usuario_actual,
+    resolver_alcance_organizacion,
+    validar_acceso_organizacion,
+)
 from app.services.academic_service import (
-    assert_session_teacher_access,
-    get_teacher_course_ids,
-    serialize_sessions_batch,
+    obtener_ids_cursos_docente,
+    serializar_sesiones_lote,
+    validar_acceso_docente_sesion,
 )
 from app.services.attendance_service import (
-    export_events_csv,
-    get_or_create_active_session,
-    record_recognized_attendance,
+    exportar_eventos_csv,
+    obtener_o_crear_sesion_activa,
+    registrar_asistencia_reconocida,
 )
-from app.services.enterprise_service import resolve_attendance_work_shift
-from app.vision.engine import bytes_to_embedding, decode_image_bytes, match_embedding
-from app.vision.quality import evaluate_face_quality
+from app.services.enterprise_service import resolver_turno_para_asistencia
+from app.vision.engine import bytes_a_vector, coincidir_vector, decodificar_bytes_imagen
+from app.vision.quality import evaluar_calidad_rostro
 
-router = APIRouter(prefix="/api", tags=["attendance"])
+enrutador = APIRouter(prefix="/api", tags=["asistencia"])
 
 
-def _serialize_event(
-    event: AttendanceEvent,
-    person: Person,
-    session: AttendanceSession,
-    shift_names: dict[int, str] | None = None,
-) -> AttendanceEventRead:
-    resolved_shift_id = event.work_shift_id if event.work_shift_id is not None else session.work_shift_id
-    shift_name = (
-        shift_names.get(resolved_shift_id)
-        if shift_names is not None and resolved_shift_id is not None
+def _serializar_evento(
+    evento: EventoAsistencia,
+    persona: Persona,
+    sesion: SesionAsistencia,
+    nombres_turnos: dict[int, str] | None = None,
+) -> EventoAsistenciaLeer:
+    """Construye el esquema JSON público de un evento de asistencia."""
+    id_turno_resuelto = (
+        evento.id_turno_laboral if evento.id_turno_laboral is not None else sesion.id_turno_laboral
+    )
+    nombre_turno = (
+        nombres_turnos.get(id_turno_resuelto)
+        if nombres_turnos is not None and id_turno_resuelto is not None
         else None
     )
-    if shift_name is None and event.work_shift is not None:
-        shift_name = event.work_shift.name
-    return AttendanceEventRead(
-        id=event.id,
-        session_id=event.session_id,
-        session_title=session.title,
-        person_id=event.person_id,
-        person_name=person.full_name,
-        person_external_id=person.external_id,
-        person_avatar_base64=person.avatar_base64,
-        work_shift_id=event.work_shift_id,
-        work_shift_name=shift_name,
-        event_type=event.event_type,
-        status=event.status,
-        confidence_score=event.confidence_score,
-        worked_minutes=event.worked_minutes,
-        late_minutes=event.late_minutes,
-        early_exit_minutes=event.early_exit_minutes,
-        capture_mode=event.capture_mode,
-        timestamp=event.timestamp,
-        notes=event.notes,
+    if nombre_turno is None and evento.turno_laboral is not None:
+        nombre_turno = evento.turno_laboral.nombre
+    return EventoAsistenciaLeer(
+        id=evento.id,
+        id_sesion=evento.id_sesion,
+        titulo_sesion=sesion.titulo,
+        id_persona=evento.id_persona,
+        nombre_persona=persona.nombre_completo,
+        identificador_externo_persona=persona.identificador_externo,
+        avatar_base64_persona=persona.avatar_base64,
+        id_turno_laboral=evento.id_turno_laboral,
+        nombre_turno_laboral=nombre_turno,
+        tipo_evento=evento.tipo_evento,
+        estado=evento.estado,
+        puntaje_confianza=evento.puntaje_confianza,
+        minutos_trabajados=evento.minutos_trabajados,
+        minutos_retardo=evento.minutos_retardo,
+        minutos_salida_anticipada=evento.minutos_salida_anticipada,
+        modo_captura=evento.modo_captura,
+        fecha_hora=evento.fecha_hora,
+        notas=evento.notas,
     )
 
 
-@router.get("/sessions", response_model=list[SessionRead])
-def list_sessions(
-    organization_id: int | None = Query(default=None),
-    status_filter: str | None = Query(default=None, alias="status"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[SessionRead]:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    stmt = (
-        select(AttendanceSession)
-        .where(AttendanceSession.organization_id == scoped_org_id)
-        .order_by(AttendanceSession.id.desc())
+@enrutador.get("/sessions", response_model=list[SesionLeer])
+def listar_sesiones(
+    id_organizacion: int | None = Query(default=None),
+    filtro_estado: str | None = Query(default=None, alias="estado"),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[SesionLeer]:
+    """Lista las sesiones de asistencia de la organización (para docentes, solo sus clases)."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    consulta = (
+        select(SesionAsistencia)
+        .where(SesionAsistencia.id_organizacion == id_org_alcance)
+        .order_by(SesionAsistencia.id.desc())
     )
-    if current_user.role == "teacher":
-        teacher_courses = get_teacher_course_ids(db, current_user.id)
-        if not teacher_courses:
+    if usuario_actual.rol == "teacher":
+        cursos_docente = obtener_ids_cursos_docente(sesion_bd, usuario_actual.id)
+        if not cursos_docente:
             return []
-        stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
-    if status_filter:
-        stmt = stmt.where(AttendanceSession.status == status_filter)
-    sessions = list(db.scalars(stmt).all())
-    return serialize_sessions_batch(db, sessions, scoped_org_id)
+        consulta = consulta.where(SesionAsistencia.id_asignacion_curso.in_(cursos_docente))
+    if filtro_estado:
+        consulta = consulta.where(SesionAsistencia.estado == filtro_estado)
+    sesiones = list(sesion_bd.scalars(consulta).all())
+    return serializar_sesiones_lote(sesion_bd, sesiones, id_org_alcance)
 
 
-@router.post("/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED)
-def create_session(
-    payload: SessionCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> SessionRead:
-    assert_org_access(current_user, payload.organization_id)
-    org = db.get(Organization, payload.organization_id)
-    if org is None:
+@enrutador.post("/sessions", response_model=SesionLeer, status_code=status.HTTP_201_CREATED)
+def crear_sesion(
+    carga: SesionCrear,
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> SesionLeer:
+    """Crea una sesión de asistencia vinculada a grupo, curso académico o turno laboral."""
+    validar_acceso_organizacion(usuario_actual, carga.id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, carga.id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    if current_user.role == "teacher" and payload.course_assignment_id is None:
+    if usuario_actual.rol == "teacher" and carga.id_asignacion_curso is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Un docente debe abrir sesiones vinculadas a una de sus asignaturas.",
         )
 
-    resolved_group_id = payload.group_id
-    expected_start = payload.expected_start_time
-    session_type = payload.session_type or ("class" if org.mode == "education" else "workday")
+    id_grupo_resuelto = carga.id_grupo
+    inicio_esperado = carga.hora_inicio_esperada
+    tipo_sesion = carga.tipo_sesion or (
+        "class" if organizacion.modo == "education" else "workday"
+    )
 
-    if payload.course_assignment_id is not None:
-        assignment = db.scalars(
-            select(CourseAssignment)
-            .options(selectinload(CourseAssignment.group))
-            .where(CourseAssignment.id == payload.course_assignment_id)
+    if carga.id_asignacion_curso is not None:
+        asignacion = sesion_bd.scalars(
+            select(AsignacionCurso)
+            .options(selectinload(AsignacionCurso.grupo))
+            .where(AsignacionCurso.id == carga.id_asignacion_curso)
         ).first()
-        if assignment is None or assignment.organization_id != org.id:
+        if asignacion is None or asignacion.id_organizacion != organizacion.id:
             raise HTTPException(status_code=404, detail="Asignación de materia no encontrada.")
-        if current_user.role == "teacher" and assignment.teacher_user_id != current_user.id:
+        if usuario_actual.rol == "teacher" and asignacion.id_usuario_docente != usuario_actual.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No puedes crear sesiones para una materia de otro profesor.",
             )
-        resolved_group_id = assignment.group_id
-        session_type = "class"
-        if payload.schedule_id is not None:
-            schedule = db.get(ClassSchedule, payload.schedule_id)
-            if schedule is None or schedule.course_assignment_id != assignment.id:
+        id_grupo_resuelto = asignacion.id_grupo
+        tipo_sesion = "class"
+        if carga.id_horario is not None:
+            horario = sesion_bd.get(HorarioClase, carga.id_horario)
+            if horario is None or horario.id_asignacion_curso != asignacion.id:
                 raise HTTPException(status_code=404, detail="Horario no encontrado para la materia.")
-            if expected_start is None:
-                expected_start = schedule.start_time
-        elif expected_start is None and assignment.group is not None:
-            expected_start = assignment.group.schedule_start
-    elif payload.work_shift_id is not None:
-        work_shift = db.get(WorkShift, payload.work_shift_id)
-        if work_shift is None or work_shift.organization_id != org.id:
+            if inicio_esperado is None:
+                inicio_esperado = horario.hora_inicio
+        elif inicio_esperado is None and asignacion.grupo is not None:
+            inicio_esperado = asignacion.grupo.hora_inicio_horario
+    elif carga.id_turno_laboral is not None:
+        turno_laboral = sesion_bd.get(TurnoLaboral, carga.id_turno_laboral)
+        if turno_laboral is None or turno_laboral.id_organizacion != organizacion.id:
             raise HTTPException(
                 status_code=404,
                 detail="Turno laboral no encontrado en la organización.",
             )
-        session_type = "workday"
-        if expected_start is None:
-            expected_start = work_shift.start_time
-        if resolved_group_id is not None:
-            group = db.get(Group, resolved_group_id)
-            if group is None or group.organization_id != org.id:
+        tipo_sesion = "workday"
+        if inicio_esperado is None:
+            inicio_esperado = turno_laboral.hora_inicio
+        if id_grupo_resuelto is not None:
+            grupo = sesion_bd.get(Grupo, id_grupo_resuelto)
+            if grupo is None or grupo.id_organizacion != organizacion.id:
                 raise HTTPException(status_code=404, detail="Grupo no encontrado en la organización.")
-    elif resolved_group_id is not None:
-        group = db.get(Group, resolved_group_id)
-        if group is None or group.organization_id != org.id:
+    elif id_grupo_resuelto is not None:
+        grupo = sesion_bd.get(Grupo, id_grupo_resuelto)
+        if grupo is None or grupo.id_organizacion != organizacion.id:
             raise HTTPException(status_code=404, detail="Grupo no encontrado en la organización.")
-        if expected_start is None:
-            expected_start = group.schedule_start
+        if inicio_esperado is None:
+            inicio_esperado = grupo.hora_inicio_horario
 
-    session = AttendanceSession(
-        organization_id=org.id,
-        group_id=resolved_group_id,
-        course_assignment_id=payload.course_assignment_id,
-        schedule_id=payload.schedule_id,
-        work_shift_id=payload.work_shift_id,
-        title=payload.title.strip(),
-        session_date=payload.session_date or date.today(),
-        session_type=session_type,
-        expected_start_time=expected_start,
-        status="open",
+    sesion = SesionAsistencia(
+        id_organizacion=organizacion.id,
+        id_grupo=id_grupo_resuelto,
+        id_asignacion_curso=carga.id_asignacion_curso,
+        id_horario=carga.id_horario,
+        id_turno_laboral=carga.id_turno_laboral,
+        titulo=carga.titulo.strip(),
+        fecha_sesion=carga.fecha_sesion or date.today(),
+        tipo_sesion=tipo_sesion,
+        hora_inicio_esperada=inicio_esperado,
+        estado="open",
     )
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    return serialize_sessions_batch(db, [session], org.id)[0]
+    sesion_bd.add(sesion)
+    sesion_bd.commit()
+    sesion_bd.refresh(sesion)
+    return serializar_sesiones_lote(sesion_bd, [sesion], organizacion.id)[0]
 
 
-@router.post("/sessions/{session_id}/close", response_model=SessionRead)
-def close_session(
-    session_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> SessionRead:
-    session = db.get(AttendanceSession, session_id)
-    if session is None:
+@enrutador.post("/sessions/{id_sesion}/close", response_model=SesionLeer)
+def cerrar_sesion(
+    id_sesion: int,
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> SesionLeer:
+    """Cierra una sesión de asistencia abierta registrando su marca temporal."""
+    sesion = sesion_bd.get(SesionAsistencia, id_sesion)
+    if sesion is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
-    assert_org_access(current_user, session.organization_id)
-    assert_session_teacher_access(db, current_user, session)
+    validar_acceso_organizacion(usuario_actual, sesion.id_organizacion)
+    validar_acceso_docente_sesion(sesion_bd, usuario_actual, sesion)
 
-    if session.status != "closed":
-        session.status = "closed"
-        session.closed_at = datetime.now()
-        db.commit()
-        db.refresh(session)
+    if sesion.estado != "closed":
+        sesion.estado = "closed"
+        sesion.cerrado_en = datetime.now()
+        sesion_bd.commit()
+        sesion_bd.refresh(sesion)
 
-    return serialize_sessions_batch(db, [session], session.organization_id)[0]
+    return serializar_sesiones_lote(sesion_bd, [sesion], sesion.id_organizacion)[0]
 
 
-@router.post("/attendance/recognize-frame", response_model=RecognizeFrameResponse)
-async def recognize_frame(
-    request: Request,
-    image: UploadFile = File(...),
-    organization_id: int = Form(...),
-    session_id: int | None = Form(default=None),
-    group_id: int | None = Form(default=None),
-    action_mode: ActionMode = Form(default="auto"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> RecognizeFrameResponse:
-    t0 = time.perf_counter()
-    settings = get_settings()
+@enrutador.post("/attendance/recognize-frame", response_model=RespuestaReconocerFrame)
+async def reconocer_frame(
+    peticion: Request,
+    imagen: UploadFile = File(...),
+    id_organizacion: int = Form(...),
+    id_sesion: int | None = Form(default=None),
+    id_grupo: int | None = Form(default=None),
+    modo_accion: ModoAccion = Form(default="auto"),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaReconocerFrame:
+    """Procesa un frame de cámara del kiosco, identifica al sujeto y registra asistencia."""
+    tiempo_inicio = time.perf_counter()
+    configuracion = obtener_configuracion()
 
-    assert_org_access(current_user, organization_id)
-    org = db.get(Organization, organization_id)
-    if org is None:
+    validar_acceso_organizacion(usuario_actual, id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    engine = getattr(request.app.state, "biometric_engine", None)
-    if engine is None:
+    motor = getattr(peticion.app.state, "motor_biometrico", None)
+    if motor is None:
         raise HTTPException(
             status_code=503,
             detail="El motor biométrico no está inicializado en el servidor.",
         )
 
-    if session_id is not None:
-        session = db.get(AttendanceSession, session_id)
-        if session is None or session.organization_id != org.id:
+    if id_sesion is not None:
+        sesion = sesion_bd.get(SesionAsistencia, id_sesion)
+        if sesion is None or sesion.id_organizacion != organizacion.id:
             raise HTTPException(status_code=404, detail="Sesión no encontrada en la organización.")
-        assert_session_teacher_access(db, current_user, session)
-        if session.status != "open":
+        validar_acceso_docente_sesion(sesion_bd, usuario_actual, sesion)
+        if sesion.estado != "open":
             raise HTTPException(status_code=400, detail="La sesión seleccionada ya está cerrada.")
     else:
-        if current_user.role == "teacher":
+        if usuario_actual.rol == "teacher":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Debes seleccionar una sesión de tu asignatura para tomar asistencia.",
             )
         try:
-            session = get_or_create_active_session(db, org, group_id=group_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            sesion = obtener_o_crear_sesion_activa(sesion_bd, organizacion, id_grupo=id_grupo)
+        except ValueError as excepcion:
+            raise HTTPException(status_code=400, detail=str(excepcion)) from excepcion
 
-    raw_bytes = await image.read()
+    bytes_crudos = await imagen.read()
     try:
-        image_bgr = decode_image_bytes(raw_bytes)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        imagen_bgr = decodificar_bytes_imagen(bytes_crudos)
+    except ValueError as excepcion:
+        raise HTTPException(status_code=400, detail=str(excepcion)) from excepcion
 
-    img_h, img_w = image_bgr.shape[:2]
-    detections = engine.detect(image_bgr)
-    if not detections:
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return RecognizeFrameResponse(
-            faces_detected=0,
-            match_status="no_face",
-            session_id=session.id,
-            message="No se detectó ningún rostro frente a la cámara.",
-            latency_ms=latency_ms,
+    alto_imagen, ancho_imagen = imagen_bgr.shape[:2]
+    detecciones = motor.detectar(imagen_bgr)
+    if not detecciones:
+        latencia_ms = round((time.perf_counter() - tiempo_inicio) * 1000.0, 2)
+        return RespuestaReconocerFrame(
+            rostros_detectados=0,
+            estado_coincidencia="no_face",
+            id_sesion=sesion.id,
+            mensaje="No se detectó ningún rostro frente a la cámara.",
+            latencia_ms=latencia_ms,
         )
 
-    primary_box, primary_row = detections[0]
-    face_box_schema = to_face_box_schema(primary_box, img_w, img_h)
-    quality = evaluate_face_quality(
-        image_bgr,
-        primary_box,
-        min_size_px=settings.kiosk_min_face_size_px,
-        min_blur=settings.kiosk_min_blur_variance,
-        min_brightness=settings.kiosk_min_brightness,
-        max_brightness=settings.max_brightness,
-        max_shadow_asymmetry=settings.kiosk_max_shadow_asymmetry,
-        backlight_delta_threshold=settings.backlight_delta_threshold,
-        strict_lighting=False,
+    cuadro_principal, fila_principal = detecciones[0]
+    esquema_cuadro = convertir_a_esquema_cuadro_rostro(cuadro_principal, ancho_imagen, alto_imagen)
+    calidad = evaluar_calidad_rostro(
+        imagen_bgr,
+        cuadro_principal,
+        tamano_minimo_px=configuracion.tamano_minimo_rostro_kiosco_px,
+        nitidez_minima=configuracion.varianza_minima_nitidez_kiosco,
+        brillo_minimo=configuracion.brillo_minimo_kiosco,
+        brillo_maximo=configuracion.brillo_maximo,
+        asimetria_sombra_maxima=configuracion.asimetria_sombra_maxima_kiosco,
+        umbral_delta_contraluz=configuracion.umbral_delta_contraluz,
+        iluminacion_estricta=False,
     )
-    quality_schema = to_quality_schema(quality)
+    esquema_calidad = convertir_a_esquema_calidad(calidad)
 
-    if not quality.ok:
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return RecognizeFrameResponse(
-            faces_detected=len(detections),
-            match_status="low_quality",
-            face_box=face_box_schema,
-            quality=quality_schema,
-            session_id=session.id,
-            message=quality.reason or "Calidad insuficiente para reconocimiento.",
-            latency_ms=latency_ms,
+    if not calidad.es_valida:
+        latencia_ms = round((time.perf_counter() - tiempo_inicio) * 1000.0, 2)
+        return RespuestaReconocerFrame(
+            rostros_detectados=len(detecciones),
+            estado_coincidencia="low_quality",
+            cuadro_rostro=esquema_cuadro,
+            calidad=esquema_calidad,
+            id_sesion=sesion.id,
+            mensaje=calidad.motivo or "Calidad insuficiente para reconocimiento.",
+            latencia_ms=latencia_ms,
         )
 
-    query_vec = engine.extract_embedding(image_bgr, primary_row)
+    vector_consulta = motor.extraer_vector(imagen_bgr, fila_principal)
 
-    effective_group_id = session.group_id if session.group_id is not None else group_id
-    gallery_stmt = (
-        select(Person.id, Person.full_name, FaceEmbedding.vector_bytes)
-        .join(FaceEmbedding, FaceEmbedding.person_id == Person.id)
+    id_grupo_efectivo = sesion.id_grupo if sesion.id_grupo is not None else id_grupo
+    consulta_galeria = (
+        select(Persona.id, Persona.nombre_completo, VectorFacial.bytes_vector)
+        .join(VectorFacial, VectorFacial.id_persona == Persona.id)
         .where(
-            Person.organization_id == org.id,
-            Person.is_active.is_(True),
-            Person.biometric_consent.is_(True),
-            FaceEmbedding.model_version == settings.model_version,
+            Persona.id_organizacion == organizacion.id,
+            Persona.esta_activo.is_(True),
+            Persona.consentimiento_biometrico.is_(True),
+            VectorFacial.version_modelo == configuracion.version_modelo,
         )
     )
-    if effective_group_id is not None:
-        gallery_stmt = gallery_stmt.join(
-            PersonGroup, PersonGroup.person_id == Person.id
-        ).where(PersonGroup.group_id == effective_group_id)
+    if id_grupo_efectivo is not None:
+        consulta_galeria = consulta_galeria.join(
+            PersonaGrupo, PersonaGrupo.id_persona == Persona.id
+        ).where(PersonaGrupo.id_grupo == id_grupo_efectivo)
 
-    gallery_rows = db.execute(gallery_stmt).all()
-    gallery = [
-        (pid, pname, bytes_to_embedding(vec_bytes))
-        for pid, pname, vec_bytes in gallery_rows
+    filas_galeria = sesion_bd.execute(consulta_galeria).all()
+    galeria = [
+        (id_per, nombre_per, bytes_a_vector(bytes_vec))
+        for id_per, nombre_per, bytes_vec in filas_galeria
     ]
 
-    decision = match_embedding(
-        query_vec,
-        gallery,
-        threshold=settings.match_threshold,
-        margin=settings.ambiguous_margin,
+    decision = coincidir_vector(
+        vector_consulta,
+        galeria,
+        umbral=configuracion.umbral_coincidencia,
+        margen=configuracion.margen_ambiguedad,
     )
 
-    if decision.status == "unknown":
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        if not gallery:
-            msg = "No hay personas con biometría registrada en este alcance."
-        elif quality.backlight_detected:
-            msg = (
+    if decision.estado == "unknown":
+        latencia_ms = round((time.perf_counter() - tiempo_inicio) * 1000.0, 2)
+        if not galeria:
+            mensaje = "No hay personas con biometría registrada en este alcance."
+        elif calidad.contraluz_detectado:
+            mensaje = (
                 "Rostro no reconocido. Se detectó contraluz fuerte; intenta mirar más de frente "
                 "o mejorar la luz frontal."
             )
         else:
-            msg = "Rostro no reconocido en el padrón activo."
-        return RecognizeFrameResponse(
-            faces_detected=len(detections),
-            match_status="unknown",
-            face_box=face_box_schema,
-            quality=quality_schema,
-            confidence=round(decision.confidence, 4),
-            second_best_score=(
-                round(decision.second_best_score, 4)
-                if decision.second_best_score is not None
+            mensaje = "Rostro no reconocido en el padrón activo."
+        return RespuestaReconocerFrame(
+            rostros_detectados=len(detecciones),
+            estado_coincidencia="unknown",
+            cuadro_rostro=esquema_cuadro,
+            calidad=esquema_calidad,
+            confianza=round(decision.confianza, 4),
+            puntaje_segundo_candidato=(
+                round(decision.puntaje_segundo_candidato, 4)
+                if decision.puntaje_segundo_candidato is not None
                 else None
             ),
-            session_id=session.id,
-            message=msg,
-            latency_ms=latency_ms,
+            id_sesion=sesion.id,
+            mensaje=mensaje,
+            latencia_ms=latencia_ms,
         )
 
-    if decision.status == "ambiguous" or decision.person_id is None:
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return RecognizeFrameResponse(
-            faces_detected=len(detections),
-            match_status="ambiguous",
-            face_box=face_box_schema,
-            quality=quality_schema,
-            confidence=round(decision.confidence, 4),
-            second_best_score=(
-                round(decision.second_best_score, 4)
-                if decision.second_best_score is not None
+    if decision.estado == "ambiguous" or decision.id_persona is None:
+        latencia_ms = round((time.perf_counter() - tiempo_inicio) * 1000.0, 2)
+        return RespuestaReconocerFrame(
+            rostros_detectados=len(detecciones),
+            estado_coincidencia="ambiguous",
+            cuadro_rostro=esquema_cuadro,
+            calidad=esquema_calidad,
+            confianza=round(decision.confianza, 4),
+            puntaje_segundo_candidato=(
+                round(decision.puntaje_segundo_candidato, 4)
+                if decision.puntaje_segundo_candidato is not None
                 else None
             ),
-            session_id=session.id,
-            message="Coincidencia ambigua entre dos personas. Acércate o mejora la iluminación.",
-            latency_ms=latency_ms,
+            id_sesion=sesion.id,
+            mensaje="Coincidencia ambigua entre dos personas. Acércate o mejora la iluminación.",
+            latencia_ms=latencia_ms,
         )
 
-    person = db.get(Person, decision.person_id)
-    if person is None:
+    persona = sesion_bd.get(Persona, decision.id_persona)
+    if persona is None:
         raise HTTPException(status_code=404, detail="Persona reconocida no encontrada.")
 
-    rec = record_recognized_attendance(
-        db=db,
-        organization=org,
-        session=session,
-        person=person,
-        confidence_score=decision.confidence,
-        action_mode=action_mode,
-        capture_mode="kiosk_individual",
+    registro = registrar_asistencia_reconocida(
+        sesion_bd=sesion_bd,
+        organizacion=organizacion,
+        sesion=sesion,
+        persona=persona,
+        puntaje_confianza=decision.confianza,
+        modo_accion=modo_accion,
+        modo_captura="kiosk_individual",
     )
-    latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    latencia_ms = round((time.perf_counter() - tiempo_inicio) * 1000.0, 2)
 
-    serialized_event = None
-    if rec.event is not None:
-        event_session = db.get(AttendanceSession, rec.event.session_id) or session
-        ev_shift_names = (
-            {rec.event.work_shift_id: rec.shift_name}
-            if rec.event.work_shift_id is not None and rec.shift_name is not None
+    evento_serializado = None
+    if registro.evento is not None:
+        sesion_del_evento = sesion_bd.get(SesionAsistencia, registro.evento.id_sesion) or sesion
+        nombres_turnos_ev = (
+            {registro.evento.id_turno_laboral: registro.nombre_turno}
+            if registro.evento.id_turno_laboral is not None and registro.nombre_turno is not None
             else None
         )
-        serialized_event = _serialize_event(rec.event, person, event_session, ev_shift_names)
+        evento_serializado = _serializar_evento(
+            registro.evento, persona, sesion_del_evento, nombres_turnos_ev
+        )
 
-    return RecognizeFrameResponse(
-        faces_detected=len(detections),
-        match_status="matched",
-        face_box=face_box_schema,
-        quality=quality_schema,
-        person=PersonSummaryBrief(
-            id=person.id,
-            external_id=person.external_id,
-            full_name=person.full_name,
-            role=person.role,
-            avatar_base64=person.avatar_base64,
+    return RespuestaReconocerFrame(
+        rostros_detectados=len(detecciones),
+        estado_coincidencia="matched",
+        cuadro_rostro=esquema_cuadro,
+        calidad=esquema_calidad,
+        persona=ResumenBrevePersona(
+            id=persona.id,
+            identificador_externo=persona.identificador_externo,
+            nombre_completo=persona.nombre_completo,
+            rol=persona.rol,
+            avatar_base64=persona.avatar_base64,
         ),
-        confidence=round(decision.confidence, 4),
-        second_best_score=(
-            round(decision.second_best_score, 4)
-            if decision.second_best_score is not None
+        confianza=round(decision.confianza, 4),
+        puntaje_segundo_candidato=(
+            round(decision.puntaje_segundo_candidato, 4)
+            if decision.puntaje_segundo_candidato is not None
             else None
         ),
-        attendance_action=rec.action,
-        event=serialized_event,
-        worked_minutes=rec.worked_minutes,
-        shift_name=rec.shift_name,
-        late_minutes=rec.late_minutes,
-        early_exit_minutes=rec.early_exit_minutes,
-        session_id=rec.event.session_id if rec.event else session.id,
-        message=rec.message,
-        latency_ms=latency_ms,
+        accion_asistencia=registro.accion,
+        evento=evento_serializado,
+        minutos_trabajados=registro.minutos_trabajados,
+        nombre_turno=registro.nombre_turno,
+        minutos_retardo=registro.minutos_retardo,
+        minutos_salida_anticipada=registro.minutos_salida_anticipada,
+        id_sesion=registro.evento.id_sesion if registro.evento else sesion.id,
+        mensaje=registro.mensaje,
+        latencia_ms=latencia_ms,
     )
 
 
-@router.get("/attendance/events", response_model=list[AttendanceEventRead])
-def list_events(
-    organization_id: int | None = Query(default=None),
-    session_id: int | None = Query(default=None),
-    person_id: int | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[AttendanceEventRead]:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    teacher_courses: set[int] | None = None
-    if current_user.role == "teacher":
-        if session_id is not None:
-            target_sess = db.get(AttendanceSession, session_id)
-            if target_sess is None or target_sess.organization_id != scoped_org_id:
+@enrutador.get("/attendance/events", response_model=list[EventoAsistenciaLeer])
+def listar_eventos_asistencia(
+    id_organizacion: int | None = Query(default=None),
+    id_sesion: int | None = Query(default=None),
+    id_persona: int | None = Query(default=None),
+    limite: int = Query(default=100, ge=1, le=500),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[EventoAsistenciaLeer]:
+    """Consulta eventos recientes de asistencia con filtros por sesión, persona o docente."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    cursos_docente: set[int] | None = None
+    if usuario_actual.rol == "teacher":
+        if id_sesion is not None:
+            sesion_objetivo = sesion_bd.get(SesionAsistencia, id_sesion)
+            if sesion_objetivo is None or sesion_objetivo.id_organizacion != id_org_alcance:
                 raise HTTPException(status_code=404, detail="Sesión no encontrada.")
-            assert_session_teacher_access(db, current_user, target_sess)
-        teacher_courses = get_teacher_course_ids(db, current_user.id)
-        if not teacher_courses:
+            validar_acceso_docente_sesion(sesion_bd, usuario_actual, sesion_objetivo)
+        cursos_docente = obtener_ids_cursos_docente(sesion_bd, usuario_actual.id)
+        if not cursos_docente:
             return []
 
-    stmt = (
-        select(AttendanceEvent, Person, AttendanceSession)
-        .join(Person, Person.id == AttendanceEvent.person_id)
-        .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
-        .where(AttendanceSession.organization_id == scoped_org_id)
-        .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
-        .limit(limit)
+    consulta = (
+        select(EventoAsistencia, Persona, SesionAsistencia)
+        .join(Persona, Persona.id == EventoAsistencia.id_persona)
+        .join(SesionAsistencia, SesionAsistencia.id == EventoAsistencia.id_sesion)
+        .where(SesionAsistencia.id_organizacion == id_org_alcance)
+        .order_by(EventoAsistencia.fecha_hora.desc(), EventoAsistencia.id.desc())
+        .limit(limite)
     )
-    if teacher_courses is not None:
-        stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
-    if session_id is not None:
-        stmt = stmt.where(AttendanceEvent.session_id == session_id)
-    if person_id is not None:
-        stmt = stmt.where(AttendanceEvent.person_id == person_id)
+    if cursos_docente is not None:
+        consulta = consulta.where(SesionAsistencia.id_asignacion_curso.in_(cursos_docente))
+    if id_sesion is not None:
+        consulta = consulta.where(EventoAsistencia.id_sesion == id_sesion)
+    if id_persona is not None:
+        consulta = consulta.where(EventoAsistencia.id_persona == id_persona)
 
-    rows = db.execute(stmt).all()
-    shift_names = {
-        sh.id: sh.name
-        for sh in db.scalars(
-            select(WorkShift).where(WorkShift.organization_id == scoped_org_id)
+    filas = sesion_bd.execute(consulta).all()
+    nombres_turnos = {
+        turno.id: turno.nombre
+        for turno in sesion_bd.scalars(
+            select(TurnoLaboral).where(TurnoLaboral.id_organizacion == id_org_alcance)
         ).all()
     }
-    return [_serialize_event(ev, per, ses, shift_names) for ev, per, ses in rows]
+    return [
+        _serializar_evento(evento, persona, sesion, nombres_turnos)
+        for evento, persona, sesion in filas
+    ]
 
 
-@router.post("/attendance/manual", response_model=AttendanceEventRead, status_code=status.HTTP_201_CREATED)
-def create_manual_attendance(
-    payload: ManualAttendanceRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> AttendanceEventRead:
-    session = db.get(AttendanceSession, payload.session_id)
-    if session is None:
+@enrutador.post(
+    "/attendance/manual",
+    response_model=EventoAsistenciaLeer,
+    status_code=status.HTTP_201_CREATED,
+)
+def crear_asistencia_manual(
+    carga: SolicitudAsistenciaManual,
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> EventoAsistenciaLeer:
+    """Registra una asistencia manual de contingencia (con nota obligatoria u opcional)."""
+    sesion = sesion_bd.get(SesionAsistencia, carga.id_sesion)
+    if sesion is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
-    assert_org_access(current_user, session.organization_id)
-    assert_session_teacher_access(db, current_user, session)
+    validar_acceso_organizacion(usuario_actual, sesion.id_organizacion)
+    validar_acceso_docente_sesion(sesion_bd, usuario_actual, sesion)
 
-    person = db.get(Person, payload.person_id)
-    if person is None or person.organization_id != session.organization_id:
+    persona = sesion_bd.get(Persona, carga.id_persona)
+    if persona is None or persona.id_organizacion != sesion.id_organizacion:
         raise HTTPException(
             status_code=404,
             detail="Persona no encontrada en la organización de la sesión.",
         )
 
-    if current_user.role == "teacher" and session.group_id is not None:
-        in_group = db.scalars(
-            select(PersonGroup).where(
-                PersonGroup.person_id == person.id,
-                PersonGroup.group_id == session.group_id,
+    if usuario_actual.rol == "teacher" and sesion.id_grupo is not None:
+        en_grupo = sesion_bd.scalars(
+            select(PersonaGrupo).where(
+                PersonaGrupo.id_persona == persona.id,
+                PersonaGrupo.id_grupo == sesion.id_grupo,
             )
         ).first()
-        if in_group is None:
+        if en_grupo is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="El alumno no pertenece al grupo de esta sesión.",
             )
 
-    resolved_shift = (
-        resolve_attendance_work_shift(db, person, session)
-        if session.session_type == "workday"
+    turno_resuelto = (
+        resolver_turno_para_asistencia(sesion_bd, persona, sesion)
+        if sesion.tipo_sesion == "workday"
         else None
     )
-    event = AttendanceEvent(
-        session_id=session.id,
-        person_id=person.id,
-        work_shift_id=resolved_shift.id if resolved_shift else None,
-        event_type=payload.event_type,
-        status=payload.status,
-        confidence_score=None,
-        capture_mode="manual",
-        timestamp=datetime.now(),
-        notes=payload.notes,
+    evento = EventoAsistencia(
+        id_sesion=sesion.id,
+        id_persona=persona.id,
+        id_turno_laboral=turno_resuelto.id if turno_resuelto else None,
+        tipo_evento=carga.tipo_evento,
+        estado=carga.estado,
+        puntaje_confianza=None,
+        modo_captura="manual",
+        fecha_hora=datetime.now(),
+        notas=carga.notas,
     )
-    db.add(event)
-    db.commit()
-    db.refresh(event)
-    shift_names = {resolved_shift.id: resolved_shift.name} if resolved_shift else None
-    return _serialize_event(event, person, session, shift_names)
+    sesion_bd.add(evento)
+    sesion_bd.commit()
+    sesion_bd.refresh(evento)
+    nombres_turnos = {turno_resuelto.id: turno_resuelto.nombre} if turno_resuelto else None
+    return _serializar_evento(evento, persona, sesion, nombres_turnos)
 
 
-@router.get("/attendance/export.csv")
-def export_attendance_csv(
-    organization_id: int | None = Query(default=None),
-    session_id: int | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+@enrutador.get("/attendance/export.csv")
+def exportar_asistencia_csv(
+    id_organizacion: int | None = Query(default=None),
+    id_sesion: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
 ) -> Response:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    teacher_courses: set[int] | None = None
-    if current_user.role == "teacher":
-        if session_id is not None:
-            target_sess = db.get(AttendanceSession, session_id)
-            if target_sess is None or target_sess.organization_id != scoped_org_id:
+    """Genera y descarga un archivo CSV compatible con Excel para la organización o sesión."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    cursos_docente: set[int] | None = None
+    if usuario_actual.rol == "teacher":
+        if id_sesion is not None:
+            sesion_objetivo = sesion_bd.get(SesionAsistencia, id_sesion)
+            if sesion_objetivo is None or sesion_objetivo.id_organizacion != id_org_alcance:
                 raise HTTPException(status_code=404, detail="Sesión no encontrada.")
-            assert_session_teacher_access(db, current_user, target_sess)
-        teacher_courses = get_teacher_course_ids(db, current_user.id)
+            validar_acceso_docente_sesion(sesion_bd, usuario_actual, sesion_objetivo)
+        cursos_docente = obtener_ids_cursos_docente(sesion_bd, usuario_actual.id)
 
-    if teacher_courses is not None and not teacher_courses:
-        rows = []
+    if cursos_docente is not None and not cursos_docente:
+        filas = []
     else:
-        stmt = (
-            select(AttendanceEvent, Person, AttendanceSession)
-            .join(Person, Person.id == AttendanceEvent.person_id)
-            .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
-            .where(AttendanceSession.organization_id == scoped_org_id)
-            .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
+        consulta = (
+            select(EventoAsistencia, Persona, SesionAsistencia)
+            .join(Persona, Persona.id == EventoAsistencia.id_persona)
+            .join(SesionAsistencia, SesionAsistencia.id == EventoAsistencia.id_sesion)
+            .where(SesionAsistencia.id_organizacion == id_org_alcance)
+            .order_by(EventoAsistencia.fecha_hora.desc(), EventoAsistencia.id.desc())
         )
-        if teacher_courses is not None:
-            stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
-        if session_id is not None:
-            stmt = stmt.where(AttendanceEvent.session_id == session_id)
+        if cursos_docente is not None:
+            consulta = consulta.where(SesionAsistencia.id_asignacion_curso.in_(cursos_docente))
+        if id_sesion is not None:
+            consulta = consulta.where(EventoAsistencia.id_sesion == id_sesion)
 
-        rows = db.execute(stmt).all()
+        filas = sesion_bd.execute(consulta).all()
 
-    shift_names = {
-        sh.id: sh.name
-        for sh in db.scalars(
-            select(WorkShift).where(WorkShift.organization_id == scoped_org_id)
+    nombres_turnos = {
+        turno.id: turno.nombre
+        for turno in sesion_bd.scalars(
+            select(TurnoLaboral).where(TurnoLaboral.id_organizacion == id_org_alcance)
         ).all()
     }
-    csv_content = export_events_csv(
-        [(ev, per, ses) for ev, per, ses in rows],
-        shift_names=shift_names,
+    contenido_csv = exportar_eventos_csv(
+        [(evento, persona, sesion) for evento, persona, sesion in filas],
+        nombres_turnos=nombres_turnos,
     )
     return Response(
-        content=csv_content.encode("utf-8"),
+        content=contenido_csv.encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="asistencia_identia.csv"'},
     )

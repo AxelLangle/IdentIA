@@ -1,836 +1,916 @@
+"""Pruebas de turnos laborales empresariales, jornadas nocturnas, estadísticas y Alembic 0004."""
+
 from datetime import date, datetime
 from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
 
-from app.config import BACKEND_DIR, get_settings
-from app.db import create_db_engine
-from app.models import AttendanceSession, Organization, Person, WorkShift
-from app.services.attendance_service import record_recognized_attendance
-from app.services.enterprise_service import generate_shift_sessions_for_date
+from app.config import DIRECTORIO_BACKEND, obtener_configuracion
+from app.db import crear_motor_bd
+from app.models import Organizacion, Persona, SesionAsistencia
+from app.services.attendance_service import registrar_asistencia_reconocida
+from app.services.enterprise_service import generar_sesiones_turno_para_fecha
 
 
-def _auth_header(client, email: str, password: str) -> dict[str, str]:
-    res = client.post("/api/auth/login", json={"email": email, "password": password})
-    assert res.status_code == 200, res.text
-    return {"Authorization": f"Bearer {res.json()['access_token']}"}
+def _encabezado_autorizacion(cliente, correo: str, contrasena: str) -> dict[str, str]:
+    """Inicia sesión en `/api/auth/login` y devuelve el encabezado Bearer JWT."""
+    respuesta = cliente.post(
+        "/api/auth/login",
+        json={"correo": correo, "contrasena": contrasena},
+    )
+    assert respuesta.status_code == 200, respuesta.text
+    return {"Authorization": f"Bearer {respuesta.json()['token_acceso']}"}
 
 
-def _create_enterprise_org(
-    client,
-    sa_headers: dict[str, str],
+def _crear_organizacion_empresarial(
+    cliente,
+    encabezados_sa: dict[str, str],
     *,
-    name: str,
-    admin_email: str,
-    admin_password: str = "EmpresaPass123!",
-    late_tolerance_minutes: int = 15,
+    nombre: str,
+    correo_admin: str,
+    contrasena_admin: str = "EmpresaPass123!",
+    minutos_tolerancia_retardo: int = 15,
 ) -> tuple[int, dict[str, str]]:
-    res = client.post(
+    """Crea una organización empresarial con su administrador y retorna `(id_org, headers)`."""
+    respuesta = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": name,
-            "mode": "enterprise",
-            "late_tolerance_minutes": late_tolerance_minutes,
-            "cooldown_seconds": 30,
-            "admin_user": {
-                "full_name": f"Admin {name}",
-                "email": admin_email,
-                "password": admin_password,
+            "nombre": nombre,
+            "modo": "enterprise",
+            "minutos_tolerancia_retardo": minutos_tolerancia_retardo,
+            "segundos_enfriamiento": 30,
+            "usuario_administrador": {
+                "nombre_completo": f"Admin {nombre}",
+                "correo": correo_admin,
+                "contrasena": contrasena_admin,
             },
         },
     )
-    assert res.status_code == 201, res.text
-    return res.json()["id"], _auth_header(client, admin_email, admin_password)
+    assert respuesta.status_code == 201, respuesta.text
+    return respuesta.json()["id"], _encabezado_autorizacion(cliente, correo_admin, contrasena_admin)
 
 
-def test_work_shift_crud_validations_and_multi_tenant_rbac(raw_api_client) -> None:
+def test_crud_turnos_validaciones_y_rbac_multiorganizacion(cliente_api_sin_autenticar) -> None:
     """Valida alta, edición, borrado, cruce medianoche, validaciones y aislamiento RBAC."""
-    client, _, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    org_a, admin_a = _create_enterprise_org(
-        client, sa_headers, name="Planta Alfa", admin_email="admin.alfa@corp.com"
+    org_a, admin_a = _crear_organizacion_empresarial(
+        cliente, encabezados_sa, nombre="Planta Alfa", correo_admin="admin.alfa@corp.com"
     )
-    org_b, admin_b = _create_enterprise_org(
-        client, sa_headers, name="Planta Beta", admin_email="admin.beta@corp.com"
+    org_b, admin_b = _crear_organizacion_empresarial(
+        cliente, encabezados_sa, nombre="Planta Beta", correo_admin="admin.beta@corp.com"
     )
 
-    op_res = client.post(
+    res_operador = cliente.post(
         "/api/users",
         headers=admin_a,
         json={
-            "email": "kiosco.alfa@corp.com",
-            "full_name": "Operador Kiosco",
-            "password": "OperPass123!",
-            "role": "operator",
-            "organization_id": org_a,
+            "correo": "kiosco.alfa@corp.com",
+            "nombre_completo": "Operador Kiosco",
+            "contrasena": "OperPass123!",
+            "rol": "operator",
+            "id_organizacion": org_a,
         },
     )
-    assert op_res.status_code == 201, op_res.text
-    op_headers = _auth_header(client, "kiosco.alfa@corp.com", "OperPass123!")
+    assert res_operador.status_code == 201, res_operador.text
+    encabezados_op = _encabezado_autorizacion(cliente, "kiosco.alfa@corp.com", "OperPass123!")
 
     # Turno diurno
-    day_res = client.post(
+    res_diurno = cliente.post(
         "/api/enterprise/shifts",
         headers=admin_a,
         json={
-            "organization_id": org_a,
-            "name": "Matutino",
-            "code": "mat-01",
-            "start_time": "08:00",
-            "end_time": "17:00",
-            "days_of_week": [0, 1, 2, 3, 4],
-            "late_tolerance_minutes": None,
-            "early_exit_tolerance_minutes": 10,
+            "id_organizacion": org_a,
+            "nombre": "Matutino",
+            "codigo": "mat-01",
+            "hora_inicio": "08:00",
+            "hora_fin": "17:00",
+            "dias_semana": [0, 1, 2, 3, 4],
+            "minutos_tolerancia_retardo": None,
+            "minutos_tolerancia_salida_anticipada": 10,
         },
     )
-    assert day_res.status_code == 201, day_res.text
-    day_shift = day_res.json()
-    assert day_shift["code"] == "MAT-01"
-    assert day_shift["crosses_midnight"] is False
-    assert day_shift["expected_duration_minutes"] == 540
-    assert day_shift["effective_late_tolerance_minutes"] == 15
+    assert res_diurno.status_code == 201, res_diurno.text
+    turno_diurno = res_diurno.json()
+    assert turno_diurno["codigo"] == "MAT-01"
+    assert turno_diurno["cruza_medianoche"] is False
+    assert turno_diurno["duracion_esperada_minutos"] == 540
+    assert turno_diurno["minutos_tolerancia_retardo_efectiva"] == 15
 
     # Turno nocturno con cruce de medianoche
-    night_res = client.post(
+    res_nocturno = cliente.post(
         "/api/enterprise/shifts",
         headers=admin_a,
         json={
-            "organization_id": org_a,
-            "name": "Nocturno Logística",
-            "code": "NOC-01",
-            "start_time": "22:00",
-            "end_time": "06:00",
-            "days_of_week": [0, 1, 2, 3, 4],
-            "late_tolerance_minutes": 10,
-            "early_exit_tolerance_minutes": 15,
+            "id_organizacion": org_a,
+            "nombre": "Nocturno Logística",
+            "codigo": "NOC-01",
+            "hora_inicio": "22:00",
+            "hora_fin": "06:00",
+            "dias_semana": [0, 1, 2, 3, 4],
+            "minutos_tolerancia_retardo": 10,
+            "minutos_tolerancia_salida_anticipada": 15,
         },
     )
-    assert night_res.status_code == 201, night_res.text
-    night_shift = night_res.json()
-    assert night_shift["crosses_midnight"] is True
-    assert night_shift["expected_duration_minutes"] == 480
+    assert res_nocturno.status_code == 201, res_nocturno.text
+    turno_nocturno = res_nocturno.json()
+    assert turno_nocturno["cruza_medianoche"] is True
+    assert turno_nocturno["duracion_esperada_minutos"] == 480
 
-    # Validaciones de error
-    same_hours = client.post(
+    # Validaciones de entrada/salida iguales, días vacíos y código duplicado
+    horas_iguales = cliente.post(
         "/api/enterprise/shifts",
         headers=admin_a,
         json={
-            "organization_id": org_a,
-            "name": "Inválido",
-            "code": "INV-1",
-            "start_time": "09:00",
-            "end_time": "09:00",
-            "days_of_week": [0, 1],
+            "id_organizacion": org_a,
+            "nombre": "Inválido",
+            "codigo": "INV-1",
+            "hora_inicio": "09:00",
+            "hora_fin": "09:00",
+            "dias_semana": [0, 1],
         },
     )
-    assert same_hours.status_code == 400
+    assert horas_iguales.status_code == 400
 
-    empty_days = client.post(
+    dias_vacios = cliente.post(
         "/api/enterprise/shifts",
         headers=admin_a,
         json={
-            "organization_id": org_a,
-            "name": "Sin días",
-            "code": "INV-2",
-            "start_time": "09:00",
-            "end_time": "17:00",
-            "days_of_week": [],
+            "id_organizacion": org_a,
+            "nombre": "Sin días",
+            "codigo": "INV-2",
+            "hora_inicio": "09:00",
+            "hora_fin": "17:00",
+            "dias_semana": [],
         },
     )
-    assert empty_days.status_code == 400
+    assert dias_vacios.status_code == 400
 
-    dup_code = client.post(
+    codigo_duplicado = cliente.post(
         "/api/enterprise/shifts",
         headers=admin_a,
         json={
-            "organization_id": org_a,
-            "name": "Matutino Duplicado",
-            "code": "MAT-01",
-            "start_time": "07:00",
-            "end_time": "15:00",
-            "days_of_week": [0],
+            "id_organizacion": org_a,
+            "nombre": "Matutino Duplicado",
+            "codigo": "MAT-01",
+            "hora_inicio": "07:00",
+            "hora_fin": "15:00",
+            "dias_semana": [0],
         },
     )
-    assert dup_code.status_code == 409
+    assert codigo_duplicado.status_code == 409
 
-    # Aislamiento multi-tenant (Admin B no accede a Org A)
-    assert client.get(f"/api/enterprise/shifts?organization_id={org_a}", headers=admin_b).status_code == 403
+    # Aislamiento multi-inquilino (Admin B no accede a Org A)
     assert (
-        client.patch(
-            f"/api/enterprise/shifts/{day_shift['id']}",
+        cliente.get(f"/api/enterprise/shifts?id_organizacion={org_a}", headers=admin_b).status_code
+        == 403
+    )
+    assert (
+        cliente.patch(
+            f"/api/enterprise/shifts/{turno_diurno['id']}",
             headers=admin_b,
-            json={"name": "Hack"},
+            json={"nombre": "Hack"},
         ).status_code
         == 403
     )
-    assert client.delete(f"/api/enterprise/shifts/{day_shift['id']}", headers=admin_b).status_code == 403
-    assert client.get(f"/api/enterprise/stats?organization_id={org_a}", headers=admin_b).status_code == 403
-
-    # RBAC de operador: no administra catálogo ni ve stats, pero sí lista y abre kiosco
     assert (
-        client.post(
+        cliente.delete(
+            f"/api/enterprise/shifts/{turno_diurno['id']}", headers=admin_b
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.get(f"/api/enterprise/stats?id_organizacion={org_a}", headers=admin_b).status_code
+        == 403
+    )
+
+    # RBAC de operador: no modifica catálogo ni consulta stats, pero sí lista y abre kiosco
+    assert (
+        cliente.post(
             "/api/enterprise/shifts",
-            headers=op_headers,
+            headers=encabezados_op,
             json={
-                "organization_id": org_a,
-                "name": "Operador No Puede",
-                "code": "OP-NO",
-                "start_time": "10:00",
-                "end_time": "18:00",
+                "id_organizacion": org_a,
+                "nombre": "Operador No Puede",
+                "codigo": "OP-NO",
+                "hora_inicio": "10:00",
+                "hora_fin": "18:00",
             },
         ).status_code
         == 403
     )
-    assert client.delete(f"/api/enterprise/shifts/{day_shift['id']}", headers=op_headers).status_code == 403
-    assert client.get(f"/api/enterprise/stats?organization_id={org_a}", headers=op_headers).status_code == 403
-    assert client.get(f"/api/enterprise/shifts?organization_id={org_a}", headers=op_headers).status_code == 200
-    start_sess = client.post(
-        f"/api/enterprise/shifts/{day_shift['id']}/start-session",
-        headers=op_headers,
-        json={"session_date": "2026-11-16"},
+    assert (
+        cliente.delete(
+            f"/api/enterprise/shifts/{turno_diurno['id']}", headers=encabezados_op
+        ).status_code
+        == 403
     )
-    assert start_sess.status_code == 200, start_sess.text
-    assert start_sess.json()["work_shift_id"] == day_shift["id"]
+    assert (
+        cliente.get(
+            f"/api/enterprise/stats?id_organizacion={org_a}", headers=encabezados_op
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.get(
+            f"/api/enterprise/shifts?id_organizacion={org_a}", headers=encabezados_op
+        ).status_code
+        == 200
+    )
+    iniciar_sesion = cliente.post(
+        f"/api/enterprise/shifts/{turno_diurno['id']}/start-session",
+        headers=encabezados_op,
+        json={"fecha_sesion": "2026-11-16"},
+    )
+    assert iniciar_sesion.status_code == 200, iniciar_sesion.text
+    assert iniciar_sesion.json()["id_turno_laboral"] == turno_diurno["id"]
 
-    # Eliminar turno vinculado a empleado limpia FK sin error
-    emp = client.post(
+    # Eliminar turno vinculado a un empleado limpia la FK (ON DELETE SET NULL) sin errores
+    empleado = cliente.post(
         "/api/persons",
         headers=admin_a,
         json={
-            "organization_id": org_a,
-            "external_id": "EMP-DEL-1",
-            "full_name": "Carlos Ruiz",
-            "role": "employee",
-            "biometric_consent": True,
-            "work_shift_id": night_shift["id"],
+            "id_organizacion": org_a,
+            "identificador_externo": "EMP-DEL-1",
+            "nombre_completo": "Carlos Ruiz",
+            "rol": "employee",
+            "consentimiento_biometrico": True,
+            "id_turno_laboral": turno_nocturno["id"],
         },
     )
-    assert emp.status_code == 201, emp.text
-    assert emp.json()["shift_source"] == "direct"
+    assert empleado.status_code == 201, empleado.text
+    assert empleado.json()["origen_turno"] == "direct"
 
-    assert client.delete(f"/api/enterprise/shifts/{night_shift['id']}", headers=admin_a).status_code == 204
-    persons_after = client.get(f"/api/persons?organization_id={org_a}", headers=admin_a).json()
-    emp_after = next(p for p in persons_after if p["id"] == emp.json()["id"])
-    assert emp_after["work_shift_id"] is None
-    assert emp_after["effective_work_shift_id"] is None
-    assert emp_after["shift_source"] == "none"
+    assert (
+        cliente.delete(
+            f"/api/enterprise/shifts/{turno_nocturno['id']}", headers=admin_a
+        ).status_code
+        == 204
+    )
+    personas_despues = cliente.get(
+        f"/api/persons?id_organizacion={org_a}", headers=admin_a
+    ).json()
+    emp_despues = next(p for p in personas_despues if p["id"] == empleado.json()["id"])
+    assert emp_despues["id_turno_laboral"] is None
+    assert emp_despues["id_turno_laboral_efectivo"] is None
+    assert emp_despues["origen_turno"] == "none"
 
 
-def test_shift_punctuality_late_early_exit_and_group_inheritance(raw_api_client) -> None:
-    """Valida puntualidad, retardo, salida anticipada y herencia de turno desde departamento."""
-    client, SessionLocal, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+def test_puntualidad_retardo_salida_anticipada_y_herencia_departamento(
+    cliente_api_sin_autenticar,
+) -> None:
+    """Valida reglas de puntualidad, retardo, salida temprana y herencia por departamento."""
+    cliente, FabricaSesiones, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    org_id, admin_headers = _create_enterprise_org(
-        client,
-        sa_headers,
-        name="Fábrica Central",
-        admin_email="admin@fabrica.com",
-        late_tolerance_minutes=15,
+    id_org, encabezados_admin = _crear_organizacion_empresarial(
+        cliente,
+        encabezados_sa,
+        nombre="Fábrica Central",
+        correo_admin="admin@fabrica.com",
+        minutos_tolerancia_retardo=15,
     )
 
-    shift = client.post(
+    turno = cliente.post(
         "/api/enterprise/shifts",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Oficina 9-6",
-            "code": "OF-0918",
-            "start_time": "09:00",
-            "end_time": "18:00",
-            "days_of_week": [0, 1, 2, 3, 4],
-            "late_tolerance_minutes": 10,
-            "early_exit_tolerance_minutes": 15,
+            "id_organizacion": id_org,
+            "nombre": "Oficina 9-6",
+            "codigo": "OF-0918",
+            "hora_inicio": "09:00",
+            "hora_fin": "18:00",
+            "dias_semana": [0, 1, 2, 3, 4],
+            "minutos_tolerancia_retardo": 10,
+            "minutos_tolerancia_salida_anticipada": 15,
         },
     ).json()
 
-    dept = client.post(
+    departamento = cliente.post(
         "/api/groups",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Producción",
-            "code": "PROD",
-            "schedule_start": "09:00",
-            "schedule_end": "18:00",
-            "default_work_shift_id": shift["id"],
+            "id_organizacion": id_org,
+            "nombre": "Producción",
+            "codigo": "PROD",
+            "hora_inicio_horario": "09:00",
+            "hora_fin_horario": "18:00",
+            "id_turno_laboral_defecto": turno["id"],
         },
     )
-    assert dept.status_code == 201, dept.text
-    assert dept.json()["default_work_shift_name"] == "Oficina 9-6"
+    assert departamento.status_code == 201, departamento.text
+    assert departamento.json()["nombre_turno_laboral_defecto"] == "Oficina 9-6"
 
-    emp_direct = client.post(
+    emp_directo = cliente.post(
         "/api/persons",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "external_id": "EMP-D1",
-            "full_name": "Ana López",
-            "role": "employee",
-            "biometric_consent": True,
-            "work_shift_id": shift["id"],
+            "id_organizacion": id_org,
+            "identificador_externo": "EMP-D1",
+            "nombre_completo": "Ana López",
+            "rol": "employee",
+            "consentimiento_biometrico": True,
+            "id_turno_laboral": turno["id"],
         },
     ).json()
-    assert emp_direct["shift_source"] == "direct"
+    assert emp_directo["origen_turno"] == "direct"
 
-    emp_group = client.post(
+    emp_grupo = cliente.post(
         "/api/persons",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "external_id": "EMP-G2",
-            "full_name": "Luis García",
-            "role": "employee",
-            "biometric_consent": True,
-            "group_ids": [dept.json()["id"]],
+            "id_organizacion": id_org,
+            "identificador_externo": "EMP-G2",
+            "nombre_completo": "Luis García",
+            "rol": "employee",
+            "consentimiento_biometrico": True,
+            "ids_grupos": [departamento.json()["id"]],
         },
     ).json()
-    assert emp_group["work_shift_id"] is None
-    assert emp_group["effective_work_shift_id"] == shift["id"]
-    assert emp_group["shift_source"] == "group"
+    assert emp_grupo["id_turno_laboral"] is None
+    assert emp_grupo["id_turno_laboral_efectivo"] == turno["id"]
+    assert emp_grupo["origen_turno"] == "group"
 
-    sess_res = client.post(
+    res_sesion = cliente.post(
         "/api/sessions",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "title": "Jornada Lunes 2026-11-16",
-            "session_date": "2026-11-16",
+            "id_organizacion": id_org,
+            "titulo": "Jornada Lunes 2026-11-16",
+            "fecha_sesion": "2026-11-16",
         },
     )
-    assert sess_res.status_code == 201, sess_res.text
-    sess_id = sess_res.json()["id"]
+    assert res_sesion.status_code == 201, res_sesion.text
+    id_sesion = res_sesion.json()["id"]
 
-    with SessionLocal() as db:
-        org_obj = db.get(Organization, org_id)
-        sess_obj = db.get(AttendanceSession, sess_id)
-        p1 = db.get(Person, emp_direct["id"])
-        p2 = db.get(Person, emp_group["id"])
-        assert org_obj and sess_obj and p1 and p2
+    with FabricaSesiones() as sesion_bd:
+        org_obj = sesion_bd.get(Organizacion, id_org)
+        ses_obj = sesion_bd.get(SesionAsistencia, id_sesion)
+        p1 = sesion_bd.get(Persona, emp_directo["id"])
+        p2 = sesion_bd.get(Persona, emp_grupo["id"])
+        assert org_obj and ses_obj and p1 and p2
 
-        # Emp 1: llega dentro de tolerancia (09:08 <= 09:10) pero sale temprano (17:20 < 17:45)
-        r1_in = record_recognized_attendance(
-            db, org_obj, sess_obj, p1, 0.92, action_mode="auto", now=datetime(2026, 11, 16, 9, 8)
+        # Emp 1: llega dentro de tolerancia (09:08 <= 09:10) pero sale anticipado (17:20 < 17:45)
+        r1_entrada = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_obj, p1, 0.92, modo_accion="auto", ahora=datetime(2026, 11, 16, 9, 8)
         )
-        assert r1_in.event is not None
-        assert r1_in.event.event_type == "check_in"
-        assert r1_in.event.status == "on_time"
-        assert r1_in.late_minutes == 0
+        assert r1_entrada.evento is not None
+        assert r1_entrada.evento.tipo_evento == "check_in"
+        assert r1_entrada.evento.estado == "on_time"
+        assert r1_entrada.minutos_retardo == 0
 
-        r1_out = record_recognized_attendance(
-            db, org_obj, sess_obj, p1, 0.93, action_mode="auto", now=datetime(2026, 11, 16, 17, 20)
+        r1_salida = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_obj, p1, 0.93, modo_accion="auto", ahora=datetime(2026, 11, 16, 17, 20)
         )
-        assert r1_out.event is not None
-        assert r1_out.event.event_type == "check_out"
-        assert r1_out.event.status == "early_exit"
-        assert r1_out.early_exit_minutes == 40
-        assert r1_out.worked_minutes == 492
+        assert r1_salida.evento is not None
+        assert r1_salida.evento.tipo_evento == "check_out"
+        assert r1_salida.evento.estado == "early_exit"
+        assert r1_salida.minutos_salida_anticipada == 40
+        assert r1_salida.minutos_trabajados == 492
 
-        # Emp 2 (turno heredado del grupo): llega con retardo (09:22) y sale a tiempo (17:50 >= 17:45)
-        r2_in = record_recognized_attendance(
-            db, org_obj, sess_obj, p2, 0.91, action_mode="auto", now=datetime(2026, 11, 16, 9, 22)
+        # Emp 2 (turno heredado): llega con retardo (09:22) y sale en horario normal (17:50 >= 17:45)
+        r2_entrada = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_obj, p2, 0.91, modo_accion="auto", ahora=datetime(2026, 11, 16, 9, 22)
         )
-        assert r2_in.event is not None
-        assert r2_in.event.event_type == "check_in"
-        assert r2_in.event.status == "late"
-        assert r2_in.late_minutes == 22
+        assert r2_entrada.evento is not None
+        assert r2_entrada.evento.tipo_evento == "check_in"
+        assert r2_entrada.evento.estado == "late"
+        assert r2_entrada.minutos_retardo == 22
 
-        r2_out = record_recognized_attendance(
-            db, org_obj, sess_obj, p2, 0.94, action_mode="auto", now=datetime(2026, 11, 16, 17, 50)
+        r2_salida = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_obj, p2, 0.94, modo_accion="auto", ahora=datetime(2026, 11, 16, 17, 50)
         )
-        assert r2_out.event is not None
-        assert r2_out.event.event_type == "check_out"
-        assert r2_out.event.status == "on_time"
-        assert r2_out.early_exit_minutes == 0
-        assert r2_out.worked_minutes == 508
+        assert r2_salida.evento is not None
+        assert r2_salida.evento.tipo_evento == "check_out"
+        assert r2_salida.evento.estado == "on_time"
+        assert r2_salida.minutos_salida_anticipada == 0
+        assert r2_salida.minutos_trabajados == 508
 
 
-def test_overnight_shift_crosses_midnight_checkout_and_early_exit(raw_api_client) -> None:
-    """Valida que un turno nocturno 22:00-06:00 cierre al día siguiente sobre la sesión origen."""
-    client, SessionLocal, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+def test_turno_nocturno_cruce_medianoche_salida_dia_siguiente(cliente_api_sin_autenticar) -> None:
+    """Valida que un turno 22:00-06:00 cierre al día siguiente sobre la sesión de entrada."""
+    cliente, FabricaSesiones, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    org_id, admin_headers = _create_enterprise_org(
-        client, sa_headers, name="Logística 24/7", admin_email="admin@log247.com"
+    id_org, encabezados_admin = _crear_organizacion_empresarial(
+        cliente, encabezados_sa, nombre="Logística 24/7", correo_admin="admin@log247.com"
     )
 
-    night = client.post(
+    nocturno = cliente.post(
         "/api/enterprise/shifts",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Nocturno",
-            "code": "NOC-2206",
-            "start_time": "22:00",
-            "end_time": "06:00",
-            "days_of_week": [0, 1, 2, 3, 4],
-            "late_tolerance_minutes": 15,
-            "early_exit_tolerance_minutes": 10,
+            "id_organizacion": id_org,
+            "nombre": "Nocturno",
+            "codigo": "NOC-2206",
+            "hora_inicio": "22:00",
+            "hora_fin": "06:00",
+            "dias_semana": [0, 1, 2, 3, 4],
+            "minutos_tolerancia_retardo": 15,
+            "minutos_tolerancia_salida_anticipada": 10,
         },
     ).json()
 
-    emp_a = client.post(
+    emp_a = cliente.post(
         "/api/persons",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "external_id": "NOC-A",
-            "full_name": "Elena Torres",
-            "biometric_consent": True,
-            "work_shift_id": night["id"],
+            "id_organizacion": id_org,
+            "identificador_externo": "NOC-A",
+            "nombre_completo": "Elena Torres",
+            "consentimiento_biometrico": True,
+            "id_turno_laboral": nocturno["id"],
         },
     ).json()
-    emp_b = client.post(
+    emp_b = cliente.post(
         "/api/persons",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "external_id": "NOC-B",
-            "full_name": "Mateo Vega",
-            "biometric_consent": True,
-            "work_shift_id": night["id"],
+            "id_organizacion": id_org,
+            "identificador_externo": "NOC-B",
+            "nombre_completo": "Mateo Vega",
+            "consentimiento_biometrico": True,
+            "id_turno_laboral": nocturno["id"],
         },
     ).json()
 
-    s_day1 = client.post(
-        f"/api/enterprise/shifts/{night['id']}/start-session",
-        headers=admin_headers,
-        json={"session_date": "2026-11-16"},
+    ses_dia1 = cliente.post(
+        f"/api/enterprise/shifts/{nocturno['id']}/start-session",
+        headers=encabezados_admin,
+        json={"fecha_sesion": "2026-11-16"},
     ).json()
-    s_day2 = client.post(
-        f"/api/enterprise/shifts/{night['id']}/start-session",
-        headers=admin_headers,
-        json={"session_date": "2026-11-17"},
+    ses_dia2 = cliente.post(
+        f"/api/enterprise/shifts/{nocturno['id']}/start-session",
+        headers=encabezados_admin,
+        json={"fecha_sesion": "2026-11-17"},
     ).json()
 
-    with SessionLocal() as db:
-        org_obj = db.get(Organization, org_id)
-        sess1 = db.get(AttendanceSession, s_day1["id"])
-        sess2 = db.get(AttendanceSession, s_day2["id"])
-        pa = db.get(Person, emp_a["id"])
-        pb = db.get(Person, emp_b["id"])
-        assert org_obj and sess1 and sess2 and pa and pb
+    with FabricaSesiones() as sesion_bd:
+        org_obj = sesion_bd.get(Organizacion, id_org)
+        s1 = sesion_bd.get(SesionAsistencia, ses_dia1["id"])
+        s2 = sesion_bd.get(SesionAsistencia, ses_dia2["id"])
+        pa = sesion_bd.get(Persona, emp_a["id"])
+        pb = sesion_bd.get(Persona, emp_b["id"])
+        assert org_obj and s1 and s2 and pa and pb
 
-        in_a = record_recognized_attendance(
-            db, org_obj, sess1, pa, 0.90, action_mode="auto", now=datetime(2026, 11, 16, 22, 5)
+        ent_a = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, s1, pa, 0.90, modo_accion="auto", ahora=datetime(2026, 11, 16, 22, 5)
         )
-        assert in_a.event and in_a.event.status == "on_time"
+        assert ent_a.evento and ent_a.evento.estado == "on_time"
 
-        in_b = record_recognized_attendance(
-            db, org_obj, sess1, pb, 0.91, action_mode="auto", now=datetime(2026, 11, 16, 22, 0)
+        ent_b = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, s1, pb, 0.91, modo_accion="auto", ahora=datetime(2026, 11, 16, 22, 0)
         )
-        assert in_b.event and in_b.event.status == "on_time"
+        assert ent_b.evento and ent_b.evento.estado == "on_time"
 
-        # Al día siguiente (2026-11-17) marcan en la sesión del día 2; debe cerrar la sesión del día 1
-        out_a = record_recognized_attendance(
-            db, org_obj, sess2, pa, 0.92, action_mode="auto", now=datetime(2026, 11, 17, 5, 30)
+        # Al día siguiente marcan en la sesión del día 2 y el motor cierra la entrada del día 1
+        sal_a = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, s2, pa, 0.92, modo_accion="auto", ahora=datetime(2026, 11, 17, 5, 30)
         )
-        assert out_a.action == "recorded"
-        assert out_a.event is not None
-        assert out_a.event.session_id == sess1.id
-        assert out_a.event.event_type == "check_out"
-        assert out_a.event.status == "early_exit"
-        assert out_a.early_exit_minutes == 30
-        assert out_a.worked_minutes == 445
+        assert sal_a.accion == "recorded"
+        assert sal_a.evento is not None
+        assert sal_a.evento.id_sesion == s1.id
+        assert sal_a.evento.tipo_evento == "check_out"
+        assert sal_a.evento.estado == "early_exit"
+        assert sal_a.minutos_salida_anticipada == 30
+        assert sal_a.minutos_trabajados == 445
 
-        out_b = record_recognized_attendance(
-            db, org_obj, sess2, pb, 0.95, action_mode="auto", now=datetime(2026, 11, 17, 5, 55)
+        sal_b = registrar_asistencia_reconocida(
+            sesion_bd, org_obj, s2, pb, 0.95, modo_accion="auto", ahora=datetime(2026, 11, 17, 5, 55)
         )
-        assert out_b.action == "recorded"
-        assert out_b.event is not None
-        assert out_b.event.session_id == sess1.id
-        assert out_b.event.event_type == "check_out"
-        assert out_b.event.status == "on_time"
-        assert out_b.early_exit_minutes == 0
-        assert out_b.worked_minutes == 475
+        assert sal_b.accion == "recorded"
+        assert sal_b.evento is not None
+        assert sal_b.evento.id_sesion == s1.id
+        assert sal_b.evento.tipo_evento == "check_out"
+        assert sal_b.evento.estado == "on_time"
+        assert sal_b.minutos_salida_anticipada == 0
+        assert sal_b.minutos_trabajados == 475
 
 
-def test_bulk_assign_generate_sessions_enterprise_stats_and_csv(raw_api_client) -> None:
+def test_asignacion_masiva_generacion_sesiones_estadisticas_y_csv(
+    cliente_api_sin_autenticar,
+) -> None:
     """Valida asignación en lote, generación idempotente, estadísticas y CSV empresarial."""
-    client, SessionLocal, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+    cliente, FabricaSesiones, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    org_id, admin_headers = _create_enterprise_org(
-        client,
-        sa_headers,
-        name="Corporativo Norte",
-        admin_email="admin@norte.com",
-        late_tolerance_minutes=10,
+    id_org, encabezados_admin = _crear_organizacion_empresarial(
+        cliente,
+        encabezados_sa,
+        nombre="Corporativo Norte",
+        correo_admin="admin@norte.com",
+        minutos_tolerancia_retardo=10,
     )
 
-    m1 = client.post(
+    matutino = cliente.post(
         "/api/enterprise/shifts",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Matutino Corto",
-            "code": "M1",
-            "start_time": "08:00",
-            "end_time": "16:00",
-            "days_of_week": [0, 1, 2],
-            "late_tolerance_minutes": 10,
-            "early_exit_tolerance_minutes": 10,
+            "id_organizacion": id_org,
+            "nombre": "Matutino Corto",
+            "codigo": "M1",
+            "hora_inicio": "08:00",
+            "hora_fin": "16:00",
+            "dias_semana": [0, 1, 2],
+            "minutos_tolerancia_retardo": 10,
+            "minutos_tolerancia_salida_anticipada": 10,
         },
     ).json()
 
-    v1 = client.post(
+    cliente.post(
         "/api/enterprise/shifts",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Vespertino",
-            "code": "V1",
-            "start_time": "14:00",
-            "end_time": "22:00",
-            "days_of_week": [0, 1, 2, 3, 4],
+            "id_organizacion": id_org,
+            "nombre": "Vespertino",
+            "codigo": "V1",
+            "hora_inicio": "14:00",
+            "hora_fin": "22:00",
+            "dias_semana": [0, 1, 2, 3, 4],
         },
-    ).json()
-
-    emp1 = client.post(
-        "/api/persons",
-        headers=admin_headers,
-        json={
-            "organization_id": org_id,
-            "external_id": "N-01",
-            "full_name": "Sofía Salas",
-            "biometric_consent": True,
-        },
-    ).json()
-    emp2 = client.post(
-        "/api/persons",
-        headers=admin_headers,
-        json={
-            "organization_id": org_id,
-            "external_id": "N-02",
-            "full_name": "Jorge Méndez",
-            "biometric_consent": True,
-        },
-    ).json()
-    emp3 = client.post(
-        "/api/persons",
-        headers=admin_headers,
-        json={
-            "organization_id": org_id,
-            "external_id": "N-03",
-            "full_name": "Lucía Pardo",
-            "biometric_consent": True,
-        },
-    ).json()
-
-    bulk_assign = client.post(
-        f"/api/enterprise/shifts/{m1['id']}/assign-persons",
-        headers=admin_headers,
-        json={"person_ids": [emp1["id"], emp2["id"], emp3["id"]]},
     )
-    assert bulk_assign.status_code == 200, bulk_assign.text
-    assert bulk_assign.json()["updated_count"] == 3
 
-    bulk_clear = client.post(
-        f"/api/enterprise/shifts/{m1['id']}/assign-persons",
-        headers=admin_headers,
-        json={"person_ids": [emp3["id"]], "clear_shift": True},
+    emp1 = cliente.post(
+        "/api/persons",
+        headers=encabezados_admin,
+        json={
+            "id_organizacion": id_org,
+            "identificador_externo": "N-01",
+            "nombre_completo": "Sofía Salas",
+            "consentimiento_biometrico": True,
+        },
+    ).json()
+    emp2 = cliente.post(
+        "/api/persons",
+        headers=encabezados_admin,
+        json={
+            "id_organizacion": id_org,
+            "identificador_externo": "N-02",
+            "nombre_completo": "Jorge Méndez",
+            "consentimiento_biometrico": True,
+        },
+    ).json()
+    emp3 = cliente.post(
+        "/api/persons",
+        headers=encabezados_admin,
+        json={
+            "id_organizacion": id_org,
+            "identificador_externo": "N-03",
+            "nombre_completo": "Lucía Pardo",
+            "consentimiento_biometrico": True,
+        },
+    ).json()
+
+    asignar_lote = cliente.post(
+        f"/api/enterprise/shifts/{matutino['id']}/assign-persons",
+        headers=encabezados_admin,
+        json={"ids_personas": [emp1["id"], emp2["id"], emp3["id"]]},
     )
-    assert bulk_clear.status_code == 200
-    assert bulk_clear.json()["updated_count"] == 1
+    assert asignar_lote.status_code == 200, asignar_lote.text
+    assert asignar_lote.json()["cantidad_actualizados"] == 3
 
-    # Generación idempotente de jornadas para el lunes 2026-11-09
-    gen1 = client.post(
+    limpiar_lote = cliente.post(
+        f"/api/enterprise/shifts/{matutino['id']}/assign-persons",
+        headers=encabezados_admin,
+        json={"ids_personas": [emp3["id"]], "limpiar_turno": True},
+    )
+    assert limpiar_lote.status_code == 200
+    assert limpiar_lote.json()["cantidad_actualizados"] == 1
+
+    # Generación idempotente de jornadas para lunes 2026-11-09
+    gen1 = cliente.post(
         "/api/enterprise/sessions/generate",
-        headers=admin_headers,
-        json={"organization_id": org_id, "target_date": "2026-11-09"},
+        headers=encabezados_admin,
+        json={"id_organizacion": id_org, "fecha_objetivo": "2026-11-09"},
     )
     assert gen1.status_code == 200, gen1.text
-    assert gen1.json()["created_count"] == 2
-    assert gen1.json()["existing_count"] == 0
+    assert gen1.json()["cantidad_creadas"] == 2
+    assert gen1.json()["cantidad_existentes"] == 0
 
-    gen2 = client.post(
+    gen2 = cliente.post(
         "/api/enterprise/sessions/generate",
-        headers=admin_headers,
-        json={"organization_id": org_id, "target_date": "2026-11-09"},
+        headers=encabezados_admin,
+        json={"id_organizacion": id_org, "fecha_objetivo": "2026-11-09"},
     )
     assert gen2.status_code == 200
-    assert gen2.json()["created_count"] == 0
-    assert gen2.json()["existing_count"] == 2
+    assert gen2.json()["cantidad_creadas"] == 0
+    assert gen2.json()["cantidad_existentes"] == 2
 
-    with SessionLocal() as db:
-        _, _, sess_mon_list = generate_shift_sessions_for_date(
-            db, organization_id=org_id, target_date=date(2026, 11, 9), work_shift_id=m1["id"]
+    with FabricaSesiones() as sesion_bd:
+        _, _, lista_lunes = generar_sesiones_turno_para_fecha(
+            sesion_bd,
+            id_organizacion=id_org,
+            fecha_objetivo=date(2026, 11, 9),
+            id_turno_laboral=matutino["id"],
         )
-        _, _, sess_tue_list = generate_shift_sessions_for_date(
-            db, organization_id=org_id, target_date=date(2026, 11, 10), work_shift_id=m1["id"]
+        _, _, lista_martes = generar_sesiones_turno_para_fecha(
+            sesion_bd,
+            id_organizacion=id_org,
+            fecha_objetivo=date(2026, 11, 10),
+            id_turno_laboral=matutino["id"],
         )
-        _, _, _ = generate_shift_sessions_for_date(
-            db, organization_id=org_id, target_date=date(2026, 11, 11), work_shift_id=m1["id"]
+        generar_sesiones_turno_para_fecha(
+            sesion_bd,
+            id_organizacion=id_org,
+            fecha_objetivo=date(2026, 11, 11),
+            id_turno_laboral=matutino["id"],
         )
 
-        org_obj = db.get(Organization, org_id)
-        p1 = db.get(Person, emp1["id"])
-        p2 = db.get(Person, emp2["id"])
+        org_obj = sesion_bd.get(Organizacion, id_org)
+        p1 = sesion_bd.get(Persona, emp1["id"])
+        p2 = sesion_bd.get(Persona, emp2["id"])
         assert org_obj and p1 and p2
-        s_mon = sess_mon_list[0]
-        s_tue = sess_tue_list[0]
+        ses_lunes = lista_lunes[0]
+        ses_martes = lista_martes[0]
 
-        # Emp 1: Lunes a tiempo + salida a tiempo (483m), Martes retardo (+25m) + salida ant. (-30m, 425m), Miércoles falta
-        record_recognized_attendance(
-            db, org_obj, s_mon, p1, 0.90, action_mode="auto", now=datetime(2026, 11, 9, 8, 2)
+        # Emp 1: Lunes puntual (483m), Martes retardo (+25m) y salida anticipada (-30m, 425m), Miércoles falta
+        registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_lunes, p1, 0.90, modo_accion="auto", ahora=datetime(2026, 11, 9, 8, 2)
         )
-        record_recognized_attendance(
-            db, org_obj, s_mon, p1, 0.91, action_mode="auto", now=datetime(2026, 11, 9, 16, 5)
+        registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_lunes, p1, 0.91, modo_accion="auto", ahora=datetime(2026, 11, 9, 16, 5)
         )
-        record_recognized_attendance(
-            db, org_obj, s_tue, p1, 0.92, action_mode="auto", now=datetime(2026, 11, 10, 8, 25)
+        registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_martes, p1, 0.92, modo_accion="auto", ahora=datetime(2026, 11, 10, 8, 25)
         )
-        record_recognized_attendance(
-            db, org_obj, s_tue, p1, 0.93, action_mode="auto", now=datetime(2026, 11, 10, 15, 30)
-        )
-
-        # Emp 2: Lunes solo check-in (sin checkout), Martes y Miércoles falta
-        record_recognized_attendance(
-            db, org_obj, s_mon, p2, 0.89, action_mode="auto", now=datetime(2026, 11, 9, 8, 0)
+        registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_martes, p1, 0.93, modo_accion="auto", ahora=datetime(2026, 11, 10, 15, 30)
         )
 
-    stats_res = client.get(
-        f"/api/enterprise/stats?organization_id={org_id}&date_from=2026-11-09&date_to=2026-11-11",
-        headers=admin_headers,
+        # Emp 2: Lunes solo check-in (sin salida), Martes y Miércoles falta
+        registrar_asistencia_reconocida(
+            sesion_bd, org_obj, ses_lunes, p2, 0.89, modo_accion="auto", ahora=datetime(2026, 11, 9, 8, 0)
+        )
+
+    res_estadisticas = cliente.get(
+        f"/api/enterprise/stats?id_organizacion={id_org}&fecha_desde=2026-11-09&fecha_hasta=2026-11-11",
+        headers=encabezados_admin,
     )
-    assert stats_res.status_code == 200, stats_res.text
-    stats = stats_res.json()
+    assert res_estadisticas.status_code == 200, res_estadisticas.text
+    estadisticas = res_estadisticas.json()
 
-    assert stats["summary"]["total_shifts"] == 2
-    assert stats["summary"]["total_employees"] == 3
-    assert stats["summary"]["assigned_employees"] == 2
-    assert stats["summary"]["unassigned_employees"] == 1
-    assert stats["summary"]["scheduled_employee_days"] == 6
-    assert stats["summary"]["present_days"] == 3
-    assert stats["summary"]["absent_days"] == 3
-    assert stats["summary"]["missing_checkout_days"] == 1
+    assert estadisticas["resumen"]["total_turnos"] == 2
+    assert estadisticas["resumen"]["total_empleados"] == 3
+    assert estadisticas["resumen"]["empleados_asignados"] == 2
+    assert estadisticas["resumen"]["empleados_sin_turno"] == 1
+    assert estadisticas["resumen"]["dias_empleado_programados"] == 6
+    assert estadisticas["resumen"]["dias_asistidos"] == 3
+    assert estadisticas["resumen"]["dias_falta"] == 3
+    assert estadisticas["resumen"]["dias_sin_salida"] == 1
 
-    st_emp1 = next(e for e in stats["by_employee"] if e["person_id"] == emp1["id"])
-    assert st_emp1["scheduled_days"] == 3
-    assert st_emp1["present_days"] == 2
-    assert st_emp1["on_time_days"] == 1
-    assert st_emp1["late_days"] == 1
-    assert st_emp1["early_exit_days"] == 1
-    assert st_emp1["absent_days"] == 1
-    assert st_emp1["total_late_minutes"] == 25
-    assert st_emp1["total_early_exit_minutes"] == 30
-    assert st_emp1["total_worked_minutes"] == 908
+    est_emp1 = next(e for e in estadisticas["por_empleado"] if e["id_persona"] == emp1["id"])
+    assert est_emp1["dias_programados"] == 3
+    assert est_emp1["dias_asistidos"] == 2
+    assert est_emp1["dias_puntuales"] == 1
+    assert est_emp1["dias_con_retardo"] == 1
+    assert est_emp1["dias_salida_anticipada"] == 1
+    assert est_emp1["dias_falta"] == 1
+    assert est_emp1["total_minutos_retardo"] == 25
+    assert est_emp1["total_minutos_salida_anticipada"] == 30
+    assert est_emp1["total_minutos_trabajados"] == 908
 
-    st_emp2 = next(e for e in stats["by_employee"] if e["person_id"] == emp2["id"])
-    assert st_emp2["missing_checkout_days"] == 1
-    assert st_emp2["absent_days"] == 2
+    est_emp2 = next(e for e in estadisticas["por_empleado"] if e["id_persona"] == emp2["id"])
+    assert est_emp2["dias_sin_salida"] == 1
+    assert est_emp2["dias_falta"] == 2
 
-    shift_names_in_stats = [s["shift_name"] for s in stats["by_shift"]]
-    assert "Matutino Corto" in shift_names_in_stats
-    assert "Sin turno asignado" in shift_names_in_stats
+    nombres_turnos_est = [t["nombre_turno"] for t in estadisticas["por_turno"]]
+    assert "Matutino Corto" in nombres_turnos_est
+    assert "Sin turno asignado" in nombres_turnos_est
 
-    csv_res = client.get(f"/api/attendance/export.csv?organization_id={org_id}", headers=admin_headers)
-    assert csv_res.status_code == 200
-    assert csv_res.text.startswith("\ufeff")
-    assert "Turno,Minutos Trabajados,Minutos Retardo,Minutos Salida Anticipada" in csv_res.text
-    assert "Matutino Corto" in csv_res.text
-    assert "425" in csv_res.text
+    respuesta_csv = cliente.get(
+        f"/api/attendance/export.csv?id_organizacion={id_org}", headers=encabezados_admin
+    )
+    assert respuesta_csv.status_code == 200
+    assert respuesta_csv.text.startswith("\ufeff")
+    assert (
+        "Turno,Minutos Trabajados,Minutos Retardo,Minutos Salida Anticipada" in respuesta_csv.text
+    )
+    assert "Matutino Corto" in respuesta_csv.text
+    assert "425" in respuesta_csv.text
 
 
-def test_alembic_0004_upgrade_and_downgrade(tmp_path: Path, monkeypatch) -> None:
-    """Verifica el ciclo completo upgrade 0004 -> downgrade 0003 -> upgrade 0004 sobre SQLite."""
-    db_file = tmp_path / "alembic_0004.db"
-    db_url = f"sqlite:///{db_file.as_posix()}"
-    monkeypatch.setenv("IDENTIA_DATABASE_URL", db_url)
-    get_settings.cache_clear()
+def test_alembic_0004_subida_y_bajada(tmp_path: Path, monkeypatch) -> None:
+    """Verifica el ciclo upgrade 0004 -> downgrade 0003 -> upgrade 0004 usando alias `IDENTIA_DATABASE_URL`."""
+    archivo_bd = tmp_path / "alembic_0004.db"
+    url_bd = f"sqlite:///{archivo_bd.as_posix()}"
+    # Conserva la prueba sobre IDENTIA_DATABASE_URL para verificar retrocompatibilidad del alias
+    monkeypatch.setenv("IDENTIA_DATABASE_URL", url_bd)
+    obtener_configuracion.cache_clear()
 
-    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
-    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    config_alembic = Config(str(DIRECTORIO_BACKEND / "alembic.ini"))
+    config_alembic.set_main_option("script_location", str(DIRECTORIO_BACKEND / "migrations"))
 
     try:
-        command.upgrade(cfg, "0004_enterprise_work_shifts")
-        eng = create_db_engine(db_url)
-        insp = inspect(eng)
-        assert "work_shifts" in insp.get_table_names()
-        assert "default_work_shift_id" in {c["name"] for c in insp.get_columns("groups")}
-        assert "work_shift_id" in {c["name"] for c in insp.get_columns("persons")}
-        assert "work_shift_id" in {c["name"] for c in insp.get_columns("attendance_sessions")}
-        ev_cols = {c["name"] for c in insp.get_columns("attendance_events")}
-        assert {"work_shift_id", "worked_minutes", "late_minutes", "early_exit_minutes"}.issubset(ev_cols)
-        with eng.connect() as conn:
-            rev = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-        eng.dispose()
-        assert rev == "0004_enterprise_work_shifts"
+        command.upgrade(config_alembic, "0004_enterprise_work_shifts")
+        motor = crear_motor_bd(url_bd)
+        inspector = inspect(motor)
+        assert "work_shifts" in inspector.get_table_names()
+        assert "default_work_shift_id" in {c["name"] for c in inspector.get_columns("groups")}
+        assert "work_shift_id" in {c["name"] for c in inspector.get_columns("persons")}
+        assert "work_shift_id" in {c["name"] for c in inspector.get_columns("attendance_sessions")}
+        cols_ev = {c["name"] for c in inspector.get_columns("attendance_events")}
+        assert {"work_shift_id", "worked_minutes", "late_minutes", "early_exit_minutes"}.issubset(
+            cols_ev
+        )
+        with motor.connect() as conexion:
+            revision = conexion.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+        motor.dispose()
+        assert revision == "0004_enterprise_work_shifts"
 
         # Downgrade limpio a 0003
-        command.downgrade(cfg, "0003_academic_periods_and_classrooms")
-        eng2 = create_db_engine(db_url)
-        insp2 = inspect(eng2)
-        assert "work_shifts" not in insp2.get_table_names()
-        assert "default_work_shift_id" not in {c["name"] for c in insp2.get_columns("groups")}
-        assert "work_shift_id" not in {c["name"] for c in insp2.get_columns("persons")}
-        ev_cols2 = {c["name"] for c in insp2.get_columns("attendance_events")}
-        assert "early_exit_minutes" not in ev_cols2
-        eng2.dispose()
+        command.downgrade(config_alembic, "0003_academic_periods_and_classrooms")
+        motor2 = crear_motor_bd(url_bd)
+        inspector2 = inspect(motor2)
+        assert "work_shifts" not in inspector2.get_table_names()
+        assert "default_work_shift_id" not in {c["name"] for c in inspector2.get_columns("groups")}
+        assert "work_shift_id" not in {c["name"] for c in inspector2.get_columns("persons")}
+        cols_ev2 = {c["name"] for c in inspector2.get_columns("attendance_events")}
+        assert "early_exit_minutes" not in cols_ev2
+        motor2.dispose()
 
         # Re-upgrade a 0004
-        command.upgrade(cfg, "0004_enterprise_work_shifts")
-        eng3 = create_db_engine(db_url)
-        with eng3.connect() as conn:
-            rev3 = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-        eng3.dispose()
-        assert rev3 == "0004_enterprise_work_shifts"
+        command.upgrade(config_alembic, "0004_enterprise_work_shifts")
+        motor3 = crear_motor_bd(url_bd)
+        with motor3.connect() as conexion:
+            revision3 = conexion.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+        motor3.dispose()
+        assert revision3 == "0004_enterprise_work_shifts"
     finally:
-        get_settings.cache_clear()
+        obtener_configuracion.cache_clear()
 
 
-def test_supervisor_permissions_and_department_shift_schedule_sync(raw_api_client) -> None:
-    """Verifica permisos de Supervisor en empresa y sincronización de horario con turno por defecto."""
-    client, _, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+def test_permisos_supervisor_y_sincronizacion_horario_area(cliente_api_sin_autenticar) -> None:
+    """Verifica permisos de Supervisor y sincronización de horario base con el turno del área."""
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
-    org_id, admin_headers = _create_enterprise_org(
-        client,
-        sa_headers,
-        name="Planta Industrial Alfa",
-        admin_email="alfa.admin@identia.local",
+    id_org, encabezados_admin = _crear_organizacion_empresarial(
+        cliente,
+        encabezados_sa,
+        nombre="Planta Industrial Alfa",
+        correo_admin="alfa.admin@identia.local",
     )
 
-    sup_res = client.post(
+    res_sup = cliente.post(
         "/api/users",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "email": "alfa.sup@identia.local",
-            "full_name": "Carlos Supervisor",
-            "password": "Supervisor2026!",
-            "role": "supervisor",
+            "correo": "alfa.sup@identia.local",
+            "nombre_completo": "Carlos Supervisor",
+            "contrasena": "Supervisor2026!",
+            "rol": "supervisor",
         },
     )
-    assert sup_res.status_code == 201, sup_res.text
-    sup_headers = _auth_header(client, "alfa.sup@identia.local", "Supervisor2026!")
+    assert res_sup.status_code == 201, res_sup.text
+    encabezados_sup = _encabezado_autorizacion(
+        cliente, "alfa.sup@identia.local", "Supervisor2026!"
+    )
 
-    shift_a = client.post(
+    turno_a = cliente.post(
         "/api/enterprise/shifts",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Turno Matutino 7-15",
-            "code": "MAT7",
-            "start_time": "07:00",
-            "end_time": "15:00",
-            "days_of_week": [0, 1, 2, 3, 4],
+            "id_organizacion": id_org,
+            "nombre": "Turno Matutino 7-15",
+            "codigo": "MAT7",
+            "hora_inicio": "07:00",
+            "hora_fin": "15:00",
+            "dias_semana": [0, 1, 2, 3, 4],
         },
     ).json()
-    shift_b = client.post(
+    turno_b = cliente.post(
         "/api/enterprise/shifts",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Turno Nocturno 22-06",
-            "code": "NOC22",
-            "start_time": "22:00",
-            "end_time": "06:00",
-            "days_of_week": [0, 1, 2, 3, 4],
+            "id_organizacion": id_org,
+            "nombre": "Turno Nocturno 22-06",
+            "codigo": "NOC22",
+            "hora_inicio": "22:00",
+            "hora_fin": "06:00",
+            "dias_semana": [0, 1, 2, 3, 4],
         },
     ).json()
 
-    # Crear área sin pasar schedule_start/schedule_end debe sincronizarse con shift_a
-    dept_res = client.post(
+    # Crear área sin indicar horas debe sincronizarse automáticamente con turno_a
+    res_area = cliente.post(
         "/api/groups",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Empaque",
-            "code": "EMP",
-            "default_work_shift_id": shift_a["id"],
+            "id_organizacion": id_org,
+            "nombre": "Empaque",
+            "codigo": "EMP",
+            "id_turno_laboral_defecto": turno_a["id"],
         },
     )
-    assert dept_res.status_code == 201, dept_res.text
-    dept = dept_res.json()
-    assert dept["schedule_start"] == "07:00"
-    assert dept["schedule_end"] == "15:00"
+    assert res_area.status_code == 201, res_area.text
+    area = res_area.json()
+    assert area["hora_inicio_horario"] == "07:00"
+    assert area["hora_fin_horario"] == "15:00"
 
-    # Al cambiar default_work_shift_id también sincroniza schedule_start y schedule_end
-    dept_patch = client.patch(
-        f"/api/groups/{dept['id']}",
-        headers=admin_headers,
-        json={"default_work_shift_id": shift_b["id"]},
+    # Al cambiar turno por defecto también actualiza las horas heredadas
+    area_actualizada = cliente.patch(
+        f"/api/groups/{area['id']}",
+        headers=encabezados_admin,
+        json={"id_turno_laboral_defecto": turno_b["id"]},
     )
-    assert dept_patch.status_code == 200, dept_patch.text
-    assert dept_patch.json()["schedule_start"] == "22:00"
-    assert dept_patch.json()["schedule_end"] == "06:00"
+    assert area_actualizada.status_code == 200, area_actualizada.text
+    assert area_actualizada.json()["hora_inicio_horario"] == "22:00"
+    assert area_actualizada.json()["hora_fin_horario"] == "06:00"
 
-    # Permisos operativos del Supervisor (permitidos)
-    assert client.get(f"/api/enterprise/shifts?organization_id={org_id}", headers=sup_headers).status_code == 200
-    assert client.get(f"/api/enterprise/stats?organization_id={org_id}", headers=sup_headers).status_code == 200
+    # Operaciones permitidas al Supervisor
     assert (
-        client.post(
+        cliente.get(
+            f"/api/enterprise/shifts?id_organizacion={id_org}", headers=encabezados_sup
+        ).status_code
+        == 200
+    )
+    assert (
+        cliente.get(
+            f"/api/enterprise/stats?id_organizacion={id_org}", headers=encabezados_sup
+        ).status_code
+        == 200
+    )
+    assert (
+        cliente.post(
             "/api/enterprise/sessions/generate",
-            headers=sup_headers,
-            json={"organization_id": org_id, "target_date": "2026-06-15"},
+            headers=encabezados_sup,
+            json={"id_organizacion": id_org, "fecha_objetivo": "2026-06-15"},
         ).status_code
         == 200
     )
     assert (
-        client.post(
-            f"/api/enterprise/shifts/{shift_a['id']}/start-session",
-            headers=sup_headers,
-            json={"session_date": "2026-06-15"},
+        cliente.post(
+            f"/api/enterprise/shifts/{turno_a['id']}/start-session",
+            headers=encabezados_sup,
+            json={"fecha_sesion": "2026-06-15"},
         ).status_code
         == 200
     )
     assert (
-        client.post(
+        cliente.post(
             "/api/persons",
-            headers=sup_headers,
+            headers=encabezados_sup,
             json={
-                "organization_id": org_id,
-                "external_id": "SUP-EMP-01",
-                "full_name": "Operario Registrado",
-                "role": "employee",
-                "biometric_consent": True,
-                "group_ids": [dept["id"]],
+                "id_organizacion": id_org,
+                "identificador_externo": "SUP-EMP-01",
+                "nombre_completo": "Operario Registrado",
+                "rol": "employee",
+                "consentimiento_biometrico": True,
+                "ids_grupos": [area["id"]],
             },
         ).status_code
         == 201
     )
 
-    # Acciones restringidas al Supervisor -> 403
+    # Operaciones restringidas al Supervisor -> HTTP 403
     assert (
-        client.post(
+        cliente.post(
             "/api/enterprise/shifts",
-            headers=sup_headers,
+            headers=encabezados_sup,
             json={
-                "organization_id": org_id,
-                "name": "No permitido",
-                "code": "NP",
-                "start_time": "10:00",
-                "end_time": "18:00",
+                "id_organizacion": id_org,
+                "nombre": "No permitido",
+                "codigo": "NP",
+                "hora_inicio": "10:00",
+                "hora_fin": "18:00",
             },
         ).status_code
         == 403
     )
-    assert client.delete(f"/api/enterprise/shifts/{shift_a['id']}", headers=sup_headers).status_code == 403
-    assert client.get(f"/api/users?organization_id={org_id}", headers=sup_headers).status_code == 403
+    assert (
+        cliente.delete(
+            f"/api/enterprise/shifts/{turno_a['id']}", headers=encabezados_sup
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.get(f"/api/users?id_organizacion={id_org}", headers=encabezados_sup).status_code
+        == 403
+    )

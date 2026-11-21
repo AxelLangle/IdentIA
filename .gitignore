@@ -21,6 +21,12 @@ frontend/dist/
 .env
 .env.local
 
+# Empaquetado PyInstaller y carpetas de trabajo de ejecutables (el ZIP y .exe < 95 MB sí se conservan)
+backend/build/
+backend/dist/
+release/IdentIA-1.1.0-portable/
+datos_identia/
+
 # IDE y sistema operativo
 .vscode/
 .idea/

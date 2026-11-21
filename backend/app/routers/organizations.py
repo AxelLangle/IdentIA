@@ -1,356 +1,405 @@
+"""Enrutador HTTP para gestión de organizaciones y grupos/departamentos.
+
+Permite administrar parámetros globales de la organización (modo empresa o escuela,
+tolerancia de retardo, cooldown, guardado de avatar y tipo de periodo académico
+protegido con clave de administrador), así como grupos académicos o departamentos
+con turno laboral por defecto sincronizado.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.models import Career, CourseAssignment, Group, Organization, PersonGroup, User, WorkShift
+from app.db import obtener_bd
+from app.models import (
+    AsignacionCurso,
+    Carrera,
+    Grupo,
+    Organizacion,
+    PersonaGrupo,
+    TurnoLaboral,
+    Usuario,
+)
 from app.schemas import (
-    GroupCreate,
-    GroupRead,
-    GroupUpdate,
-    OrganizationCreate,
-    OrganizationRead,
-    OrganizationUpdate,
+    GrupoActualizar,
+    GrupoCrear,
+    GrupoLeer,
+    OrganizacionActualizar,
+    OrganizacionCrear,
+    OrganizacionLeer,
 )
 from app.security import (
-    assert_org_access,
-    get_current_user,
-    hash_secret,
-    require_roles,
-    resolve_org_scope,
+    generar_hash_secreto,
+    obtener_usuario_actual,
+    requerir_roles,
+    resolver_alcance_organizacion,
+    validar_acceso_organizacion,
 )
-from app.services.academic_service import get_teacher_group_ids
-from app.services.security_service import record_audit_log, verify_admin_password
+from app.services.academic_service import obtener_ids_grupos_docente
+from app.services.security_service import registrar_auditoria, verificar_contrasena_admin
 
-router = APIRouter(prefix="/api", tags=["organizations"])
+enrutador = APIRouter(prefix="/api", tags=["organizaciones"])
 
 
-@router.get("/organizations", response_model=list[OrganizationRead])
-def list_organizations(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[Organization]:
-    if current_user.role == "superadmin":
-        return list(db.scalars(select(Organization).order_by(Organization.id.asc())).all())
-    if current_user.organization_id is None:
+@enrutador.get("/organizations", response_model=list[OrganizacionLeer])
+def listar_organizaciones(
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[Organizacion]:
+    """Lista todas las organizaciones (Superadmin) o solo la organización asignada."""
+    if usuario_actual.rol == "superadmin":
+        return list(sesion_bd.scalars(select(Organizacion).order_by(Organizacion.id.asc())).all())
+    if usuario_actual.id_organizacion is None:
         return []
     return list(
-        db.scalars(
-            select(Organization)
-            .where(Organization.id == current_user.organization_id)
-            .order_by(Organization.id.asc())
+        sesion_bd.scalars(
+            select(Organizacion)
+            .where(Organizacion.id == usuario_actual.id_organizacion)
+            .order_by(Organizacion.id.asc())
         ).all()
     )
 
 
-@router.post("/organizations", response_model=OrganizationRead, status_code=status.HTTP_201_CREATED)
-def create_organization(
-    payload: OrganizationCreate,
-    current_user: User = Depends(require_roles("superadmin")),
-    db: Session = Depends(get_db),
-) -> Organization:
-    org_data = payload.model_dump(exclude={"admin_user"})
-    org = Organization(**org_data)
-    db.add(org)
-    db.flush()
+@enrutador.post("/organizations", response_model=OrganizacionLeer, status_code=status.HTTP_201_CREATED)
+def crear_organizacion(
+    carga: OrganizacionCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> Organizacion:
+    """Da de alta una organización junto con su grupo base `GEN-01` y admin inicial opcional."""
+    datos_org = carga.model_dump(exclude={"usuario_administrador"})
+    organizacion = Organizacion(**datos_org)
+    sesion_bd.add(organizacion)
+    sesion_bd.flush()
 
-    db.add(
-        Group(
-            organization_id=org.id,
-            name="General",
-            code="GEN-01",
-            schedule_start="09:00",
-            schedule_end="18:00",
+    sesion_bd.add(
+        Grupo(
+            id_organizacion=organizacion.id,
+            nombre="General",
+            codigo="GEN-01",
+            hora_inicio_horario="09:00",
+            hora_fin_horario="18:00",
         )
     )
 
-    admin_summary = "sin admin inicial"
-    if payload.admin_user is not None:
-        email_norm = payload.admin_user.email.strip().lower()
-        dup = db.scalars(select(User).where(User.email == email_norm)).first()
-        if dup is not None:
-            db.rollback()
+    resumen_admin = "sin admin inicial"
+    if carga.usuario_administrador is not None:
+        correo_normalizado = carga.usuario_administrador.correo.strip().lower()
+        duplicado = sesion_bd.scalars(
+            select(Usuario).where(Usuario.correo == correo_normalizado)
+        ).first()
+        if duplicado is not None:
+            sesion_bd.rollback()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Ya existe un usuario con el correo '{email_norm}'.",
+                detail=f"Ya existe un usuario con el correo '{correo_normalizado}'.",
             )
-        org_admin = User(
-            email=email_norm,
-            full_name=payload.admin_user.full_name.strip(),
-            password_hash=hash_secret(payload.admin_user.password),
-            role="org_admin",
-            organization_id=org.id,
-            created_by_user_id=current_user.id,
+        admin_org = Usuario(
+            correo=correo_normalizado,
+            nombre_completo=carga.usuario_administrador.nombre_completo.strip(),
+            hash_contrasena=generar_hash_secreto(carga.usuario_administrador.contrasena),
+            rol="org_admin",
+            id_organizacion=organizacion.id,
+            id_usuario_creador=usuario_actual.id,
         )
-        db.add(org_admin)
-        admin_summary = f"admin inicial: {email_norm}"
+        sesion_bd.add(admin_org)
+        resumen_admin = f"admin inicial: {correo_normalizado}"
 
-    record_audit_log(
-        db,
-        organization_id=org.id,
-        action="create_organization",
-        target_type="organization",
-        target_id=org.id,
-        target_summary=org.name,
-        executed_by_user=current_user,
-        authorized_by_user=current_user,
-        details=f"Modo: {org.mode} | {admin_summary}",
+    registrar_auditoria(
+        sesion_bd,
+        id_organizacion=organizacion.id,
+        accion="create_organization",
+        tipo_objetivo="organization",
+        id_objetivo=organizacion.id,
+        resumen_objetivo=organizacion.nombre,
+        usuario_ejecutor=usuario_actual,
+        usuario_autorizador=usuario_actual,
+        detalles=f"Modo: {organizacion.modo} | {resumen_admin}",
     )
 
-    db.commit()
-    db.refresh(org)
-    return org
+    sesion_bd.commit()
+    sesion_bd.refresh(organizacion)
+    return organizacion
 
 
-@router.patch("/organizations/{org_id}", response_model=OrganizationRead)
-def update_organization(
-    org_id: int,
-    payload: OrganizationUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> Organization:
-    assert_org_access(current_user, org_id)
-    org = db.get(Organization, org_id)
-    if org is None:
+@enrutador.patch("/organizations/{id_organizacion}", response_model=OrganizacionLeer)
+def actualizar_organizacion(
+    id_organizacion: int,
+    carga: OrganizacionActualizar,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> Organizacion:
+    """Actualiza parámetros operativos de la organización (exige clave admin si cambia el periodo)."""
+    validar_acceso_organizacion(usuario_actual, id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    data = payload.model_dump(exclude_unset=True)
-    auth_secret = data.pop("authorization_secret", None)
+    datos_parciales = carga.model_dump(exclude_unset=True)
+    secreto_autorizacion = datos_parciales.pop("secreto_autorizacion", None)
 
     if (
-        "academic_period_type" in data
-        and data["academic_period_type"] is not None
-        and data["academic_period_type"] != org.academic_period_type
+        "tipo_periodo_academico" in datos_parciales
+        and datos_parciales["tipo_periodo_academico"] is not None
+        and datos_parciales["tipo_periodo_academico"] != organizacion.tipo_periodo_academico
     ):
-        auth_admin = verify_admin_password(
-            db,
-            current_user=current_user,
-            organization_id=org.id,
-            authorization_secret=auth_secret,
+        admin_autorizador = verificar_contrasena_admin(
+            sesion_bd,
+            usuario_actual=usuario_actual,
+            id_organizacion=organizacion.id,
+            secreto_autorizacion=secreto_autorizacion,
         )
-        record_audit_log(
-            db,
-            organization_id=org.id,
-            action="change_org_period_type",
-            target_type="organization",
-            target_id=org.id,
-            target_summary=org.name,
-            executed_by_user=current_user,
-            authorized_by_user=auth_admin,
-            details=f"Periodo general: {org.academic_period_type} -> {data['academic_period_type']}",
+        registrar_auditoria(
+            sesion_bd,
+            id_organizacion=organizacion.id,
+            accion="change_org_period_type",
+            tipo_objetivo="organization",
+            id_objetivo=organizacion.id,
+            resumen_objetivo=organizacion.nombre,
+            usuario_ejecutor=usuario_actual,
+            usuario_autorizador=admin_autorizador,
+            detalles=(
+                f"Periodo general: {organizacion.tipo_periodo_academico} -> "
+                f"{datos_parciales['tipo_periodo_academico']}"
+            ),
         )
 
-    for field, value in data.items():
-        setattr(org, field, value)
+    for campo, valor in datos_parciales.items():
+        setattr(organizacion, campo, valor)
 
-    db.commit()
-    db.refresh(org)
-    return org
+    sesion_bd.commit()
+    sesion_bd.refresh(organizacion)
+    return organizacion
 
 
-def _serialize_groups(db: Session, groups: list[Group], organization_id: int) -> list[GroupRead]:
-    if not groups:
+def _serializar_grupos(
+    sesion_bd: Session,
+    grupos: list[Grupo],
+    id_organizacion: int,
+) -> list[GrupoLeer]:
+    """Serializa grupos con carrera, periodo efectivo, turno heredado y conteos."""
+    if not grupos:
         return []
 
-    org = db.get(Organization, organization_id)
-    org_period_type = org.academic_period_type if org else "semestral"
-    career_map = {
-        c.id: c
-        for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
+    organizacion = sesion_bd.get(Organizacion, id_organizacion)
+    tipo_periodo_org = organizacion.tipo_periodo_academico if organizacion else "semestral"
+    mapa_carreras = {
+        carrera.id: carrera
+        for carrera in sesion_bd.scalars(
+            select(Carrera).where(Carrera.id_organizacion == id_organizacion)
+        ).all()
     }
-    shift_map = {
-        sh.id: sh
-        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
+    mapa_turnos = {
+        turno.id: turno
+        for turno in sesion_bd.scalars(
+            select(TurnoLaboral).where(TurnoLaboral.id_organizacion == id_organizacion)
+        ).all()
     }
-    counts_rows = db.execute(
-        select(PersonGroup.group_id, func.count(PersonGroup.person_id)).group_by(PersonGroup.group_id)
+    filas_integrantes = sesion_bd.execute(
+        select(PersonaGrupo.id_grupo, func.count(PersonaGrupo.id_persona)).group_by(
+            PersonaGrupo.id_grupo
+        )
     ).all()
-    counts_map = {gid: cnt for gid, cnt in counts_rows}
+    mapa_integrantes = {id_grupo: conteo for id_grupo, conteo in filas_integrantes}
 
-    courses_rows = db.execute(
-        select(CourseAssignment.group_id, func.count(CourseAssignment.id))
+    filas_cursos = sesion_bd.execute(
+        select(AsignacionCurso.id_grupo, func.count(AsignacionCurso.id))
         .where(
-            CourseAssignment.organization_id == organization_id,
-            CourseAssignment.is_active.is_(True),
+            AsignacionCurso.id_organizacion == id_organizacion,
+            AsignacionCurso.esta_activo.is_(True),
         )
-        .group_by(CourseAssignment.group_id)
+        .group_by(AsignacionCurso.id_grupo)
     ).all()
-    courses_map = {gid: cnt for gid, cnt in courses_rows}
+    mapa_cursos = {id_grupo: conteo for id_grupo, conteo in filas_cursos}
 
-    result: list[GroupRead] = []
-    for g in groups:
-        career = career_map.get(g.career_id) if g.career_id else None
-        shift = shift_map.get(g.default_work_shift_id) if g.default_work_shift_id else None
-        effective_period = (
-            g.period_type
-            or (career.period_type if career and career.period_type else None)
-            or org_period_type
+    resultado: list[GrupoLeer] = []
+    for grupo in grupos:
+        carrera = mapa_carreras.get(grupo.id_carrera) if grupo.id_carrera else None
+        turno = (
+            mapa_turnos.get(grupo.id_turno_laboral_defecto)
+            if grupo.id_turno_laboral_defecto
+            else None
         )
-        result.append(
-            GroupRead(
-                id=g.id,
-                organization_id=g.organization_id,
-                career_id=g.career_id,
-                career_name=career.name if career else None,
-                name=g.name,
-                code=g.code,
-                semester=g.semester,
-                default_classroom=g.default_classroom,
-                default_work_shift_id=g.default_work_shift_id,
-                default_work_shift_name=shift.name if shift else None,
-                default_work_shift_code=shift.code if shift else None,
-                period_type=effective_period,
-                custom_period_type=g.period_type,
-                schedule_start=g.schedule_start,
-                schedule_end=g.schedule_end,
-                created_at=g.created_at,
-                members_count=counts_map.get(g.id, 0),
-                courses_count=courses_map.get(g.id, 0),
+        tipo_periodo_efectivo = (
+            grupo.tipo_periodo
+            or (carrera.tipo_periodo if carrera and carrera.tipo_periodo else None)
+            or tipo_periodo_org
+        )
+        resultado.append(
+            GrupoLeer(
+                id=grupo.id,
+                id_organizacion=grupo.id_organizacion,
+                id_carrera=grupo.id_carrera,
+                nombre_carrera=carrera.nombre if carrera else None,
+                nombre=grupo.nombre,
+                codigo=grupo.codigo,
+                semestre=grupo.semestre,
+                aula_defecto=grupo.aula_defecto,
+                id_turno_laboral_defecto=grupo.id_turno_laboral_defecto,
+                nombre_turno_laboral_defecto=turno.nombre if turno else None,
+                codigo_turno_laboral_defecto=turno.codigo if turno else None,
+                tipo_periodo=tipo_periodo_efectivo,
+                tipo_periodo_personalizado=grupo.tipo_periodo,
+                hora_inicio_horario=grupo.hora_inicio_horario,
+                hora_fin_horario=grupo.hora_fin_horario,
+                creado_en=grupo.creado_en,
+                cantidad_integrantes=mapa_integrantes.get(grupo.id, 0),
+                cantidad_cursos=mapa_cursos.get(grupo.id, 0),
             )
         )
-    return result
+    return resultado
 
 
-@router.get("/groups", response_model=list[GroupRead])
-def list_groups(
-    organization_id: int | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[GroupRead]:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    stmt = (
-        select(Group)
-        .where(Group.organization_id == scoped_org_id)
-        .order_by(Group.id.asc())
+@enrutador.get("/groups", response_model=list[GrupoLeer])
+def listar_grupos(
+    id_organizacion: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[GrupoLeer]:
+    """Lista grupos o áreas de la organización; para docentes filtra solo sus grupos."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    consulta = (
+        select(Grupo)
+        .where(Grupo.id_organizacion == id_org_alcance)
+        .order_by(Grupo.id.asc())
     )
-    if current_user.role == "teacher":
-        teacher_gids = get_teacher_group_ids(db, current_user.id)
-        if not teacher_gids:
+    if usuario_actual.rol == "teacher":
+        ids_grupos_docente = obtener_ids_grupos_docente(sesion_bd, usuario_actual.id)
+        if not ids_grupos_docente:
             return []
-        stmt = stmt.where(Group.id.in_(teacher_gids))
+        consulta = consulta.where(Grupo.id.in_(ids_grupos_docente))
 
-    groups = list(db.scalars(stmt).all())
-    return _serialize_groups(db, groups, scoped_org_id)
+    grupos = list(sesion_bd.scalars(consulta).all())
+    return _serializar_grupos(sesion_bd, grupos, id_org_alcance)
 
 
-@router.post("/groups", response_model=GroupRead, status_code=status.HTTP_201_CREATED)
-def create_group(
-    payload: GroupCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> GroupRead:
-    assert_org_access(current_user, payload.organization_id)
-    org = db.get(Organization, payload.organization_id)
-    if org is None:
+@enrutador.post("/groups", response_model=GrupoLeer, status_code=status.HTTP_201_CREATED)
+def crear_grupo(
+    carga: GrupoCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> GrupoLeer:
+    """Crea un grupo académico o departamento empresarial sincronizando turno si aplica."""
+    validar_acceso_organizacion(usuario_actual, carga.id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, carga.id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    if payload.career_id is not None:
-        career = db.get(Career, payload.career_id)
-        if career is None or career.organization_id != org.id:
+    if carga.id_carrera is not None:
+        carrera = sesion_bd.get(Carrera, carga.id_carrera)
+        if carrera is None or carrera.id_organizacion != organizacion.id:
             raise HTTPException(
                 status_code=404,
                 detail="Carrera no encontrada en la organización.",
             )
 
-    shift_for_defaults: WorkShift | None = None
-    if payload.default_work_shift_id is not None:
-        shift_for_defaults = db.get(WorkShift, payload.default_work_shift_id)
-        if shift_for_defaults is None or shift_for_defaults.organization_id != org.id:
+    turno_para_defecto: TurnoLaboral | None = None
+    if carga.id_turno_laboral_defecto is not None:
+        turno_para_defecto = sesion_bd.get(TurnoLaboral, carga.id_turno_laboral_defecto)
+        if turno_para_defecto is None or turno_para_defecto.id_organizacion != organizacion.id:
             raise HTTPException(
                 status_code=404,
                 detail="Turno laboral no encontrado en la organización.",
             )
 
-    data = payload.model_dump()
-    if shift_for_defaults is not None:
-        # Mantener las columnas heredadas alineadas con el turno para evitar discrepancias
-        data["schedule_start"] = shift_for_defaults.start_time
-        data["schedule_end"] = shift_for_defaults.end_time
-    if data.get("semester") is not None:
-        data["semester"] = data["semester"].strip() or None
-    if data.get("default_classroom") is not None:
-        data["default_classroom"] = data["default_classroom"].strip() or None
+    datos_grupo = carga.model_dump()
+    if turno_para_defecto is not None:
+        # Mantiene alineadas las columnas base del horario con el turno asignado por defecto
+        datos_grupo["hora_inicio_horario"] = turno_para_defecto.hora_inicio
+        datos_grupo["hora_fin_horario"] = turno_para_defecto.hora_fin
+    if datos_grupo.get("semestre") is not None:
+        datos_grupo["semestre"] = datos_grupo["semestre"].strip() or None
+    if datos_grupo.get("aula_defecto") is not None:
+        datos_grupo["aula_defecto"] = datos_grupo["aula_defecto"].strip() or None
 
-    group = Group(**data)
-    db.add(group)
-    db.commit()
-    db.refresh(group)
-    return _serialize_groups(db, [group], org.id)[0]
+    grupo = Grupo(**datos_grupo)
+    sesion_bd.add(grupo)
+    sesion_bd.commit()
+    sesion_bd.refresh(grupo)
+    return _serializar_grupos(sesion_bd, [grupo], organizacion.id)[0]
 
 
-@router.patch("/groups/{group_id}", response_model=GroupRead)
-def update_group(
-    group_id: int,
-    payload: GroupUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> GroupRead:
-    group = db.get(Group, group_id)
-    if group is None:
+@enrutador.patch("/groups/{id_grupo}", response_model=GrupoLeer)
+def actualizar_grupo(
+    id_grupo: int,
+    carga: GrupoActualizar,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> GrupoLeer:
+    """Actualiza datos de grupo/área; cambiar periodo propio exige contraseña de administrador."""
+    grupo = sesion_bd.get(Grupo, id_grupo)
+    if grupo is None:
         raise HTTPException(status_code=404, detail="Grupo no encontrado.")
-    assert_org_access(current_user, group.organization_id)
+    validar_acceso_organizacion(usuario_actual, grupo.id_organizacion)
 
-    data = payload.model_dump(exclude_unset=True)
-    auth_secret = data.pop("authorization_secret", None)
+    datos_parciales = carga.model_dump(exclude_unset=True)
+    secreto_autorizacion = datos_parciales.pop("secreto_autorizacion", None)
 
-    if "period_type" in data and data["period_type"] != group.period_type:
-        auth_admin = verify_admin_password(
-            db,
-            current_user=current_user,
-            organization_id=group.organization_id,
-            authorization_secret=auth_secret,
+    if "tipo_periodo" in datos_parciales and datos_parciales["tipo_periodo"] != grupo.tipo_periodo:
+        admin_autorizador = verificar_contrasena_admin(
+            sesion_bd,
+            usuario_actual=usuario_actual,
+            id_organizacion=grupo.id_organizacion,
+            secreto_autorizacion=secreto_autorizacion,
         )
-        record_audit_log(
-            db,
-            organization_id=group.organization_id,
-            action="change_group_period_type",
-            target_type="group",
-            target_id=group.id,
-            target_summary=f"{group.name} ({group.code})",
-            executed_by_user=current_user,
-            authorized_by_user=auth_admin,
-            details=f"Periodo grupo: {group.period_type or 'heredado'} -> {data['period_type'] or 'heredado'}",
+        registrar_auditoria(
+            sesion_bd,
+            id_organizacion=grupo.id_organizacion,
+            accion="change_group_period_type",
+            tipo_objetivo="group",
+            id_objetivo=grupo.id,
+            resumen_objetivo=f"{grupo.nombre} ({grupo.codigo})",
+            usuario_ejecutor=usuario_actual,
+            usuario_autorizador=admin_autorizador,
+            detalles=(
+                f"Periodo grupo: {grupo.tipo_periodo or 'heredado'} -> "
+                f"{datos_parciales['tipo_periodo'] or 'heredado'}"
+            ),
         )
 
-    if "career_id" in data and data["career_id"] is not None:
-        career = db.get(Career, data["career_id"])
-        if career is None or career.organization_id != group.organization_id:
+    if "id_carrera" in datos_parciales and datos_parciales["id_carrera"] is not None:
+        carrera = sesion_bd.get(Carrera, datos_parciales["id_carrera"])
+        if carrera is None or carrera.id_organizacion != grupo.id_organizacion:
             raise HTTPException(
                 status_code=404,
                 detail="Carrera no encontrada en la organización.",
             )
 
-    if "default_work_shift_id" in data and data["default_work_shift_id"] is not None:
-        shift = db.get(WorkShift, data["default_work_shift_id"])
-        if shift is None or shift.organization_id != group.organization_id:
+    if (
+        "id_turno_laboral_defecto" in datos_parciales
+        and datos_parciales["id_turno_laboral_defecto"] is not None
+    ):
+        turno = sesion_bd.get(TurnoLaboral, datos_parciales["id_turno_laboral_defecto"])
+        if turno is None or turno.id_organizacion != grupo.id_organizacion:
             raise HTTPException(
                 status_code=404,
                 detail="Turno laboral no encontrado en la organización.",
             )
-        # Sincronizar horario base heredado con el turno seleccionado
-        data["schedule_start"] = shift.start_time
-        data["schedule_end"] = shift.end_time
+        # Sincroniza horario heredado con el turno por defecto recién seleccionado
+        datos_parciales["hora_inicio_horario"] = turno.hora_inicio
+        datos_parciales["hora_fin_horario"] = turno.hora_fin
 
-    for field, value in data.items():
-        if field in ("semester", "default_classroom") and isinstance(value, str):
-            setattr(group, field, value.strip() or None)
+    for campo, valor in datos_parciales.items():
+        if campo in ("semestre", "aula_defecto") and isinstance(valor, str):
+            setattr(grupo, campo, valor.strip() or None)
         else:
-            setattr(group, field, value)
+            setattr(grupo, campo, valor)
 
-    db.commit()
-    db.refresh(group)
-    return _serialize_groups(db, [group], group.organization_id)[0]
+    sesion_bd.commit()
+    sesion_bd.refresh(grupo)
+    return _serializar_grupos(sesion_bd, [grupo], grupo.id_organizacion)[0]
 
 
-@router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_group(
-    group_id: int,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
+@enrutador.delete("/groups/{id_grupo}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_grupo(
+    id_grupo: int,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
 ) -> None:
-    group = db.get(Group, group_id)
-    if group is None:
+    """Elimina un grupo o departamento de la organización."""
+    grupo = sesion_bd.get(Grupo, id_grupo)
+    if grupo is None:
         raise HTTPException(status_code=404, detail="Grupo no encontrado.")
-    assert_org_access(current_user, group.organization_id)
-    db.delete(group)
-    db.commit()
+    validar_acceso_organizacion(usuario_actual, grupo.id_organizacion)
+    sesion_bd.delete(grupo)
+    sesion_bd.commit()

@@ -1,175 +1,235 @@
+/**
+ * Componente raíz de la aplicación web IdentIA.
+ * Centraliza el estado global de autenticación JWT, la organización activa y
+ * sus catálogos compartidos (grupos, personas, sesiones y eventos), además de
+ * coordinar la navegación segura según rol y modo (`education` o `enterprise`).
+ */
 import { useCallback, useEffect, useState } from "react";
-import { Layout, type NavTab } from "./components/Layout";
+import { DisenoPrincipal, type PestanaNavegacion } from "./components/Layout";
 import {
-  api,
-  getStoredToken,
-  setOnUnauthorizedHandler,
-  setStoredToken,
+  clienteApi,
+  guardarTokenAlmacenado,
+  obtenerTokenAlmacenado,
+  registrarManejadorNoAutorizado,
 } from "./lib/api";
-import { AcademicPage } from "./pages/AcademicPage";
-import { DashboardPage } from "./pages/DashboardPage";
-import { EnrollmentPage } from "./pages/EnrollmentPage";
-import { EnterpriseShiftsPage } from "./pages/EnterpriseShiftsPage";
-import { KioskPage } from "./pages/KioskPage";
-import { LoginPage } from "./pages/LoginPage";
-import { SecurityPage } from "./pages/SecurityPage";
-import { SessionsPage } from "./pages/SessionsPage";
-import { TeacherPortalPage } from "./pages/TeacherPortalPage";
+import { PaginaAcademico } from "./pages/AcademicPage";
+import { PaginaPanelGeneral } from "./pages/DashboardPage";
+import { PaginaEnrolamiento } from "./pages/EnrollmentPage";
+import { PaginaTurnosEmpresariales } from "./pages/EnterpriseShiftsPage";
+import { PaginaKiosco } from "./pages/KioskPage";
+import { PaginaInicioSesion } from "./pages/LoginPage";
+import { PaginaSeguridad } from "./pages/SecurityPage";
+import { PaginaSesiones } from "./pages/SessionsPage";
+import { PaginaPortalDocente } from "./pages/TeacherPortalPage";
 import type {
-  AttendanceEvent,
-  AttendanceSession,
-  AuthUser,
-  Group,
-  HealthResponse,
-  LoginResponse,
-  Organization,
-  Person,
+  EventoAsistencia,
+  Grupo,
+  Organizacion,
+  Persona,
+  RespuestaInicioSesion,
+  RespuestaSalud,
+  SesionAsistencia,
+  UsuarioAutenticado,
 } from "./types/api";
 
-export function App() {
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
-  const [checkingAuth, setCheckingAuth] = useState(true);
+/**
+ * Componente principal exportado de IdentIA; gestiona el ciclo de vida de
+ * la sesión y distribuye datos y callbacks hacia cada vista funcional.
+ */
+export function Aplicacion() {
+  const [usuarioActual, establecerUsuarioActual] =
+    useState<UsuarioAutenticado | null>(null);
+  const [verificandoSesion, establecerVerificandoSesion] = useState(true);
 
-  const [activeTab, setActiveTab] = useState<NavTab>("dashboard");
-  const [kioskTargetSessionId, setKioskTargetSessionId] = useState<number | null>(null);
-  const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [organizations, setOrganizations] = useState<Organization[]>([]);
-  const [selectedOrgId, setSelectedOrgId] = useState<number | null>(null);
+  const [pestanaActiva, establecerPestanaActiva] =
+    useState<PestanaNavegacion>("dashboard");
+  const [idSesionObjetivoKiosco, establecerIdSesionObjetivoKiosco] = useState<
+    number | null
+  >(null);
+  const [estadoSalud, establecerEstadoSalud] = useState<RespuestaSalud | null>(null);
+  const [organizaciones, establecerOrganizaciones] = useState<Organizacion[]>([]);
+  const [idOrganizacionSeleccionada, establecerIdOrganizacionSeleccionada] = useState<
+    number | null
+  >(null);
 
-  const [groups, setGroups] = useState<Group[]>([]);
-  const [persons, setPersons] = useState<Person[]>([]);
-  const [sessions, setSessions] = useState<AttendanceSession[]>([]);
-  const [events, setEvents] = useState<AttendanceEvent[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [grupos, establecerGrupos] = useState<Grupo[]>([]);
+  const [personas, establecerPersonas] = useState<Persona[]>([]);
+  const [sesiones, establecerSesiones] = useState<SesionAsistencia[]>([]);
+  const [eventos, establecerEventos] = useState<EventoAsistencia[]>([]);
+  const [cargando, establecerCargando] = useState(false);
+  const [errorCarga, establecerErrorCarga] = useState<string | null>(null);
 
-  const handleLogout = useCallback(() => {
-    setStoredToken(null);
-    setCurrentUser(null);
-    setOrganizations([]);
-    setSelectedOrgId(null);
-    setGroups([]);
-    setPersons([]);
-    setSessions([]);
-    setEvents([]);
-    setKioskTargetSessionId(null);
-    setActiveTab("dashboard");
+  /** Cierra la sesión local, limpia el JWT y restablece el estado en memoria. */
+  const manejarCierreSesion = useCallback(() => {
+    guardarTokenAlmacenado(null);
+    establecerUsuarioActual(null);
+    establecerOrganizaciones([]);
+    establecerIdOrganizacionSeleccionada(null);
+    establecerGrupos([]);
+    establecerPersonas([]);
+    establecerSesiones([]);
+    establecerEventos([]);
+    establecerIdSesionObjetivoKiosco(null);
+    establecerPestanaActiva("dashboard");
   }, []);
 
-  const handleOpenSessionInKiosk = useCallback((sessionId: number) => {
-    setKioskTargetSessionId(sessionId);
-    setActiveTab("kiosk");
+  /** Navega al kiosco preseleccionando una sesión específica recién abierta. */
+  const manejarAbrirSesionEnKiosco = useCallback((idSesion: number) => {
+    establecerIdSesionObjetivoKiosco(idSesion);
+    establecerPestanaActiva("kiosk");
   }, []);
 
-  const loadOrgData = useCallback(async (orgId: number) => {
-    const [grps, pers, sess, evs, hlt] = await Promise.all([
-      api.listGroups(orgId),
-      api.listPersons(orgId),
-      api.listSessions(orgId),
-      api.listEvents(orgId),
-      api.getHealth(),
-    ]);
-    setGroups(grps);
-    setPersons(pers);
-    setSessions(sess);
-    setEvents(evs);
-    setHealth(hlt);
+  /** Carga en paralelo todos los datos operativos de la organización elegida. */
+  const cargarDatosOrganizacion = useCallback(async (idOrganizacion: number) => {
+    const [listaGrupos, listaPersonas, listaSesiones, listaEventos, salud] =
+      await Promise.all([
+        clienteApi.listarGrupos(idOrganizacion),
+        clienteApi.listarPersonas(idOrganizacion),
+        clienteApi.listarSesiones(idOrganizacion),
+        clienteApi.listarEventos(idOrganizacion),
+        clienteApi.obtenerSalud(),
+      ]);
+    establecerGrupos(listaGrupos);
+    establecerPersonas(listaPersonas);
+    establecerSesiones(listaSesiones);
+    establecerEventos(listaEventos);
+    establecerEstadoSalud(salud);
   }, []);
 
-  const bootstrapWorkspace = useCallback(
-    async (preferredOrgId?: number, userForRouting?: AuthUser | null) => {
-      setLoading(true);
+  /** Inicializa el catálogo de organizaciones y ajusta la vista según rol/modo. */
+  const inicializarEspacioTrabajo = useCallback(
+    async (
+      idOrganizacionPreferido?: number,
+      usuarioParaEnrutado?: UsuarioAutenticado | null
+    ) => {
+      establecerCargando(true);
       try {
-        setLoadError(null);
-        const [hlt, orgs] = await Promise.all([api.getHealth(), api.listOrganizations()]);
-        setHealth(hlt);
-        setOrganizations(orgs);
-        const targetId = preferredOrgId ?? orgs[0]?.id ?? null;
-        setSelectedOrgId(targetId);
-        const targetOrg = orgs.find((o) => o.id === targetId) ?? null;
-        if (userForRouting?.role === "teacher" && targetOrg?.mode === "education") {
-          setActiveTab("teacher_portal");
-        } else if (targetOrg?.mode === "enterprise") {
-          setActiveTab((prev) =>
-            prev === "academic" || prev === "teacher_portal" ? "dashboard" : prev
+        establecerErrorCarga(null);
+        const [salud, listaOrganizaciones] = await Promise.all([
+          clienteApi.obtenerSalud(),
+          clienteApi.listarOrganizaciones(),
+        ]);
+        establecerEstadoSalud(salud);
+        establecerOrganizaciones(listaOrganizaciones);
+
+        const idObjetivo =
+          idOrganizacionPreferido ?? listaOrganizaciones[0]?.id ?? null;
+        establecerIdOrganizacionSeleccionada(idObjetivo);
+        const organizacionObjetivo =
+          listaOrganizaciones.find((org) => org.id === idObjetivo) ?? null;
+
+        if (
+          usuarioParaEnrutado?.rol === "teacher" &&
+          organizacionObjetivo?.modo === "education"
+        ) {
+          establecerPestanaActiva("teacher_portal");
+        } else if (organizacionObjetivo?.modo === "enterprise") {
+          establecerPestanaActiva((previa) =>
+            previa === "academic" || previa === "teacher_portal"
+              ? "dashboard"
+              : previa
           );
-        } else if (targetOrg?.mode === "education") {
-          setActiveTab((prev) => (prev === "enterprise_shifts" ? "dashboard" : prev));
+        } else if (organizacionObjetivo?.modo === "education") {
+          establecerPestanaActiva((previa) =>
+            previa === "enterprise_shifts" ? "dashboard" : previa
+          );
         }
-        if (targetId !== null) {
-          await loadOrgData(targetId);
+
+        if (idObjetivo !== null) {
+          await cargarDatosOrganizacion(idObjetivo);
         }
-      } catch (err) {
-        setLoadError(
-          err instanceof Error
-            ? `No se pudo cargar la información de IdentIA: ${err.message}`
+      } catch (errorInicializacion) {
+        establecerErrorCarga(
+          errorInicializacion instanceof Error
+            ? `No se pudo cargar la información de IdentIA: ${errorInicializacion.message}`
             : "Error al iniciar el espacio de trabajo."
         );
       } finally {
-        setLoading(false);
+        establecerCargando(false);
       }
     },
-    [loadOrgData]
+    [cargarDatosOrganizacion]
   );
 
+  // Registra el manejador global 401 para cerrar la sesión ante tokens expirados.
   useEffect(() => {
-    setOnUnauthorizedHandler(() => {
-      handleLogout();
+    registrarManejadorNoAutorizado(() => {
+      manejarCierreSesion();
     });
-    return () => setOnUnauthorizedHandler(null);
-  }, [handleLogout]);
+    return () => registrarManejadorNoAutorizado(null);
+  }, [manejarCierreSesion]);
 
+  // Intenta restaurar una sesión previa validando `/api/auth/me` al arrancar.
   useEffect(() => {
-    async function restoreSession() {
-      const token = getStoredToken();
-      if (!token) {
-        setCheckingAuth(false);
+    async function restaurarSesion() {
+      const tokenGuardado = obtenerTokenAlmacenado();
+      if (!tokenGuardado) {
+        establecerVerificandoSesion(false);
         return;
       }
       try {
-        const user = await api.getMe();
-        setCurrentUser(user);
-        await bootstrapWorkspace(user.organization_id ?? undefined, user);
+        const perfilUsuario = await clienteApi.obtenerPerfilActual();
+        establecerUsuarioActual(perfilUsuario);
+        await inicializarEspacioTrabajo(
+          perfilUsuario.id_organizacion ?? undefined,
+          perfilUsuario
+        );
       } catch {
-        setStoredToken(null);
-        setCurrentUser(null);
+        guardarTokenAlmacenado(null);
+        establecerUsuarioActual(null);
       } finally {
-        setCheckingAuth(false);
+        establecerVerificandoSesion(false);
       }
     }
-    void restoreSession();
-  }, [bootstrapWorkspace]);
+    void restaurarSesion();
+  }, [inicializarEspacioTrabajo]);
 
-  const handleLoginSuccess = async (loginData: LoginResponse) => {
-    setCurrentUser(loginData.user);
-    setActiveTab("dashboard");
-    await bootstrapWorkspace(loginData.user.organization_id ?? undefined, loginData.user);
+  /** Procesa el inicio de sesión exitoso cargando la organización asignada. */
+  const manejarExitoInicioSesion = async (datosInicio: RespuestaInicioSesion) => {
+    establecerUsuarioActual(datosInicio.usuario);
+    establecerPestanaActiva("dashboard");
+    await inicializarEspacioTrabajo(
+      datosInicio.usuario.id_organizacion ?? undefined,
+      datosInicio.usuario
+    );
   };
 
-  const handleSelectOrg = async (orgId: number) => {
-    setSelectedOrgId(orgId);
-    setKioskTargetSessionId(null);
-    const targetOrg = organizations.find((o) => o.id === orgId) ?? null;
-    if (targetOrg?.mode === "enterprise") {
-      setActiveTab((prev) =>
-        prev === "academic" || prev === "teacher_portal" ? "dashboard" : prev
+  /** Cambia la organización activa desde el selector del superadministrador. */
+  const manejarSeleccionOrganizacion = async (idOrganizacion: number) => {
+    establecerIdOrganizacionSeleccionada(idOrganizacion);
+    establecerIdSesionObjetivoKiosco(null);
+    const organizacionObjetivo =
+      organizaciones.find((org) => org.id === idOrganizacion) ?? null;
+
+    if (organizacionObjetivo?.modo === "enterprise") {
+      establecerPestanaActiva((previa) =>
+        previa === "academic" || previa === "teacher_portal"
+          ? "dashboard"
+          : previa
       );
-    } else if (currentUser?.role === "teacher" && targetOrg?.mode === "education") {
-      setActiveTab("teacher_portal");
-    } else if (targetOrg?.mode === "education") {
-      setActiveTab((prev) => (prev === "enterprise_shifts" ? "dashboard" : prev));
+    } else if (
+      usuarioActual?.rol === "teacher" &&
+      organizacionObjetivo?.modo === "education"
+    ) {
+      establecerPestanaActiva("teacher_portal");
+    } else if (organizacionObjetivo?.modo === "education") {
+      establecerPestanaActiva((previa) =>
+        previa === "enterprise_shifts" ? "dashboard" : previa
+      );
     }
-    await loadOrgData(orgId);
+
+    await cargarDatosOrganizacion(idOrganizacion);
   };
 
-  const refreshCurrentOrg = useCallback(async () => {
-    if (selectedOrgId === null) return;
-    const orgs = await api.listOrganizations();
-    setOrganizations(orgs);
-    await loadOrgData(selectedOrgId);
-  }, [loadOrgData, selectedOrgId]);
+  /** Recarga la organización actual y todos sus catálogos relacionados. */
+  const recargarOrganizacionActual = useCallback(async () => {
+    if (idOrganizacionSeleccionada === null) return;
+    const listaOrganizaciones = await clienteApi.listarOrganizaciones();
+    establecerOrganizaciones(listaOrganizaciones);
+    await cargarDatosOrganizacion(idOrganizacionSeleccionada);
+  }, [cargarDatosOrganizacion, idOrganizacionSeleccionada]);
 
-  if (checkingAuth) {
+  if (verificandoSesion) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-400 flex items-center justify-center text-sm">
         Verificando sesión...
@@ -177,139 +237,163 @@ export function App() {
     );
   }
 
-  if (!currentUser) {
-    return <LoginPage onSuccess={(res) => void handleLoginSuccess(res)} />;
+  if (!usuarioActual) {
+    return (
+      <PaginaInicioSesion
+        alIniciarSesion={(respuesta) => void manejarExitoInicioSesion(respuesta)}
+      />
+    );
   }
 
-  const selectedOrg = organizations.find((o) => o.id === selectedOrgId) ?? null;
+  const organizacionSeleccionada =
+    organizaciones.find((org) => org.id === idOrganizacionSeleccionada) ?? null;
 
   return (
-    <Layout
-      activeTab={activeTab}
-      onChangeTab={setActiveTab}
-      currentUser={currentUser}
-      onLogout={handleLogout}
-      organizations={organizations}
-      selectedOrg={selectedOrg}
-      onSelectOrg={(id) => void handleSelectOrg(id)}
-      health={health}
+    <DisenoPrincipal
+      pestanaActiva={pestanaActiva}
+      alCambiarPestana={establecerPestanaActiva}
+      usuarioActual={usuarioActual}
+      alCerrarSesion={manejarCierreSesion}
+      organizaciones={organizaciones}
+      organizacionSeleccionada={organizacionSeleccionada}
+      alSeleccionarOrganizacion={(idOrg) => void manejarSeleccionOrganizacion(idOrg)}
+      estadoSalud={estadoSalud}
     >
-      {loading ? (
+      {cargando ? (
         <div className="flex items-center justify-center h-64 text-sm text-slate-400">
           Cargando IdentIA...
         </div>
-      ) : loadError ? (
+      ) : errorCarga ? (
         <div className="max-w-xl mx-auto mt-10 rounded-2xl bg-red-500/10 border border-red-500/40 p-6 text-sm text-red-200 space-y-3">
           <p className="font-semibold">Error de conexión</p>
-          <p>{loadError}</p>
+          <p>{errorCarga}</p>
           <button
             type="button"
-            onClick={() => void bootstrapWorkspace(selectedOrgId ?? undefined)}
+            onClick={() =>
+              void inicializarEspacioTrabajo(idOrganizacionSeleccionada ?? undefined)
+            }
             className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-semibold"
           >
             Reintentar
           </button>
         </div>
-      ) : !selectedOrg ? (
+      ) : !organizacionSeleccionada ? (
         <div className="text-center text-slate-400 py-16 text-sm">
           No hay organizaciones asignadas a tu usuario.
         </div>
       ) : (
         <>
-          {activeTab === "teacher_portal" && selectedOrg.mode === "education" && (
-            <TeacherPortalPage
-              currentUser={currentUser}
-              organization={selectedOrg}
-              onRefreshAll={refreshCurrentOrg}
-              onOpenSessionInKiosk={handleOpenSessionInKiosk}
-            />
-          )}
-          {activeTab === "dashboard" && currentUser.role !== "teacher" && (
-            <DashboardPage
-              currentUser={currentUser}
-              organization={selectedOrg}
-              health={health}
-              persons={persons}
-              events={events}
-              onRefreshAll={refreshCurrentOrg}
-              onOrganizationCreated={async (id) => {
-                await bootstrapWorkspace(id);
+          {pestanaActiva === "teacher_portal" &&
+            organizacionSeleccionada.modo === "education" && (
+              <PaginaPortalDocente
+                usuarioActual={usuarioActual}
+                organizacion={organizacionSeleccionada}
+                alRecargarTodo={recargarOrganizacionActual}
+                alAbrirSesionEnKiosco={manejarAbrirSesionEnKiosco}
+              />
+            )}
+
+          {pestanaActiva === "dashboard" && usuarioActual.rol !== "teacher" && (
+            <PaginaPanelGeneral
+              usuarioActual={usuarioActual}
+              organizacion={organizacionSeleccionada}
+              estadoSalud={estadoSalud}
+              personas={personas}
+              eventos={eventos}
+              alRecargarTodo={recargarOrganizacionActual}
+              alCrearOrganizacion={async (idNuevaOrg) => {
+                await inicializarEspacioTrabajo(idNuevaOrg);
               }}
-              onNavigateTab={setActiveTab}
+              alNavegarPestana={establecerPestanaActiva}
             />
           )}
-          {activeTab === "kiosk" && (
-            <KioskPage
-              currentUser={currentUser}
-              organization={selectedOrg}
-              groups={groups}
-              sessions={sessions}
-              events={events}
-              initialSessionId={kioskTargetSessionId}
-              onRefreshEvents={async () => {
-                const evs = await api.listEvents(selectedOrg.id);
-                setEvents(evs);
+
+          {pestanaActiva === "kiosk" && (
+            <PaginaKiosco
+              usuarioActual={usuarioActual}
+              organizacion={organizacionSeleccionada}
+              grupos={grupos}
+              sesiones={sesiones}
+              eventos={eventos}
+              idSesionInicial={idSesionObjetivoKiosco}
+              alRecargarEventos={async () => {
+                const listaEventos = await clienteApi.listarEventos(
+                  organizacionSeleccionada.id
+                );
+                establecerEventos(listaEventos);
               }}
             />
           )}
-          {activeTab === "enrollment" && currentUser.role !== "teacher" && (
-            <EnrollmentPage
-              currentUser={currentUser}
-              organization={selectedOrg}
-              groups={groups}
-              persons={persons}
-              onRefreshPersons={async () => {
-                const [pers, hlt] = await Promise.all([
-                  api.listPersons(selectedOrg.id),
-                  api.getHealth(),
+
+          {pestanaActiva === "enrollment" && usuarioActual.rol !== "teacher" && (
+            <PaginaEnrolamiento
+              usuarioActual={usuarioActual}
+              organizacion={organizacionSeleccionada}
+              grupos={grupos}
+              personas={personas}
+              alRecargarPersonas={async () => {
+                const [listaPersonas, salud] = await Promise.all([
+                  clienteApi.listarPersonas(organizacionSeleccionada.id),
+                  clienteApi.obtenerSalud(),
                 ]);
-                setPersons(pers);
-                setHealth(hlt);
+                establecerPersonas(listaPersonas);
+                establecerEstadoSalud(salud);
               }}
             />
           )}
-          {activeTab === "academic" &&
-            selectedOrg.mode === "education" &&
-            (currentUser.role === "superadmin" || currentUser.role === "org_admin") && (
-              <AcademicPage
-                currentUser={currentUser}
-                organization={selectedOrg}
-                groups={groups}
-                onRefreshOrg={refreshCurrentOrg}
-                onOpenSessionInKiosk={handleOpenSessionInKiosk}
+
+          {pestanaActiva === "academic" &&
+            organizacionSeleccionada.modo === "education" &&
+            (usuarioActual.rol === "superadmin" ||
+              usuarioActual.rol === "org_admin") && (
+              <PaginaAcademico
+                usuarioActual={usuarioActual}
+                organizacion={organizacionSeleccionada}
+                grupos={grupos}
+                alRecargarOrganizacion={recargarOrganizacionActual}
+                alAbrirSesionEnKiosco={manejarAbrirSesionEnKiosco}
               />
             )}
-          {activeTab === "enterprise_shifts" &&
-            selectedOrg.mode === "enterprise" &&
-            ["superadmin", "org_admin", "supervisor"].includes(currentUser.role) && (
-              <EnterpriseShiftsPage
-                currentUser={currentUser}
-                organization={selectedOrg}
-                groups={groups}
-                persons={persons}
-                onRefreshOrg={refreshCurrentOrg}
-                onOpenSessionInKiosk={handleOpenSessionInKiosk}
+
+          {pestanaActiva === "enterprise_shifts" &&
+            organizacionSeleccionada.modo === "enterprise" &&
+            ["superadmin", "org_admin", "supervisor"].includes(
+              usuarioActual.rol
+            ) && (
+              <PaginaTurnosEmpresariales
+                usuarioActual={usuarioActual}
+                organizacion={organizacionSeleccionada}
+                grupos={grupos}
+                personas={personas}
+                alRecargarOrganizacion={recargarOrganizacionActual}
+                alAbrirSesionEnKiosco={manejarAbrirSesionEnKiosco}
               />
             )}
-          {activeTab === "sessions" && (
-            <SessionsPage
-              currentUser={currentUser}
-              organization={selectedOrg}
-              groups={groups}
-              sessions={sessions}
-              persons={persons}
-              events={events}
-              onRefreshAll={refreshCurrentOrg}
+
+          {pestanaActiva === "sessions" && (
+            <PaginaSesiones
+              usuarioActual={usuarioActual}
+              organizacion={organizacionSeleccionada}
+              grupos={grupos}
+              sesiones={sesiones}
+              personas={personas}
+              eventos={eventos}
+              alRecargarTodo={recargarOrganizacionActual}
             />
           )}
-          {activeTab === "security" &&
-            (currentUser.role === "superadmin" || currentUser.role === "org_admin") && (
-              <SecurityPage currentUser={currentUser} organization={selectedOrg} />
+
+          {pestanaActiva === "security" &&
+            (usuarioActual.rol === "superadmin" ||
+              usuarioActual.rol === "org_admin") && (
+              <PaginaSeguridad
+                usuarioActual={usuarioActual}
+                organizacion={organizacionSeleccionada}
+              />
             )}
         </>
       )}
-    </Layout>
+    </DisenoPrincipal>
   );
 }
 
-export default App;
+export default Aplicacion;

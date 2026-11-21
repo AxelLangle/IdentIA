@@ -1,3 +1,11 @@
+"""Servicio de registro de asistencia escolar y empresarial y exportación CSV.
+
+Aplica enfriamiento (cooldown) entre lecturas biométricas consecutivas,
+previene duplicados en pase de lista escolar, gestiona secuencias entrada/salida
+en empresas (incluyendo turnos nocturnos de la jornada previa) y genera archivos
+CSV con BOM UTF-8 listos para abrir en Excel.
+"""
+
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -5,314 +13,336 @@ import io
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AttendanceEvent, AttendanceSession, Group, Organization, Person
+from app.models import EventoAsistencia, Grupo, Organizacion, Persona, SesionAsistencia
 from app.services.enterprise_service import (
-    evaluate_shift_check_in,
-    evaluate_shift_check_out,
-    find_open_overnight_checkin,
-    resolve_attendance_work_shift,
+    buscar_entrada_nocturna_abierta,
+    evaluar_entrada_turno,
+    evaluar_salida_turno,
+    resolver_turno_para_asistencia,
 )
 
 
 @dataclass(frozen=True)
-class AttendanceRecordResult:
-    """Resultado de intentar registrar un evento de asistencia."""
+class ResultadoRegistroAsistencia:
+    """Resultado de intentar registrar un evento biométrico de asistencia."""
 
-    action: str  # "recorded" | "cooldown" | "already_present" | "invalid_sequence"
-    event: AttendanceEvent | None
-    worked_minutes: int | None
-    message: str
-    shift_name: str | None = None
-    late_minutes: int | None = None
-    early_exit_minutes: int | None = None
+    accion: str  # "recorded" | "cooldown" | "already_present" | "invalid_sequence"
+    evento: EventoAsistencia | None
+    minutos_trabajados: int | None
+    mensaje: str
+    nombre_turno: str | None = None
+    minutos_retardo: int | None = None
+    minutos_salida_anticipada: int | None = None
 
 
-def _normalize_dt(value: datetime | None) -> datetime:
-    if value is None:
+def _normalizar_fecha_hora(valor: datetime | None) -> datetime:
+    """Convierte un `datetime` opcional a hora local ingenua (sin tzinfo)."""
+    if valor is None:
         return datetime.now()
-    if value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
-    return value
+    if valor.tzinfo is not None:
+        return valor.astimezone().replace(tzinfo=None)
+    return valor
 
 
-def _compute_punctuality(
-    session: AttendanceSession,
-    organization: Organization,
-    current_time: datetime,
+def _calcular_puntualidad_sesion(
+    sesion: SesionAsistencia,
+    organizacion: Organizacion,
+    hora_actual: datetime,
 ) -> str:
-    if not session.expected_start_time:
+    """Determina si una llegada es `'on_time'` o `'late'` respecto a la sesión y tolerancia."""
+    if not sesion.hora_inicio_esperada:
         return "on_time"
     try:
-        hour_str, minute_str = session.expected_start_time.split(":")
-        expected_t = time(hour=int(hour_str), minute=int(minute_str))
+        hora_txt, minuto_txt = sesion.hora_inicio_esperada.split(":")
+        hora_esperada = time(hour=int(hora_txt), minute=int(minuto_txt))
     except (ValueError, TypeError):
         return "on_time"
 
-    deadline = datetime.combine(session.session_date, expected_t) + timedelta(
-        minutes=organization.late_tolerance_minutes
+    fecha_limite = datetime.combine(sesion.fecha_sesion, hora_esperada) + timedelta(
+        minutes=organizacion.minutos_tolerancia_retardo
     )
-    return "late" if current_time > deadline else "on_time"
+    return "late" if hora_actual > fecha_limite else "on_time"
 
 
-def get_or_create_active_session(
-    db: Session,
-    organization: Organization,
-    group_id: int | None = None,
-    target_date: date | None = None,
-) -> AttendanceSession:
-    """Obtiene la sesión abierta del día o crea una automáticamente para el kiosco."""
-    today = target_date or date.today()
-    stmt = (
-        select(AttendanceSession)
+def obtener_o_crear_sesion_activa(
+    sesion_bd: Session,
+    organizacion: Organizacion,
+    id_grupo: int | None = None,
+    fecha_objetivo: date | None = None,
+) -> SesionAsistencia:
+    """Obtiene la sesión abierta del día para el kiosco o crea una automáticamente."""
+    hoy = fecha_objetivo or date.today()
+    consulta = (
+        select(SesionAsistencia)
         .where(
-            AttendanceSession.organization_id == organization.id,
-            AttendanceSession.session_date == today,
-            AttendanceSession.status == "open",
-            AttendanceSession.group_id == group_id
-            if group_id is not None
-            else AttendanceSession.group_id.is_(None),
+            SesionAsistencia.id_organizacion == organizacion.id,
+            SesionAsistencia.fecha_sesion == hoy,
+            SesionAsistencia.estado == "open",
+            SesionAsistencia.id_grupo == id_grupo
+            if id_grupo is not None
+            else SesionAsistencia.id_grupo.is_(None),
         )
-        .order_by(AttendanceSession.id.desc())
+        .order_by(SesionAsistencia.id.desc())
     )
-    existing = db.scalars(stmt).first()
-    if existing is not None:
-        return existing
+    existente = sesion_bd.scalars(consulta).first()
+    if existente is not None:
+        return existente
 
-    expected_start_time: str | None = None
-    if group_id is not None:
-        group = db.get(Group, group_id)
-        if group is None or group.organization_id != organization.id:
+    hora_inicio_esperada: str | None = None
+    if id_grupo is not None:
+        grupo = sesion_bd.get(Grupo, id_grupo)
+        if grupo is None or grupo.id_organizacion != organizacion.id:
             raise ValueError("El grupo indicado no pertenece a la organización.")
-        expected_start_time = group.schedule_start
-        title = f"{group.name} ({today.isoformat()})"
+        hora_inicio_esperada = grupo.hora_inicio_horario
+        titulo = f"{grupo.nombre} ({hoy.isoformat()})"
     else:
-        prefix = "Pase de lista" if organization.mode == "education" else "Jornada"
-        title = f"{prefix} {today.isoformat()}"
+        prefijo = "Pase de lista" if organizacion.modo == "education" else "Jornada"
+        titulo = f"{prefijo} {hoy.isoformat()}"
 
-    session = AttendanceSession(
-        organization_id=organization.id,
-        group_id=group_id,
-        title=title,
-        session_date=today,
-        session_type="class" if organization.mode == "education" else "workday",
-        expected_start_time=expected_start_time,
-        status="open",
+    nueva_sesion = SesionAsistencia(
+        id_organizacion=organizacion.id,
+        id_grupo=id_grupo,
+        titulo=titulo,
+        fecha_sesion=hoy,
+        tipo_sesion="class" if organizacion.modo == "education" else "workday",
+        hora_inicio_esperada=hora_inicio_esperada,
+        estado="open",
     )
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    return session
+    sesion_bd.add(nueva_sesion)
+    sesion_bd.commit()
+    sesion_bd.refresh(nueva_sesion)
+    return nueva_sesion
 
 
-def record_recognized_attendance(
-    db: Session,
-    organization: Organization,
-    session: AttendanceSession,
-    person: Person,
-    confidence_score: float,
-    action_mode: str = "auto",
-    capture_mode: str = "kiosk_individual",
-    now: datetime | None = None,
-) -> AttendanceRecordResult:
+def registrar_asistencia_reconocida(
+    sesion_bd: Session,
+    organizacion: Organizacion,
+    sesion: SesionAsistencia,
+    persona: Persona,
+    puntaje_confianza: float,
+    modo_accion: str = "auto",
+    modo_captura: str = "kiosk_individual",
+    ahora: datetime | None = None,
+) -> ResultadoRegistroAsistencia:
     """Registra entrada/salida o asistencia escolar aplicando cooldown y reglas de modo."""
-    current_time = _normalize_dt(now)
-    is_education_flow = organization.mode == "education" or action_mode == "present"
+    hora_actual = _normalizar_fecha_hora(ahora)
+    es_flujo_educativo = organizacion.modo == "education" or modo_accion == "present"
 
-    last_event = db.scalars(
-        select(AttendanceEvent)
+    ultimo_evento = sesion_bd.scalars(
+        select(EventoAsistencia)
         .where(
-            AttendanceEvent.session_id == session.id,
-            AttendanceEvent.person_id == person.id,
+            EventoAsistencia.id_sesion == sesion.id,
+            EventoAsistencia.id_persona == persona.id,
         )
-        .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
+        .order_by(EventoAsistencia.fecha_hora.desc(), EventoAsistencia.id.desc())
     ).first()
 
-    if is_education_flow:
-        if last_event is not None:
-            elapsed = (current_time - last_event.timestamp).total_seconds()
-            if 0 <= elapsed < organization.cooldown_seconds:
-                remaining = max(1, int(round(organization.cooldown_seconds - elapsed)))
-                return AttendanceRecordResult(
-                    action="cooldown",
-                    event=last_event,
-                    worked_minutes=None,
-                    message=(
-                        f"{person.full_name} ya registró un movimiento hace poco. "
-                        f"Espera {remaining}s."
+    if es_flujo_educativo:
+        if ultimo_evento is not None:
+            segundos_transcurridos = (hora_actual - ultimo_evento.fecha_hora).total_seconds()
+            if 0 <= segundos_transcurridos < organizacion.segundos_enfriamiento:
+                restantes = max(1, int(round(organizacion.segundos_enfriamiento - segundos_transcurridos)))
+                return ResultadoRegistroAsistencia(
+                    accion="cooldown",
+                    evento=ultimo_evento,
+                    minutos_trabajados=None,
+                    mensaje=(
+                        f"{persona.nombre_completo} ya registró un movimiento hace poco. "
+                        f"Espera {restantes}s."
                     ),
                 )
 
-        existing_present = db.scalars(
-            select(AttendanceEvent).where(
-                AttendanceEvent.session_id == session.id,
-                AttendanceEvent.person_id == person.id,
-                AttendanceEvent.event_type == "present",
+        asistencia_previa = sesion_bd.scalars(
+            select(EventoAsistencia).where(
+                EventoAsistencia.id_sesion == sesion.id,
+                EventoAsistencia.id_persona == persona.id,
+                EventoAsistencia.tipo_evento == "present",
             )
         ).first()
-        if existing_present is not None:
-            return AttendanceRecordResult(
-                action="already_present",
-                event=existing_present,
-                worked_minutes=None,
-                message=f"{person.full_name} ya tiene asistencia registrada en esta sesión.",
+        if asistencia_previa is not None:
+            return ResultadoRegistroAsistencia(
+                accion="already_present",
+                evento=asistencia_previa,
+                minutos_trabajados=None,
+                mensaje=f"{persona.nombre_completo} ya tiene asistencia registrada en esta sesión.",
             )
 
-        status = _compute_punctuality(session, organization, current_time)
-        event = AttendanceEvent(
-            session_id=session.id,
-            person_id=person.id,
-            event_type="present",
-            status=status,
-            confidence_score=round(confidence_score, 4),
-            capture_mode=capture_mode,
-            timestamp=current_time,
+        estado_puntualidad = _calcular_puntualidad_sesion(sesion, organizacion, hora_actual)
+        evento = EventoAsistencia(
+            id_sesion=sesion.id,
+            id_persona=persona.id,
+            tipo_evento="present",
+            estado=estado_puntualidad,
+            puntaje_confianza=round(puntaje_confianza, 4),
+            modo_captura=modo_captura,
+            fecha_hora=hora_actual,
         )
-        db.add(event)
-        db.commit()
-        db.refresh(event)
-        label = "A tiempo" if status == "on_time" else "Retardo"
-        return AttendanceRecordResult(
-            action="recorded",
-            event=event,
-            worked_minutes=None,
-            message=f"Asistencia registrada para {person.full_name} ({label}).",
+        sesion_bd.add(evento)
+        sesion_bd.commit()
+        sesion_bd.refresh(evento)
+        etiqueta = "A tiempo" if estado_puntualidad == "on_time" else "Retardo"
+        return ResultadoRegistroAsistencia(
+            accion="recorded",
+            evento=evento,
+            minutos_trabajados=None,
+            mensaje=f"Asistencia registrada para {persona.nombre_completo} ({etiqueta}).",
         )
 
-    # Modo empresarial (check_in / check_out con soporte de turnos y cruce de medianoche)
-    effective_shift = resolve_attendance_work_shift(db, person, session)
-    target_session = session
+    # Modo empresarial: entrada/salida con turnos laborales y soporte de cruce de medianoche
+    turno_efectivo = resolver_turno_para_asistencia(sesion_bd, persona, sesion)
+    sesion_objetivo = sesion
 
-    if last_event is None and action_mode in ("auto", "check_out"):
-        overnight = find_open_overnight_checkin(
-            db,
-            organization.id,
-            person.id,
-            current_time,
-            effective_shift,
+    if ultimo_evento is None and modo_accion in ("auto", "check_out"):
+        jornada_nocturna = buscar_entrada_nocturna_abierta(
+            sesion_bd,
+            organizacion.id,
+            persona.id,
+            hora_actual,
+            turno_efectivo,
         )
-        if overnight is not None:
-            origin_event, origin_session, origin_shift = overnight
-            last_event = origin_event
-            target_session = origin_session
-            effective_shift = origin_shift
+        if jornada_nocturna is not None:
+            evento_origen, sesion_origen, turno_origen = jornada_nocturna
+            ultimo_evento = evento_origen
+            sesion_objetivo = sesion_origen
+            turno_efectivo = turno_origen
 
-    if last_event is not None:
-        elapsed = (current_time - last_event.timestamp).total_seconds()
-        if 0 <= elapsed < organization.cooldown_seconds:
-            remaining = max(1, int(round(organization.cooldown_seconds - elapsed)))
-            return AttendanceRecordResult(
-                action="cooldown",
-                event=last_event,
-                worked_minutes=None,
-                shift_name=effective_shift.name if effective_shift else None,
-                message=(
-                    f"{person.full_name} ya registró un movimiento hace poco. "
-                    f"Espera {remaining}s."
+    if ultimo_evento is not None:
+        segundos_transcurridos = (hora_actual - ultimo_evento.fecha_hora).total_seconds()
+        if 0 <= segundos_transcurridos < organizacion.segundos_enfriamiento:
+            restantes = max(1, int(round(organizacion.segundos_enfriamiento - segundos_transcurridos)))
+            return ResultadoRegistroAsistencia(
+                accion="cooldown",
+                evento=ultimo_evento,
+                minutos_trabajados=None,
+                nombre_turno=turno_efectivo.nombre if turno_efectivo else None,
+                mensaje=(
+                    f"{persona.nombre_completo} ya registró un movimiento hace poco. "
+                    f"Espera {restantes}s."
                 ),
             )
 
-    if action_mode == "auto":
-        if last_event is None or last_event.event_type == "check_out":
-            target_type = "check_in"
+    if modo_accion == "auto":
+        if ultimo_evento is None or ultimo_evento.tipo_evento == "check_out":
+            tipo_objetivo = "check_in"
         else:
-            target_type = "check_out"
+            tipo_objetivo = "check_out"
     else:
-        if action_mode == "check_in" and last_event is not None and last_event.event_type == "check_in":
-            return AttendanceRecordResult(
-                action="invalid_sequence",
-                event=last_event,
-                worked_minutes=None,
-                shift_name=effective_shift.name if effective_shift else None,
-                message=f"{person.full_name} ya tiene una entrada activa sin salida.",
+        if (
+            modo_accion == "check_in"
+            and ultimo_evento is not None
+            and ultimo_evento.tipo_evento == "check_in"
+        ):
+            return ResultadoRegistroAsistencia(
+                accion="invalid_sequence",
+                evento=ultimo_evento,
+                minutos_trabajados=None,
+                nombre_turno=turno_efectivo.nombre if turno_efectivo else None,
+                mensaje=f"{persona.nombre_completo} ya tiene una entrada activa sin salida.",
             )
-        if action_mode == "check_out" and (last_event is None or last_event.event_type != "check_in"):
-            return AttendanceRecordResult(
-                action="invalid_sequence",
-                event=last_event,
-                worked_minutes=None,
-                shift_name=effective_shift.name if effective_shift else None,
-                message=f"{person.full_name} no tiene una entrada previa para registrar salida.",
+        if modo_accion == "check_out" and (
+            ultimo_evento is None or ultimo_evento.tipo_evento != "check_in"
+        ):
+            return ResultadoRegistroAsistencia(
+                accion="invalid_sequence",
+                evento=ultimo_evento,
+                minutos_trabajados=None,
+                nombre_turno=turno_efectivo.nombre if turno_efectivo else None,
+                mensaje=f"{persona.nombre_completo} no tiene una entrada previa para registrar salida.",
             )
-        target_type = action_mode
+        tipo_objetivo = modo_accion
 
-    worked_minutes: int | None = None
-    late_minutes: int | None = None
-    early_exit_minutes: int | None = None
+    minutos_trabajados: int | None = None
+    minutos_retardo: int | None = None
+    minutos_salida_anticipada: int | None = None
 
-    if target_type == "check_in":
-        if effective_shift is not None:
-            status, late_minutes = evaluate_shift_check_in(
-                effective_shift, organization, target_session.session_date, current_time
+    if tipo_objetivo == "check_in":
+        if turno_efectivo is not None:
+            estado_evento, minutos_retardo = evaluar_entrada_turno(
+                turno_efectivo, organizacion, sesion_objetivo.fecha_sesion, hora_actual
             )
         else:
-            status = _compute_punctuality(target_session, organization, current_time)
+            estado_evento = _calcular_puntualidad_sesion(sesion_objetivo, organizacion, hora_actual)
     else:
-        if last_event is not None and last_event.event_type == "check_in":
-            worked_minutes = max(0, int((current_time - last_event.timestamp).total_seconds() // 60))
-        if effective_shift is not None:
-            status, early_exit_minutes = evaluate_shift_check_out(
-                effective_shift, target_session.session_date, current_time
+        if ultimo_evento is not None and ultimo_evento.tipo_evento == "check_in":
+            minutos_trabajados = max(
+                0,
+                int((hora_actual - ultimo_evento.fecha_hora).total_seconds() // 60),
+            )
+        if turno_efectivo is not None:
+            estado_evento, minutos_salida_anticipada = evaluar_salida_turno(
+                turno_efectivo, sesion_objetivo.fecha_sesion, hora_actual
             )
         else:
-            status = "on_time"
+            estado_evento = "on_time"
 
-    event = AttendanceEvent(
-        session_id=target_session.id,
-        person_id=person.id,
-        work_shift_id=effective_shift.id if effective_shift else None,
-        event_type=target_type,
-        status=status,
-        confidence_score=round(confidence_score, 4),
-        worked_minutes=worked_minutes,
-        late_minutes=late_minutes,
-        early_exit_minutes=early_exit_minutes,
-        capture_mode=capture_mode,
-        timestamp=current_time,
+    evento = EventoAsistencia(
+        id_sesion=sesion_objetivo.id,
+        id_persona=persona.id,
+        id_turno_laboral=turno_efectivo.id if turno_efectivo else None,
+        tipo_evento=tipo_objetivo,
+        estado=estado_evento,
+        puntaje_confianza=round(puntaje_confianza, 4),
+        minutos_trabajados=minutos_trabajados,
+        minutos_retardo=minutos_retardo,
+        minutos_salida_anticipada=minutos_salida_anticipada,
+        modo_captura=modo_captura,
+        fecha_hora=hora_actual,
     )
-    db.add(event)
-    db.commit()
-    db.refresh(event)
+    sesion_bd.add(evento)
+    sesion_bd.commit()
+    sesion_bd.refresh(evento)
 
-    shift_label = effective_shift.name if effective_shift else None
-    if target_type == "check_in":
-        if effective_shift is not None:
-            if status == "late":
-                msg = f"Entrada registrada: {person.full_name} (Retardo +{late_minutes} min · {effective_shift.name})."
+    nombre_turno = turno_efectivo.nombre if turno_efectivo else None
+    if tipo_objetivo == "check_in":
+        if turno_efectivo is not None:
+            if estado_evento == "late":
+                mensaje_resultado = (
+                    f"Entrada registrada: {persona.nombre_completo} "
+                    f"(Retardo +{minutos_retardo} min · {turno_efectivo.nombre})."
+                )
             else:
-                msg = f"Entrada registrada: {person.full_name} (A tiempo · {effective_shift.name})."
+                mensaje_resultado = (
+                    f"Entrada registrada: {persona.nombre_completo} "
+                    f"(A tiempo · {turno_efectivo.nombre})."
+                )
         else:
-            label = "A tiempo" if status == "on_time" else "Retardo"
-            msg = f"Entrada registrada: {person.full_name} ({label})."
+            etiqueta = "A tiempo" if estado_evento == "on_time" else "Retardo"
+            mensaje_resultado = f"Entrada registrada: {persona.nombre_completo} ({etiqueta})."
     else:
-        if effective_shift is not None and status == "early_exit":
-            msg = f"Salida anticipada registrada: {person.full_name} (-{early_exit_minutes} min · {effective_shift.name})."
-        elif effective_shift is not None:
-            msg = f"Salida registrada: {person.full_name} ({effective_shift.name})."
+        if turno_efectivo is not None and estado_evento == "early_exit":
+            mensaje_resultado = (
+                f"Salida anticipada registrada: {persona.nombre_completo} "
+                f"(-{minutos_salida_anticipada} min · {turno_efectivo.nombre})."
+            )
+        elif turno_efectivo is not None:
+            mensaje_resultado = (
+                f"Salida registrada: {persona.nombre_completo} ({turno_efectivo.nombre})."
+            )
         else:
-            msg = f"Salida registrada: {person.full_name}."
-        if worked_minutes is not None:
-            msg += f" Tiempo en jornada: {worked_minutes} min."
+            mensaje_resultado = f"Salida registrada: {persona.nombre_completo}."
+        if minutos_trabajados is not None:
+            mensaje_resultado += f" Tiempo en jornada: {minutos_trabajados} min."
 
-    return AttendanceRecordResult(
-        action="recorded",
-        event=event,
-        worked_minutes=worked_minutes,
-        message=msg,
-        shift_name=shift_label,
-        late_minutes=late_minutes,
-        early_exit_minutes=early_exit_minutes,
+    return ResultadoRegistroAsistencia(
+        accion="recorded",
+        evento=evento,
+        minutos_trabajados=minutos_trabajados,
+        mensaje=mensaje_resultado,
+        nombre_turno=nombre_turno,
+        minutos_retardo=minutos_retardo,
+        minutos_salida_anticipada=minutos_salida_anticipada,
     )
 
 
-def export_events_csv(
-    rows: list[tuple[AttendanceEvent, Person, AttendanceSession]],
-    shift_names: dict[int, str] | None = None,
+def exportar_eventos_csv(
+    filas: list[tuple[EventoAsistencia, Persona, SesionAsistencia]],
+    nombres_turnos: dict[int, str] | None = None,
 ) -> str:
     """Exporta registros de asistencia a CSV con BOM UTF-8 compatible con Excel."""
-    buffer = io.StringIO()
-    buffer.write("\ufeff")
-    writer = csv.writer(buffer)
-    writer.writerow(
+    bufer = io.StringIO()
+    bufer.write("\ufeff")
+    escritor = csv.writer(bufer)
+    escritor.writerow(
         [
             "ID Evento",
             "Fecha y Hora",
@@ -331,28 +361,39 @@ def export_events_csv(
             "Notas",
         ]
     )
-    resolved_shifts = shift_names or {}
-    for event, person, session in rows:
-        conf_pct = f"{event.confidence_score * 100:.1f}" if event.confidence_score is not None else ""
-        shift_id = event.work_shift_id or session.work_shift_id
-        shift_name = resolved_shifts.get(shift_id, "") if shift_id is not None else ""
-        writer.writerow(
+    turnos_resueltos = nombres_turnos or {}
+    for evento, persona, sesion in filas:
+        porcentaje_confianza = (
+            f"{evento.puntaje_confianza * 100:.1f}" if evento.puntaje_confianza is not None else ""
+        )
+        id_turno = evento.id_turno_laboral or sesion.id_turno_laboral
+        nombre_turno = turnos_resueltos.get(id_turno, "") if id_turno is not None else ""
+        escritor.writerow(
             [
-                event.id,
-                event.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                session.title,
-                person.external_id,
-                person.full_name,
-                person.role,
-                event.event_type,
-                event.status,
-                shift_name,
-                event.worked_minutes if event.worked_minutes is not None else "",
-                event.late_minutes if event.late_minutes is not None and event.late_minutes > 0 else "",
-                event.early_exit_minutes if event.early_exit_minutes is not None and event.early_exit_minutes > 0 else "",
-                event.capture_mode,
-                conf_pct,
-                event.notes or "",
+                evento.id,
+                evento.fecha_hora.strftime("%Y-%m-%d %H:%M:%S"),
+                sesion.titulo,
+                persona.identificador_externo,
+                persona.nombre_completo,
+                persona.rol,
+                evento.tipo_evento,
+                evento.estado,
+                nombre_turno,
+                evento.minutos_trabajados if evento.minutos_trabajados is not None else "",
+                (
+                    evento.minutos_retardo
+                    if evento.minutos_retardo is not None and evento.minutos_retardo > 0
+                    else ""
+                ),
+                (
+                    evento.minutos_salida_anticipada
+                    if evento.minutos_salida_anticipada is not None
+                    and evento.minutos_salida_anticipada > 0
+                    else ""
+                ),
+                evento.modo_captura,
+                porcentaje_confianza,
+                evento.notas or "",
             ]
         )
-    return buffer.getvalue()
+    return bufer.getvalue()

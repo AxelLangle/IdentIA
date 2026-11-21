@@ -1,217 +1,273 @@
+/**
+ * Gestión de Grupos/Departamentos, Sesiones de Asistencia, Registro Manual
+ * de Respaldo y Bitácora Histórica de Eventos con exportación CSV.
+ */
 import { useEffect, useState, type FormEvent } from "react";
-import { CalendarCheck, CalendarPlus, Download, Lock, Plus, Trash2 } from "lucide-react";
-import { formatGroupPeriodLabel } from "../lib/academicPeriods";
-import { api } from "../lib/api";
+import {
+  CalendarCheck,
+  CalendarPlus,
+  Download,
+  Lock,
+  Plus,
+  Trash2,
+} from "lucide-react";
+import { formatearEtiquetaPeriodoGrupo } from "../lib/academicPeriods";
+import { clienteApi } from "../lib/api";
 import type {
-  AttendanceEvent,
-  AttendanceSession,
-  AuthUser,
-  CourseAssignment,
-  Group,
-  Organization,
-  Person,
-  WorkShift,
+  AsignacionCurso,
+  EventoAsistencia,
+  Grupo,
+  Organizacion,
+  Persona,
+  SesionAsistencia,
+  TurnoLaboral,
+  UsuarioAutenticado,
 } from "../types/api";
 
-interface SessionsPageProps {
-  currentUser: AuthUser;
-  organization: Organization;
-  groups: Group[];
-  sessions: AttendanceSession[];
-  persons: Person[];
-  events: AttendanceEvent[];
-  onRefreshAll: () => Promise<void>;
+/** Propiedades recibidas por `PaginaSesiones`. */
+interface PropiedadesPaginaSesiones {
+  /** Usuario autenticado para aplicar reglas según rol. */
+  usuarioActual: UsuarioAutenticado;
+  /** Organización activa en el espacio de trabajo. */
+  organizacion: Organizacion;
+  /** Catálogo de grupos escolares o departamentos empresariales. */
+  grupos: Grupo[];
+  /** Lista de sesiones abiertas y cerradas. */
+  sesiones: SesionAsistencia[];
+  /** Padrón completo de personas activas en la organización. */
+  personas: Persona[];
+  /** Historial reciente de eventos registrados. */
+  eventos: EventoAsistencia[];
+  /** Callback para refrescar catálogos compartidos tras crear o cerrar elementos. */
+  alRecargarTodo: () => Promise<void>;
 }
 
-export function SessionsPage({
-  currentUser,
-  organization,
-  groups,
-  sessions,
-  persons,
-  events,
-  onRefreshAll,
-}: SessionsPageProps) {
-  const isTeacher = currentUser.role === "teacher";
-  const isEducation = organization.mode === "education";
-  const isEnterprise = organization.mode === "enterprise";
-  const canManageGroups = currentUser.role === "superadmin" || currentUser.role === "org_admin";
-  const canGenerateAcademic =
-    isEducation && ["superadmin", "org_admin", "teacher"].includes(currentUser.role);
-  const canGenerateEnterprise =
-    isEnterprise && ["superadmin", "org_admin", "supervisor", "operator"].includes(currentUser.role);
+/**
+ * Renderiza la gestión diaria de sesiones, creación rápida de grupos/áreas,
+ * pase manual de respaldo e historial filtrable por sesión.
+ */
+export function PaginaSesiones({
+  usuarioActual,
+  organizacion,
+  grupos,
+  sesiones,
+  personas,
+  eventos,
+  alRecargarTodo,
+}: PropiedadesPaginaSesiones) {
+  const esDocente = usuarioActual.rol === "teacher";
+  const esEducacion = organizacion.modo === "education";
+  const esEmpresa = organizacion.modo === "enterprise";
+  const puedeGestionarGrupos =
+    usuarioActual.rol === "superadmin" || usuarioActual.rol === "org_admin";
+  const puedeGenerarAcademicas =
+    esEducacion && ["superadmin", "org_admin", "teacher"].includes(usuarioActual.rol);
+  const puedeGenerarEmpresariales =
+    esEmpresa &&
+    ["superadmin", "org_admin", "supervisor", "operator"].includes(usuarioActual.rol);
 
-  const [courses, setCourses] = useState<CourseAssignment[]>([]);
-  const [workShifts, setWorkShifts] = useState<WorkShift[]>([]);
-  // Crear grupo / departamento
-  const [groupName, setGroupName] = useState("");
-  const [groupCode, setGroupCode] = useState("");
-  const [groupDefaultShiftId, setGroupDefaultShiftId] = useState<string>("");
+  const [cursos, establecerCursos] = useState<AsignacionCurso[]>([]);
+  const [turnosLaborales, establecerTurnosLaborales] = useState<TurnoLaboral[]>([]);
 
-  // Crear sesión
-  const [sessionTitle, setSessionTitle] = useState("");
-  const [sessionCourseId, setSessionCourseId] = useState<string>("");
-  const [sessionShiftId, setSessionShiftId] = useState<string>("");
-  const [sessionGroupId, setSessionGroupId] = useState<string>("");
-  const [expectedStart, setExpectedStart] = useState("");
+  // Formulario para crear grupo escolar o departamento.
+  const [nombreGrupo, establecerNombreGrupo] = useState("");
+  const [codigoGrupo, establecerCodigoGrupo] = useState("");
+  const [idTurnoDefectoGrupo, establecerIdTurnoDefectoGrupo] = useState<string>("");
 
-  // Registro manual
-  const [manualSessionId, setManualSessionId] = useState<string>("");
-  const [manualPersonId, setManualPersonId] = useState<string>("");
-  const [manualEventType, setManualEventType] = useState<"present" | "check_in" | "check_out">(
-    organization.mode === "education" ? "present" : "check_in"
-  );
-  const [manualNotes, setManualNotes] = useState("");
-  const [filterSessionId, setFilterSessionId] = useState<string>("");
-  const [statusMsg, setStatusMsg] = useState<string | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Formulario para abrir sesión manual o vinculada a curso/turno.
+  const [tituloSesion, establecerTituloSesion] = useState("");
+  const [idCursoSesion, establecerIdCursoSesion] = useState<string>("");
+  const [idTurnoSesion, establecerIdTurnoSesion] = useState<string>("");
+  const [idGrupoSesion, establecerIdGrupoSesion] = useState<string>("");
+  const [horaInicioEsperada, establecerHoraInicioEsperada] = useState("");
 
+  // Formulario de registro manual de respaldo.
+  const [idSesionManual, establecerIdSesionManual] = useState<string>("");
+  const [idPersonaManual, establecerIdPersonaManual] = useState<string>("");
+  const [tipoEventoManual, establecerTipoEventoManual] = useState<
+    "present" | "check_in" | "check_out"
+  >(organizacion.modo === "education" ? "present" : "check_in");
+  const [notasManuales, establecerNotasManuales] = useState("");
+  const [idSesionFiltro, establecerIdSesionFiltro] = useState<string>("");
+  const [mensajeEstado, establecerMensajeEstado] = useState<string | null>(null);
+  const [mensajeError, establecerMensajeError] = useState<string | null>(null);
+
+  // Carga cursos o turnos laborales según el modo de la organización activa.
   useEffect(() => {
-    setGroupDefaultShiftId("");
-    setSessionCourseId("");
-    setSessionShiftId("");
-    setSessionGroupId("");
-    setManualSessionId("");
-    setManualPersonId("");
-    let cancelled = false;
-    if (isEducation) {
-      setWorkShifts([]);
-      api
-        .listCourses(organization.id)
-        .then((list) => {
-          if (!cancelled) setCourses(list);
+    establecerIdTurnoDefectoGrupo("");
+    establecerIdCursoSesion("");
+    establecerIdTurnoSesion("");
+    establecerIdGrupoSesion("");
+    establecerIdSesionManual("");
+    establecerIdPersonaManual("");
+    let cancelado = false;
+
+    if (esEducacion) {
+      establecerTurnosLaborales([]);
+      clienteApi
+        .listarCursos(organizacion.id)
+        .then((lista) => {
+          if (!cancelado) establecerCursos(lista);
         })
         .catch(() => {
-          if (!cancelled) setCourses([]);
+          if (!cancelado) establecerCursos([]);
         });
     } else {
-      setCourses([]);
-      api
-        .listWorkShifts(organization.id)
-        .then((list) => {
-          if (!cancelled) setWorkShifts(list);
+      establecerCursos([]);
+      clienteApi
+        .listarTurnosLaborales(organizacion.id)
+        .then((lista) => {
+          if (!cancelado) establecerTurnosLaborales(lista);
         })
         .catch(() => {
-          if (!cancelled) setWorkShifts([]);
+          if (!cancelado) establecerTurnosLaborales([]);
         });
     }
+
     return () => {
-      cancelled = true;
+      cancelado = true;
     };
-  }, [isEducation, organization.id]);
+  }, [esEducacion, organizacion.id]);
 
-  const openSessions = sessions.filter((s) => s.status === "open");
-  const filteredEvents = filterSessionId
-    ? events.filter((e) => e.session_id === Number(filterSessionId))
-    : events;
+  const sesionesAbiertas = sesiones.filter((sesion) => sesion.estado === "open");
+  const eventosFiltrados = idSesionFiltro
+    ? eventos.filter((evento) => evento.id_sesion === Number(idSesionFiltro))
+    : eventos;
 
-  const selectedManualSession =
-    openSessions.find((s) => String(s.id) === manualSessionId) ?? null;
-  const manualPersonOptions =
-    selectedManualSession && selectedManualSession.group_id !== null
-      ? persons.filter((p) => p.group_ids.includes(selectedManualSession.group_id!))
-      : persons;
+  const sesionManualSeleccionada =
+    sesionesAbiertas.find((sesion) => String(sesion.id) === idSesionManual) ?? null;
+  const opcionesPersonaManual =
+    sesionManualSeleccionada && sesionManualSeleccionada.id_grupo !== null
+      ? personas.filter((persona) =>
+          persona.ids_grupos.includes(sesionManualSeleccionada.id_grupo!)
+        )
+      : personas;
 
-  async function handleGenerateTodaySessions() {
-    setErrorMsg(null);
-    setStatusMsg(null);
+  /** Dispara la generación automática de sesiones de clase o jornadas de hoy. */
+  async function manejarGenerarSesionesHoy() {
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
     try {
-      const now = new Date();
-      const todayIso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
-        now.getDate()
-      ).padStart(2, "0")}`;
-      const res = isEducation
-        ? await api.generateAcademicSessions({
-            organization_id: organization.id,
-            target_date: todayIso,
+      const ahora = new Date();
+      const fechaHoyIso = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(
+        2,
+        "0"
+      )}-${String(ahora.getDate()).padStart(2, "0")}`;
+      const respuesta = esEducacion
+        ? await clienteApi.generarSesionesAcademicas({
+            id_organizacion: organizacion.id,
+            fecha_objetivo: fechaHoyIso,
           })
-        : await api.generateEnterpriseSessions({
-            organization_id: organization.id,
-            target_date: todayIso,
+        : await clienteApi.generarSesionesEmpresariales({
+            id_organizacion: organizacion.id,
+            fecha_objetivo: fechaHoyIso,
           });
-      setStatusMsg(
-        `${isEducation ? "Sesiones" : "Jornadas"} del ${res.target_date}: ${res.created_count} nuevas, ${res.existing_count} existentes.`
+      establecerMensajeEstado(
+        `${esEducacion ? "Sesiones" : "Jornadas"} del ${respuesta.fecha_objetivo}: ${
+          respuesta.cantidad_creadas
+        } nuevas, ${respuesta.cantidad_existentes} existentes.`
       );
-      await onRefreshAll();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudieron generar sesiones.");
+      await alRecargarTodo();
+    } catch (errorGeneracion) {
+      establecerMensajeError(
+        errorGeneracion instanceof Error
+          ? errorGeneracion.message
+          : "No se pudieron generar sesiones."
+      );
     }
   }
 
-  async function handleCreateGroup(e: FormEvent) {
-    e.preventDefault();
-    if (!groupName.trim() || !groupCode.trim()) return;
-    setErrorMsg(null);
-    setStatusMsg(null);
+  /** Crea un nuevo grupo escolar o área/departamento empresarial. */
+  async function manejarCrearGrupo(evento: FormEvent) {
+    evento.preventDefault();
+    if (!nombreGrupo.trim() || !codigoGrupo.trim()) return;
+    establecerMensajeError(null);
+    establecerMensajeEstado(null);
     try {
-      await api.createGroup({
-        organization_id: organization.id,
-        name: groupName.trim(),
-        code: groupCode.trim(),
-        ...(isEnterprise && groupDefaultShiftId
-          ? { default_work_shift_id: Number(groupDefaultShiftId) }
+      await clienteApi.crearGrupo({
+        id_organizacion: organizacion.id,
+        nombre: nombreGrupo.trim(),
+        codigo: codigoGrupo.trim(),
+        ...(esEmpresa && idTurnoDefectoGrupo
+          ? { id_turno_laboral_defecto: Number(idTurnoDefectoGrupo) }
           : {}),
       });
-      setGroupName("");
-      setGroupCode("");
-      setGroupDefaultShiftId("");
-      setStatusMsg(isEnterprise ? "Área / departamento creado." : "Grupo creado.");
-      await onRefreshAll();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo crear el registro.");
+      establecerNombreGrupo("");
+      establecerCodigoGrupo("");
+      establecerIdTurnoDefectoGrupo("");
+      establecerMensajeEstado(
+        esEmpresa ? "Área / departamento creado." : "Grupo creado."
+      );
+      await alRecargarTodo();
+    } catch (errorCreacion) {
+      establecerMensajeError(
+        errorCreacion instanceof Error
+          ? errorCreacion.message
+          : "No se pudo crear el registro."
+      );
     }
   }
 
-  async function handleDeleteGroup(groupId: number) {
-    await api.deleteGroup(groupId);
-    await onRefreshAll();
+  /** Elimina un grupo o departamento existente por identificador. */
+  async function manejarEliminarGrupo(idGrupo: number) {
+    await clienteApi.eliminarGrupo(idGrupo);
+    await alRecargarTodo();
   }
 
-  async function handleCreateSession(e: FormEvent) {
-    e.preventDefault();
-    if (!sessionTitle.trim()) return;
-    setErrorMsg(null);
+  /** Abre manualmente una nueva sesión vinculada opcionalmente a curso, turno o grupo. */
+  async function manejarCrearSesion(evento: FormEvent) {
+    evento.preventDefault();
+    if (!tituloSesion.trim()) return;
+    establecerMensajeError(null);
     try {
-      await api.createSession({
-        organization_id: organization.id,
-        group_id: !sessionCourseId && sessionGroupId ? Number(sessionGroupId) : null,
-        course_assignment_id: sessionCourseId ? Number(sessionCourseId) : null,
-        work_shift_id: isEnterprise && sessionShiftId ? Number(sessionShiftId) : null,
-        title: sessionTitle.trim(),
-        expected_start_time: expectedStart || null,
+      await clienteApi.crearSesion({
+        id_organizacion: organizacion.id,
+        id_grupo: !idCursoSesion && idGrupoSesion ? Number(idGrupoSesion) : null,
+        id_asignacion_curso: idCursoSesion ? Number(idCursoSesion) : null,
+        id_turno_laboral: esEmpresa && idTurnoSesion ? Number(idTurnoSesion) : null,
+        titulo: tituloSesion.trim(),
+        hora_inicio_esperada: horaInicioEsperada || null,
       });
-      setSessionTitle("");
-      setSessionCourseId("");
-      setSessionShiftId("");
-      setExpectedStart("");
-      await onRefreshAll();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo abrir la sesión.");
+      establecerTituloSesion("");
+      establecerIdCursoSesion("");
+      establecerIdTurnoSesion("");
+      establecerHoraInicioEsperada("");
+      await alRecargarTodo();
+    } catch (errorSesion) {
+      establecerMensajeError(
+        errorSesion instanceof Error ? errorSesion.message : "No se pudo abrir la sesión."
+      );
     }
   }
 
-  async function handleCloseSession(sessionId: number) {
-    await api.closeSession(sessionId);
-    await onRefreshAll();
+  /** Cierra una sesión abierta para impedir nuevos registros en ella. */
+  async function manejarCerrarSesion(idSesion: number) {
+    await clienteApi.cerrarSesion(idSesion);
+    await alRecargarTodo();
   }
 
-  async function handleManualAttendance(e: FormEvent) {
-    e.preventDefault();
-    if (!manualSessionId || !manualPersonId) return;
-    setErrorMsg(null);
+  /** Registra una asistencia manual de respaldo en caso de falla física o excepción. */
+  async function manejarAsistenciaManual(evento: FormEvent) {
+    evento.preventDefault();
+    if (!idSesionManual || !idPersonaManual) return;
+    establecerMensajeError(null);
     try {
-      await api.createManualAttendance({
-        session_id: Number(manualSessionId),
-        person_id: Number(manualPersonId),
-        event_type: manualEventType,
-        status: "manual",
-        notes: manualNotes.trim() || undefined,
+      await clienteApi.crearAsistenciaManual({
+        id_sesion: Number(idSesionManual),
+        id_persona: Number(idPersonaManual),
+        tipo_evento: tipoEventoManual,
+        estado: "manual",
+        notas: notasManuales.trim() || undefined,
       });
-      setManualNotes("");
-      setStatusMsg("Asistencia manual registrada.");
-      await onRefreshAll();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo registrar asistencia manual.");
+      establecerNotasManuales("");
+      establecerMensajeEstado("Asistencia manual registrada.");
+      await alRecargarTodo();
+    } catch (errorManual) {
+      establecerMensajeError(
+        errorManual instanceof Error
+          ? errorManual.message
+          : "No se pudo registrar asistencia manual."
+      );
     }
   }
 
@@ -220,32 +276,33 @@ export function SessionsPage({
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">
-            {isTeacher ? "Mis Sesiones e Historial" : "Grupos, Sesiones e Historial"}
+            {esDocente ? "Mis Sesiones e Historial" : "Grupos, Sesiones e Historial"}
           </h2>
           <p className="text-sm text-slate-400">
-            {isTeacher
+            {esDocente
               ? "Sesiones y registros de tus asignaturas asignadas"
               : "Administra materias/departamentos, sesiones de asistencia y respaldo manual"}
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {(canGenerateAcademic || (canGenerateEnterprise && workShifts.length > 0)) && (
+          {(puedeGenerarAcademicas ||
+            (puedeGenerarEmpresariales && turnosLaborales.length > 0)) && (
             <button
               type="button"
-              onClick={() => void handleGenerateTodaySessions()}
+              onClick={() => void manejarGenerarSesionesHoy()}
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white"
             >
               <CalendarCheck className="w-4 h-4" />
-              {isEducation ? "Generar sesiones de hoy" : "Generar jornadas de hoy"}
+              {esEducacion ? "Generar sesiones de hoy" : "Generar jornadas de hoy"}
             </button>
           )}
           <button
             type="button"
             onClick={() =>
-              void api.downloadCsv(
-                organization.id,
-                filterSessionId ? Number(filterSessionId) : null
+              void clienteApi.descargarCsv(
+                organizacion.id,
+                idSesionFiltro ? Number(idSesionFiltro) : null
               )
             }
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
@@ -256,195 +313,219 @@ export function SessionsPage({
         </div>
       </div>
 
-      {statusMsg && (
+      {mensajeEstado && (
         <div className="rounded-xl bg-emerald-500/15 border border-emerald-500/40 px-4 py-2.5 text-xs text-emerald-200">
-          {statusMsg}
+          {mensajeEstado}
         </div>
       )}
-      {errorMsg && (
+      {mensajeError && (
         <div className="rounded-xl bg-red-500/15 border border-red-500/40 px-4 py-2.5 text-xs text-red-200">
-          {errorMsg}
+          {mensajeError}
         </div>
       )}
 
-      {/* Grupos y Sesiones */}
-      <div className={`grid grid-cols-1 ${isTeacher ? "" : "lg:grid-cols-2"} gap-6`}>
-        {!isTeacher && (
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-          <h3 className="font-semibold text-base">
-            {organization.mode === "education" ? "Grupos / Materias" : "Áreas / Departamentos"}
-          </h3>
+      {/* Grupos / Departamentos y Sesiones */}
+      <div className={`grid grid-cols-1 ${esDocente ? "" : "lg:grid-cols-2"} gap-6`}>
+        {!esDocente && (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+            <h3 className="font-semibold text-base">
+              {organizacion.modo === "education"
+                ? "Grupos / Materias"
+                : "Áreas / Departamentos"}
+            </h3>
 
-          {canManageGroups && (
-            <form onSubmit={handleCreateGroup} className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-              <input
-                type="text"
-                required
-                value={groupName}
-                onChange={(e) => setGroupName(e.target.value)}
-                placeholder={isEnterprise ? "Nombre del área / departamento" : "Nombre"}
-                className="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-              />
-              <input
-                type="text"
-                required
-                value={groupCode}
-                onChange={(e) => setGroupCode(e.target.value)}
-                placeholder="Código"
-                className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-              />
-              <button
-                type="submit"
-                className="inline-flex items-center justify-center gap-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg px-3 py-2 text-sm font-semibold"
+            {puedeGestionarGrupos && (
+              <form
+                onSubmit={manejarCrearGrupo}
+                className="grid grid-cols-2 sm:grid-cols-4 gap-2.5"
               >
-                <Plus className="w-4 h-4" />
-                Crear
-              </button>
-              {isEnterprise ? (
-                workShifts.some((sh) => sh.is_active) ? (
-                  <div className="col-span-2 sm:col-span-4">
-                    <label className="block text-[11px] text-slate-400 mb-1">
-                      Turno laboral por defecto (opcional)
-                    </label>
-                    <select
-                      value={groupDefaultShiftId}
-                      onChange={(e) => setGroupDefaultShiftId(e.target.value)}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
-                    >
-                      <option value="">Sin turno por defecto (definir por empleado)</option>
-                      {workShifts
-                        .filter((sh) => sh.is_active)
-                        .map((sh) => (
-                          <option key={sh.id} value={sh.id}>
-                            {sh.name} ({sh.start_time}–{sh.end_time}
-                            {sh.crosses_midnight ? " 🌙" : ""})
-                          </option>
-                        ))}
-                    </select>
-                  </div>
+                <input
+                  type="text"
+                  required
+                  value={nombreGrupo}
+                  onChange={(evento) => establecerNombreGrupo(evento.target.value)}
+                  placeholder={esEmpresa ? "Nombre del área / departamento" : "Nombre"}
+                  className="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                />
+                <input
+                  type="text"
+                  required
+                  value={codigoGrupo}
+                  onChange={(evento) => establecerCodigoGrupo(evento.target.value)}
+                  placeholder="Código"
+                  className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                />
+                <button
+                  type="submit"
+                  className="inline-flex items-center justify-center gap-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg px-3 py-2 text-sm font-semibold"
+                >
+                  <Plus className="w-4 h-4" />
+                  Crear
+                </button>
+                {esEmpresa ? (
+                  turnosLaborales.some((turno) => turno.esta_activo) ? (
+                    <div className="col-span-2 sm:col-span-4">
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Turno laboral por defecto (opcional)
+                      </label>
+                      <select
+                        value={idTurnoDefectoGrupo}
+                        onChange={(evento) =>
+                          establecerIdTurnoDefectoGrupo(evento.target.value)
+                        }
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                      >
+                        <option value="">
+                          Sin turno por defecto (definir por empleado)
+                        </option>
+                        {turnosLaborales
+                          .filter((turno) => turno.esta_activo)
+                          .map((turno) => (
+                            <option key={turno.id} value={turno.id}>
+                              {turno.nombre} ({turno.hora_inicio}–{turno.hora_fin}
+                              {turno.cruza_medianoche ? " 🌙" : ""})
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                  ) : (
+                    <p className="col-span-2 sm:col-span-4 text-[11px] text-slate-500">
+                      Los horarios laborales se configuran en Turnos y Jornadas.
+                    </p>
+                  )
                 ) : (
                   <p className="col-span-2 sm:col-span-4 text-[11px] text-slate-500">
-                    Los horarios laborales se configuran en Turnos y Jornadas.
+                    Los horarios y materias se gestionan en Estructura Académica.
                   </p>
-                )
-              ) : (
-                <p className="col-span-2 sm:col-span-4 text-[11px] text-slate-500">
-                  Los horarios y materias se gestionan en Estructura Académica.
-                </p>
-              )}
-            </form>
-          )}
+                )}
+              </form>
+            )}
 
-          <div className="space-y-2 max-h-56 overflow-y-auto">
-            {groups.map((g) => {
-              const linkedShift = isEnterprise
-                ? workShifts.find((sh) => sh.id === g.default_work_shift_id)
-                : null;
-              const periodLabel = isEducation
-                ? formatGroupPeriodLabel(g.period_type, g.semester)
-                : null;
-              return (
-                <div
-                  key={g.id}
-                  className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-800/50 border border-slate-800"
-                >
-                  <div>
-                    <p className="text-sm font-medium">
-                      {g.name} <span className="text-xs text-slate-400">({g.code})</span>
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      {isEnterprise ? (
-                        <>
-                          {g.members_count} integrantes ·{" "}
-                          {g.default_work_shift_name
-                            ? `Turno por defecto: ${g.default_work_shift_name}${
-                                linkedShift
-                                  ? ` (${linkedShift.start_time}–${linkedShift.end_time})`
-                                  : ""
-                              }`
-                            : "Sin turno por defecto"}
-                        </>
-                      ) : (
-                        <>
-                          {g.career_name ? `${g.career_name} · ` : ""}
-                          {periodLabel ? `${periodLabel} · ` : ""}
-                          {g.members_count} integrantes · {g.courses_count} materias
-                          {g.default_classroom ? ` · Aula ${g.default_classroom}` : ""}
-                        </>
-                      )}
-                    </p>
+            <div className="space-y-2 max-h-56 overflow-y-auto">
+              {grupos.map((grupo) => {
+                const turnoVinculado = esEmpresa
+                  ? turnosLaborales.find(
+                      (turno) => turno.id === grupo.id_turno_laboral_defecto
+                    )
+                  : null;
+                const etiquetaPeriodo = esEducacion
+                  ? formatearEtiquetaPeriodoGrupo(grupo.semestre, grupo.tipo_periodo)
+                  : null;
+                return (
+                  <div
+                    key={grupo.id}
+                    className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-800/50 border border-slate-800"
+                  >
+                    <div>
+                      <p className="text-sm font-medium">
+                        {grupo.nombre}{" "}
+                        <span className="text-xs text-slate-400">({grupo.codigo})</span>
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        {esEmpresa ? (
+                          <>
+                            {grupo.cantidad_integrantes} integrantes ·{" "}
+                            {grupo.nombre_turno_laboral_defecto
+                              ? `Turno por defecto: ${grupo.nombre_turno_laboral_defecto}${
+                                  turnoVinculado
+                                    ? ` (${turnoVinculado.hora_inicio}–${turnoVinculado.hora_fin})`
+                                    : ""
+                                }`
+                              : "Sin turno por defecto"}
+                          </>
+                        ) : (
+                          <>
+                            {grupo.nombre_carrera ? `${grupo.nombre_carrera} · ` : ""}
+                            {etiquetaPeriodo ? `${etiquetaPeriodo} · ` : ""}
+                            {grupo.cantidad_integrantes} integrantes ·{" "}
+                            {grupo.cantidad_cursos} materias
+                            {grupo.aula_defecto ? ` · Aula ${grupo.aula_defecto}` : ""}
+                          </>
+                        )}
+                      </p>
+                    </div>
+                    {puedeGestionarGrupos && (
+                      <button
+                        type="button"
+                        onClick={() => void manejarEliminarGrupo(grupo.id)}
+                        className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
                   </div>
-                  {canManageGroups && (
-                    <button
-                      type="button"
-                      onClick={() => void handleDeleteGroup(g.id)}
-                      className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
-        </div>
         )}
 
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           <h3 className="font-semibold text-base">Sesiones de Asistencia</h3>
 
-          <form onSubmit={handleCreateSession} className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-            {isEducation && (
+          <form
+            onSubmit={manejarCrearSesion}
+            className="grid grid-cols-1 sm:grid-cols-3 gap-2.5"
+          >
+            {esEducacion && (
               <select
-                required={isTeacher}
-                value={sessionCourseId}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setSessionCourseId(val);
-                  if (val && !sessionTitle.trim()) {
-                    const matched = courses.find((c) => String(c.id) === val);
-                    if (matched) {
-                      setSessionTitle(`${matched.subject_name} — ${matched.group_name}`);
+                required={esDocente}
+                value={idCursoSesion}
+                onChange={(evento) => {
+                  const valor = evento.target.value;
+                  establecerIdCursoSesion(valor);
+                  if (valor && !tituloSesion.trim()) {
+                    const cursoCoincidente = cursos.find(
+                      (curso) => String(curso.id) === valor
+                    );
+                    if (cursoCoincidente) {
+                      establecerTituloSesion(
+                        `${cursoCoincidente.nombre_materia} — ${cursoCoincidente.nombre_grupo}`
+                      );
                     }
                   }
                 }}
                 className="sm:col-span-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               >
                 <option value="">
-                  {isTeacher
+                  {esDocente
                     ? "Selecciona asignatura asignada..."
                     : "Opcional: vincular a asignatura de curso"}
                 </option>
-                {courses.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.subject_name} ({c.subject_code}) · {c.group_name}
+                {cursos.map((curso) => (
+                  <option key={curso.id} value={curso.id}>
+                    {curso.nombre_materia} ({curso.codigo_materia}) · {curso.nombre_grupo}
                   </option>
                 ))}
               </select>
             )}
-            {isEnterprise && workShifts.length > 0 && (
+            {esEmpresa && turnosLaborales.length > 0 && (
               <select
-                value={sessionShiftId}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setSessionShiftId(val);
-                  const matched = workShifts.find((sh) => String(sh.id) === val);
-                  if (matched) {
-                    if (!sessionTitle.trim()) {
-                      setSessionTitle(`${matched.name} (${matched.start_time}-${matched.end_time})`);
+                value={idTurnoSesion}
+                onChange={(evento) => {
+                  const valor = evento.target.value;
+                  establecerIdTurnoSesion(valor);
+                  const turnoCoincidente = turnosLaborales.find(
+                    (turno) => String(turno.id) === valor
+                  );
+                  if (turnoCoincidente) {
+                    if (!tituloSesion.trim()) {
+                      establecerTituloSesion(
+                        `${turnoCoincidente.nombre} (${turnoCoincidente.hora_inicio}-${turnoCoincidente.hora_fin})`
+                      );
                     }
-                    if (!expectedStart) {
-                      setExpectedStart(matched.start_time);
+                    if (!horaInicioEsperada) {
+                      establecerHoraInicioEsperada(turnoCoincidente.hora_inicio);
                     }
                   }
                 }}
                 className="sm:col-span-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               >
                 <option value="">Opcional: vincular a turno laboral</option>
-                {workShifts.map((sh) => (
-                  <option key={sh.id} value={sh.id}>
-                    {sh.name} ({sh.start_time}–{sh.end_time}
-                    {sh.crosses_midnight ? " 🌙" : ""})
+                {turnosLaborales.map((turno) => (
+                  <option key={turno.id} value={turno.id}>
+                    {turno.nombre} ({turno.hora_inicio}–{turno.hora_fin}
+                    {turno.cruza_medianoche ? " 🌙" : ""})
                   </option>
                 ))}
               </select>
@@ -452,8 +533,8 @@ export function SessionsPage({
             <input
               type="text"
               required
-              value={sessionTitle}
-              onChange={(e) => setSessionTitle(e.target.value)}
+              value={tituloSesion}
+              onChange={(evento) => establecerTituloSesion(evento.target.value)}
               placeholder="Título de la sesión"
               className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
             />
@@ -464,63 +545,71 @@ export function SessionsPage({
               <CalendarPlus className="w-4 h-4" />
               Abrir
             </button>
-            {!isTeacher && (
+            {!esDocente && (
               <select
-                value={sessionGroupId}
-                disabled={Boolean(sessionCourseId)}
-                onChange={(e) => setSessionGroupId(e.target.value)}
+                value={idGrupoSesion}
+                disabled={Boolean(idCursoSesion)}
+                onChange={(evento) => establecerIdGrupoSesion(evento.target.value)}
                 className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
               >
                 <option value="">Sin grupo específico</option>
-                {groups.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name}
+                {grupos.map((grupo) => (
+                  <option key={grupo.id} value={grupo.id}>
+                    {grupo.nombre}
                   </option>
                 ))}
               </select>
             )}
             <input
               type="time"
-              value={expectedStart}
-              onChange={(e) => setExpectedStart(e.target.value)}
-              className={`${isTeacher ? "sm:col-span-3" : ""} bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm`}
+              value={horaInicioEsperada}
+              onChange={(evento) => establecerHoraInicioEsperada(evento.target.value)}
+              className={`${
+                esDocente ? "sm:col-span-3" : ""
+              } bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm`}
               title="Hora esperada de inicio"
             />
           </form>
 
           <div className="space-y-2 max-h-56 overflow-y-auto">
-            {sessions.map((s) => (
+            {sesiones.map((sesion) => (
               <div
-                key={s.id}
+                key={sesion.id}
                 className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-800/50 border border-slate-800"
               >
                 <div>
-                  <p className="text-sm font-medium">{s.title}</p>
-                  {s.subject_name && (
+                  <p className="text-sm font-medium">{sesion.titulo}</p>
+                  {sesion.nombre_materia && (
                     <p className="text-[11px] text-indigo-300 mt-0.5">
-                      {s.subject_name}
-                      {s.group_name ? ` · ${s.group_name}` : ""}
-                      {s.teacher_name ? ` · ${s.teacher_name}` : ""}
+                      {sesion.nombre_materia}
+                      {sesion.nombre_grupo ? ` · ${sesion.nombre_grupo}` : ""}
+                      {sesion.nombre_docente ? ` · ${sesion.nombre_docente}` : ""}
                     </p>
                   )}
-                  {s.work_shift_name && (
+                  {sesion.nombre_turno_laboral && (
                     <p className="text-[11px] text-indigo-300 mt-0.5">
-                      Turno: {s.work_shift_name}
-                      {s.work_shift_code ? ` (${s.work_shift_code})` : ""}
-                      {s.work_shift_crosses_midnight ? " 🌙" : ""}
+                      Turno: {sesion.nombre_turno_laboral}
+                      {sesion.codigo_turno_laboral
+                        ? ` (${sesion.codigo_turno_laboral})`
+                        : ""}
+                      {sesion.turno_cruza_medianoche ? " 🌙" : ""}
                     </p>
                   )}
                   <p className="text-xs text-slate-500">
-                    {s.session_date} · {s.events_count} eventos ·{" "}
-                    <span className={s.status === "open" ? "text-emerald-400" : "text-slate-400"}>
-                      {s.status === "open" ? "Abierta" : "Cerrada"}
+                    {sesion.fecha_sesion} · {sesion.cantidad_eventos} eventos ·{" "}
+                    <span
+                      className={
+                        sesion.estado === "open" ? "text-emerald-400" : "text-slate-400"
+                      }
+                    >
+                      {sesion.estado === "open" ? "Abierta" : "Cerrada"}
                     </span>
                   </p>
                 </div>
-                {s.status === "open" && (
+                {sesion.estado === "open" && (
                   <button
                     type="button"
-                    onClick={() => void handleCloseSession(s.id)}
+                    onClick={() => void manejarCerrarSesion(sesion.id)}
                     className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300"
                   >
                     <Lock className="w-3.5 h-3.5" />
@@ -533,51 +622,55 @@ export function SessionsPage({
         </div>
       </div>
 
-      {/* Registro manual */}
+      {/* Registro manual de respaldo */}
       <form
-        onSubmit={handleManualAttendance}
+        onSubmit={manejarAsistenciaManual}
         className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
       >
         <div className="flex items-center justify-between">
           <h3 className="font-semibold text-base">Registro Manual de Respaldo</h3>
-          {statusMsg && <span className="text-xs text-emerald-300">{statusMsg}</span>}
+          {mensajeEstado && (
+            <span className="text-xs text-emerald-300">{mensajeEstado}</span>
+          )}
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
           <select
             required
-            value={manualSessionId}
-            onChange={(e) => {
-              setManualSessionId(e.target.value);
-              setManualPersonId("");
+            value={idSesionManual}
+            onChange={(evento) => {
+              establecerIdSesionManual(evento.target.value);
+              establecerIdPersonaManual("");
             }}
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
             <option value="">Selecciona sesión abierta...</option>
-            {openSessions.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.title}
+            {sesionesAbiertas.map((sesion) => (
+              <option key={sesion.id} value={sesion.id}>
+                {sesion.titulo}
               </option>
             ))}
           </select>
 
           <select
             required
-            value={manualPersonId}
-            onChange={(e) => setManualPersonId(e.target.value)}
+            value={idPersonaManual}
+            onChange={(evento) => establecerIdPersonaManual(evento.target.value)}
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
             <option value="">Selecciona persona...</option>
-            {manualPersonOptions.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.full_name} ({p.external_id})
+            {opcionesPersonaManual.map((persona) => (
+              <option key={persona.id} value={persona.id}>
+                {persona.nombre_completo} ({persona.identificador_externo})
               </option>
             ))}
           </select>
 
           <select
-            value={manualEventType}
-            onChange={(e) =>
-              setManualEventType(e.target.value as "present" | "check_in" | "check_out")
+            value={tipoEventoManual}
+            onChange={(evento) =>
+              establecerTipoEventoManual(
+                evento.target.value as "present" | "check_in" | "check_out"
+              )
             }
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
@@ -588,8 +681,8 @@ export function SessionsPage({
 
           <input
             type="text"
-            value={manualNotes}
-            onChange={(e) => setManualNotes(e.target.value)}
+            value={notasManuales}
+            onChange={(evento) => establecerNotasManuales(evento.target.value)}
             placeholder="Nota (ej. cámara sin luz)"
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           />
@@ -608,14 +701,14 @@ export function SessionsPage({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h3 className="font-semibold text-base">Historial de Asistencias</h3>
           <select
-            value={filterSessionId}
-            onChange={(e) => setFilterSessionId(e.target.value)}
+            value={idSesionFiltro}
+            onChange={(evento) => establecerIdSesionFiltro(evento.target.value)}
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
           >
             <option value="">Todas las sesiones</option>
-            {sessions.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.title}
+            {sesiones.map((sesion) => (
+              <option key={sesion.id} value={sesion.id}>
+                {sesion.titulo}
               </option>
             ))}
           </select>
@@ -635,68 +728,75 @@ export function SessionsPage({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/70">
-              {filteredEvents.map((ev) => (
-                <tr key={ev.id} className="hover:bg-slate-800/30">
+              {eventosFiltrados.map((evento) => (
+                <tr key={evento.id} className="hover:bg-slate-800/30">
                   <td className="py-2.5 pr-3 text-xs text-slate-300">
-                    {new Date(ev.timestamp).toLocaleString()}
+                    {new Date(evento.fecha_hora).toLocaleString()}
                   </td>
-                  <td className="py-2.5 px-3 text-xs text-slate-400">{ev.session_title}</td>
+                  <td className="py-2.5 px-3 text-xs text-slate-400">
+                    {evento.titulo_sesion}
+                  </td>
                   <td className="py-2.5 px-3 font-medium">
-                    {ev.person_name}{" "}
-                    <span className="text-xs text-slate-500">({ev.person_external_id})</span>
+                    {evento.nombre_persona}{" "}
+                    <span className="text-xs text-slate-500">
+                      ({evento.identificador_externo_persona})
+                    </span>
                   </td>
                   <td className="py-2.5 px-3 text-xs">
-                    {ev.event_type === "check_in"
+                    {evento.tipo_evento === "check_in"
                       ? "Entrada"
-                      : ev.event_type === "check_out"
+                      : evento.tipo_evento === "check_out"
                         ? "Salida"
                         : "Asistencia"}
-                    {ev.work_shift_name && (
+                    {evento.nombre_turno_laboral && (
                       <span className="block text-[11px] text-slate-400">
-                        {ev.work_shift_name}
+                        {evento.nombre_turno_laboral}
                       </span>
                     )}
                   </td>
                   <td className="py-2.5 px-3 text-xs">
                     <span
                       className={
-                        ev.status === "on_time"
+                        evento.estado === "on_time"
                           ? "text-emerald-300"
-                          : ev.status === "late"
+                          : evento.estado === "late"
                             ? "text-amber-300"
-                            : ev.status === "early_exit"
+                            : evento.estado === "early_exit"
                               ? "text-orange-300"
                               : "text-sky-300"
                       }
                     >
-                      {ev.status === "on_time"
+                      {evento.estado === "on_time"
                         ? "A tiempo"
-                        : ev.status === "late"
+                        : evento.estado === "late"
                           ? "Retardo"
-                          : ev.status === "early_exit"
+                          : evento.estado === "early_exit"
                             ? "Salida anticipada"
                             : "Manual"}
                     </span>
-                    {ev.late_minutes !== null && ev.late_minutes > 0 && (
+                    {evento.minutos_retardo !== null && evento.minutos_retardo > 0 && (
                       <span className="block text-[11px] text-amber-400">
-                        +{ev.late_minutes} min
+                        +{evento.minutos_retardo} min
                       </span>
                     )}
-                    {ev.early_exit_minutes !== null && ev.early_exit_minutes > 0 && (
-                      <span className="block text-[11px] text-orange-400">
-                        -{ev.early_exit_minutes} min
-                      </span>
-                    )}
-                    {ev.worked_minutes !== null && (
+                    {evento.minutos_salida_anticipada !== null &&
+                      evento.minutos_salida_anticipada > 0 && (
+                        <span className="block text-[11px] text-orange-400">
+                          -{evento.minutos_salida_anticipada} min
+                        </span>
+                      )}
+                    {evento.minutos_trabajados !== null && (
                       <span className="block text-[11px] text-slate-400">
-                        {ev.worked_minutes} min trabajados
+                        {evento.minutos_trabajados} min trabajados
                       </span>
                     )}
                   </td>
-                  <td className="py-2.5 px-3 text-xs text-slate-400">{ev.capture_mode}</td>
+                  <td className="py-2.5 px-3 text-xs text-slate-400">
+                    {evento.modo_captura}
+                  </td>
                   <td className="py-2.5 pl-3 text-right text-xs">
-                    {ev.confidence_score !== null
-                      ? `${(ev.confidence_score * 100).toFixed(1)}%`
+                    {evento.puntaje_confianza !== null
+                      ? `${(evento.puntaje_confianza * 100).toFixed(1)}%`
                       : "Manual"}
                   </td>
                 </tr>

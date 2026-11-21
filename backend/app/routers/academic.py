@@ -1,702 +1,775 @@
+"""Enrutador HTTP del dominio educativo (carreras, materias, cursos, agenda y estadísticas).
+
+Implementa la estructura académica completa con herencia automática de asignaturas
+hacia los alumnos inscritos en grupos, horarios semanales multi-bloque, portal
+docente con aislamiento estricto y analítica administrativa consolidada.
+"""
+
 from datetime import date, datetime
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.db import get_db
+from app.db import obtener_bd
 from app.models import (
-    Career,
-    ClassSchedule,
-    CourseAssignment,
-    Group,
-    Organization,
-    Person,
-    Subject,
-    User,
+    AsignacionCurso,
+    Carrera,
+    Grupo,
+    HorarioClase,
+    Materia,
+    Organizacion,
+    Persona,
+    Usuario,
 )
 from app.schemas import (
-    AcademicStatsResponse,
-    CareerCreate,
-    CareerRead,
-    CareerUpdate,
-    ClassScheduleCreate,
-    ClassScheduleRead,
-    CourseAssignmentCreate,
-    CourseAssignmentRead,
-    CourseAssignmentUpdate,
-    GenerateSessionsRequest,
-    GenerateSessionsResponse,
-    SessionRead,
-    StartCourseSessionRequest,
-    SubjectCreate,
-    SubjectRead,
-    TeacherAgendaResponse,
+    AsignacionCursoActualizar,
+    AsignacionCursoCrear,
+    AsignacionCursoLeer,
+    CarreraActualizar,
+    CarreraCrear,
+    CarreraLeer,
+    HorarioClaseCrear,
+    HorarioClaseLeer,
+    MateriaCrear,
+    MateriaLeer,
+    RespuestaAgendaDocente,
+    RespuestaEstadisticasAcademicas,
+    RespuestaGenerarSesiones,
+    SesionLeer,
+    SolicitudGenerarSesiones,
+    SolicitudIniciarSesionCurso,
 )
-from app.security import assert_org_access, get_current_user, require_roles, resolve_org_scope
+from app.security import (
+    obtener_usuario_actual,
+    requerir_roles,
+    resolver_alcance_organizacion,
+    validar_acceso_organizacion,
+)
 from app.services.academic_service import (
-    build_teacher_agenda,
-    compute_academic_stats,
-    generate_sessions_for_date,
-    get_teacher_group_ids,
-    serialize_courses_batch,
-    serialize_sessions_batch,
-    start_or_get_course_session,
-    validate_schedule_times,
+    calcular_estadisticas_academicas,
+    construir_agenda_docente,
+    generar_sesiones_para_fecha,
+    iniciar_o_obtener_sesion_curso,
+    obtener_ids_grupos_docente,
+    serializar_cursos_lote,
+    serializar_sesiones_lote,
+    validar_horarios_clase,
 )
-from app.services.security_service import record_audit_log, verify_admin_password
+from app.services.security_service import registrar_auditoria, verificar_contrasena_admin
 
-router = APIRouter(prefix="/api/academic", tags=["academic"])
+enrutador = APIRouter(prefix="/api/academic", tags=["academico"])
 
 
-def _serialize_careers(db: Session, careers: list[Career], organization_id: int) -> list[CareerRead]:
-    if not careers:
+def _serializar_carreras(
+    sesion_bd: Session,
+    carreras: list[Carrera],
+    id_organizacion: int,
+) -> list[CarreraLeer]:
+    """Serializa carreras junto con su periodo efectivo y conteos de grupos y materias."""
+    if not carreras:
         return []
-    org = db.get(Organization, organization_id)
-    org_period_type = org.academic_period_type if org else "semestral"
-    group_counts = {
-        cid: int(cnt)
-        for cid, cnt in db.execute(
-            select(Group.career_id, func.count(Group.id))
-            .where(Group.organization_id == organization_id, Group.career_id.is_not(None))
-            .group_by(Group.career_id)
+    organizacion = sesion_bd.get(Organizacion, id_organizacion)
+    tipo_periodo_org = organizacion.tipo_periodo_academico if organizacion else "semestral"
+
+    conteo_grupos = {
+        id_carrera: int(conteo)
+        for id_carrera, conteo in sesion_bd.execute(
+            select(Grupo.id_carrera, func.count(Grupo.id))
+            .where(Grupo.id_organizacion == id_organizacion, Grupo.id_carrera.is_not(None))
+            .group_by(Grupo.id_carrera)
         ).all()
     }
-    subject_counts = {
-        cid: int(cnt)
-        for cid, cnt in db.execute(
-            select(Subject.career_id, func.count(Subject.id))
-            .where(Subject.organization_id == organization_id, Subject.career_id.is_not(None))
-            .group_by(Subject.career_id)
+    conteo_materias = {
+        id_carrera: int(conteo)
+        for id_carrera, conteo in sesion_bd.execute(
+            select(Materia.id_carrera, func.count(Materia.id))
+            .where(Materia.id_organizacion == id_organizacion, Materia.id_carrera.is_not(None))
+            .group_by(Materia.id_carrera)
         ).all()
     }
     return [
-        CareerRead(
-            id=c.id,
-            organization_id=c.organization_id,
-            name=c.name,
-            code=c.code,
-            description=c.description,
-            period_type=c.period_type,
-            effective_period_type=c.period_type or org_period_type,
-            created_at=c.created_at,
-            groups_count=group_counts.get(c.id, 0),
-            subjects_count=subject_counts.get(c.id, 0),
+        CarreraLeer(
+            id=carrera.id,
+            id_organizacion=carrera.id_organizacion,
+            nombre=carrera.nombre,
+            codigo=carrera.codigo,
+            descripcion=carrera.descripcion,
+            tipo_periodo=carrera.tipo_periodo,
+            tipo_periodo_efectivo=carrera.tipo_periodo or tipo_periodo_org,
+            creado_en=carrera.creado_en,
+            cantidad_grupos=conteo_grupos.get(carrera.id, 0),
+            cantidad_materias=conteo_materias.get(carrera.id, 0),
         )
-        for c in careers
+        for carrera in carreras
     ]
 
 
-def _serialize_subjects(db: Session, subjects: list[Subject], organization_id: int) -> list[SubjectRead]:
-    if not subjects:
+def _serializar_materias(
+    sesion_bd: Session,
+    materias: list[Materia],
+    id_organizacion: int,
+) -> list[MateriaLeer]:
+    """Serializa asignaturas resolviendo el nombre de su carrera asociada."""
+    if not materias:
         return []
-    career_map = {
-        c.id: c.name
-        for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
+    mapa_carreras = {
+        carrera.id: carrera.nombre
+        for carrera in sesion_bd.scalars(
+            select(Carrera).where(Carrera.id_organizacion == id_organizacion)
+        ).all()
     }
     return [
-        SubjectRead(
-            id=s.id,
-            organization_id=s.organization_id,
-            career_id=s.career_id,
-            career_name=career_map.get(s.career_id) if s.career_id else None,
-            name=s.name,
-            code=s.code,
-            created_at=s.created_at,
+        MateriaLeer(
+            id=materia.id,
+            id_organizacion=materia.id_organizacion,
+            id_carrera=materia.id_carrera,
+            nombre_carrera=mapa_carreras.get(materia.id_carrera) if materia.id_carrera else None,
+            nombre=materia.nombre,
+            codigo=materia.codigo,
+            creado_en=materia.creado_en,
         )
-        for s in subjects
+        for materia in materias
     ]
 
 
-def _load_course_or_404(db: Session, course_id: int) -> CourseAssignment:
-    course = db.scalars(
-        select(CourseAssignment)
+def _cargar_curso_o_404(sesion_bd: Session, id_curso: int) -> AsignacionCurso:
+    """Obtiene una asignación de curso con sus relaciones cargadas o lanza HTTP 404."""
+    curso = sesion_bd.scalars(
+        select(AsignacionCurso)
         .options(
-            selectinload(CourseAssignment.subject),
-            selectinload(CourseAssignment.group),
-            selectinload(CourseAssignment.teacher),
-            selectinload(CourseAssignment.schedules),
+            selectinload(AsignacionCurso.materia),
+            selectinload(AsignacionCurso.grupo),
+            selectinload(AsignacionCurso.docente),
+            selectinload(AsignacionCurso.horarios),
         )
-        .where(CourseAssignment.id == course_id)
+        .where(AsignacionCurso.id == id_curso)
     ).first()
-    if course is None:
+    if curso is None:
         raise HTTPException(status_code=404, detail="Asignación de asignatura no encontrada.")
-    return course
+    return curso
 
 
-def _validate_teacher_user(db: Session, organization_id: int, teacher_user_id: int) -> User:
-    teacher = db.get(User, teacher_user_id)
-    if teacher is None or not teacher.is_active:
+def _validar_usuario_docente(
+    sesion_bd: Session,
+    id_organizacion: int,
+    id_usuario_docente: int,
+) -> Usuario:
+    """Verifica que el usuario asignado como docente esté activo, pertenezca a la escuela y tenga rol válido."""
+    docente = sesion_bd.get(Usuario, id_usuario_docente)
+    if docente is None or not docente.esta_activo:
         raise HTTPException(status_code=404, detail="Usuario docente no encontrado o inactivo.")
-    if teacher.organization_id != organization_id:
+    if docente.id_organizacion != id_organizacion:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="El profesor debe pertenecer a la misma organización.",
         )
-    if teacher.role not in ("teacher", "org_admin"):
+    if docente.rol not in ("teacher", "org_admin"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El usuario asignado debe tener rol de Profesor o Administrador de organización.",
         )
-    return teacher
+    return docente
 
 
-# --- Carreras ---
-@router.get("/careers", response_model=list[CareerRead])
-def list_careers(
-    organization_id: int | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[CareerRead]:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    careers = list(
-        db.scalars(
-            select(Career)
-            .where(Career.organization_id == scoped_org_id)
-            .order_by(Career.name.asc())
+# ==============================================================================
+# Carreras
+# ==============================================================================
+@enrutador.get("/careers", response_model=list[CarreraLeer])
+def listar_carreras(
+    id_organizacion: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[CarreraLeer]:
+    """Lista todas las carreras registradas en la institución."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    carreras = list(
+        sesion_bd.scalars(
+            select(Carrera)
+            .where(Carrera.id_organizacion == id_org_alcance)
+            .order_by(Carrera.nombre.asc())
         ).all()
     )
-    return _serialize_careers(db, careers, scoped_org_id)
+    return _serializar_carreras(sesion_bd, carreras, id_org_alcance)
 
 
-@router.post("/careers", response_model=CareerRead, status_code=status.HTTP_201_CREATED)
-def create_career(
-    payload: CareerCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> CareerRead:
-    assert_org_access(current_user, payload.organization_id)
-    org = db.get(Organization, payload.organization_id)
-    if org is None:
+@enrutador.post("/careers", response_model=CarreraLeer, status_code=status.HTTP_201_CREATED)
+def crear_carrera(
+    carga: CarreraCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> CarreraLeer:
+    """Da de alta una nueva carrera o programa académico."""
+    validar_acceso_organizacion(usuario_actual, carga.id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, carga.id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    career = Career(
-        organization_id=org.id,
-        name=payload.name.strip(),
-        code=payload.code.strip().upper(),
-        description=payload.description.strip() if payload.description else None,
-        period_type=payload.period_type,
+    carrera = Carrera(
+        id_organizacion=organizacion.id,
+        nombre=carga.nombre.strip(),
+        codigo=carga.codigo.strip().upper(),
+        descripcion=carga.descripcion.strip() if carga.descripcion else None,
+        tipo_periodo=carga.tipo_periodo,
     )
-    db.add(career)
+    sesion_bd.add(carrera)
     try:
-        db.flush()
-    except IntegrityError as exc:
-        db.rollback()
+        sesion_bd.flush()
+    except IntegrityError as excepcion:
+        sesion_bd.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Ya existe una carrera con el código '{career.code}'.",
-        ) from exc
+            detail=f"Ya existe una carrera con el código '{carrera.codigo}'.",
+        ) from excepcion
 
-    record_audit_log(
-        db,
-        organization_id=org.id,
-        action="create_career",
-        target_type="career",
-        target_id=career.id,
-        target_summary=f"{career.name} ({career.code})",
-        executed_by_user=current_user,
-        authorized_by_user=current_user,
+    registrar_auditoria(
+        sesion_bd,
+        id_organizacion=organizacion.id,
+        accion="create_career",
+        tipo_objetivo="career",
+        id_objetivo=carrera.id,
+        resumen_objetivo=f"{carrera.nombre} ({carrera.codigo})",
+        usuario_ejecutor=usuario_actual,
+        usuario_autorizador=usuario_actual,
     )
-    db.commit()
-    db.refresh(career)
-    return _serialize_careers(db, [career], org.id)[0]
+    sesion_bd.commit()
+    sesion_bd.refresh(carrera)
+    return _serializar_carreras(sesion_bd, [carrera], organizacion.id)[0]
 
 
-@router.patch("/careers/{career_id}", response_model=CareerRead)
-def update_career(
-    career_id: int,
-    payload: CareerUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> CareerRead:
-    career = db.get(Career, career_id)
-    if career is None:
+@enrutador.patch("/careers/{id_carrera}", response_model=CarreraLeer)
+def actualizar_carrera(
+    id_carrera: int,
+    carga: CarreraActualizar,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> CarreraLeer:
+    """Actualiza una carrera (cambiar su periodo académico exige contraseña administrativa)."""
+    carrera = sesion_bd.get(Carrera, id_carrera)
+    if carrera is None:
         raise HTTPException(status_code=404, detail="Carrera no encontrada.")
-    assert_org_access(current_user, career.organization_id)
+    validar_acceso_organizacion(usuario_actual, carrera.id_organizacion)
 
-    data = payload.model_dump(exclude_unset=True)
-    auth_secret = data.pop("authorization_secret", None)
+    datos_parciales = carga.model_dump(exclude_unset=True)
+    secreto_autorizacion = datos_parciales.pop("secreto_autorizacion", None)
 
-    if "period_type" in data and data["period_type"] != career.period_type:
-        auth_admin = verify_admin_password(
-            db,
-            current_user=current_user,
-            organization_id=career.organization_id,
-            authorization_secret=auth_secret,
+    if "tipo_periodo" in datos_parciales and datos_parciales["tipo_periodo"] != carrera.tipo_periodo:
+        admin_autorizador = verificar_contrasena_admin(
+            sesion_bd,
+            usuario_actual=usuario_actual,
+            id_organizacion=carrera.id_organizacion,
+            secreto_autorizacion=secreto_autorizacion,
         )
-        record_audit_log(
-            db,
-            organization_id=career.organization_id,
-            action="change_career_period_type",
-            target_type="career",
-            target_id=career.id,
-            target_summary=f"{career.name} ({career.code})",
-            executed_by_user=current_user,
-            authorized_by_user=auth_admin,
-            details=f"Periodo carrera: {career.period_type or 'general'} -> {data['period_type'] or 'general'}",
+        registrar_auditoria(
+            sesion_bd,
+            id_organizacion=carrera.id_organizacion,
+            accion="change_career_period_type",
+            tipo_objetivo="career",
+            id_objetivo=carrera.id,
+            resumen_objetivo=f"{carrera.nombre} ({carrera.codigo})",
+            usuario_ejecutor=usuario_actual,
+            usuario_autorizador=admin_autorizador,
+            detalles=(
+                f"Periodo carrera: {carrera.tipo_periodo or 'general'} -> "
+                f"{datos_parciales['tipo_periodo'] or 'general'}"
+            ),
         )
 
-    if "name" in data and data["name"] is not None:
-        career.name = data["name"].strip()
-    if "code" in data and data["code"] is not None:
-        career.code = data["code"].strip().upper()
-    if "description" in data:
-        career.description = data["description"].strip() if data["description"] else None
-    if "period_type" in data:
-        career.period_type = data["period_type"]
+    if "nombre" in datos_parciales and datos_parciales["nombre"] is not None:
+        carrera.nombre = datos_parciales["nombre"].strip()
+    if "codigo" in datos_parciales and datos_parciales["codigo"] is not None:
+        carrera.codigo = datos_parciales["codigo"].strip().upper()
+    if "descripcion" in datos_parciales:
+        carrera.descripcion = (
+            datos_parciales["descripcion"].strip() if datos_parciales["descripcion"] else None
+        )
+    if "tipo_periodo" in datos_parciales:
+        carrera.tipo_periodo = datos_parciales["tipo_periodo"]
 
     try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
+        sesion_bd.commit()
+    except IntegrityError as excepcion:
+        sesion_bd.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Ya existe otra carrera con ese código.",
-        ) from exc
-    db.refresh(career)
-    return _serialize_careers(db, [career], career.organization_id)[0]
+        ) from excepcion
+    sesion_bd.refresh(carrera)
+    return _serializar_carreras(sesion_bd, [carrera], carrera.id_organizacion)[0]
 
 
-@router.delete("/careers/{career_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_career(
-    career_id: int,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
+@enrutador.delete("/careers/{id_carrera}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_carrera(
+    id_carrera: int,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
 ) -> None:
-    career = db.get(Career, career_id)
-    if career is None:
+    """Elimina una carrera existente (los grupos asociados quedan con `id_carrera=None`)."""
+    carrera = sesion_bd.get(Carrera, id_carrera)
+    if carrera is None:
         raise HTTPException(status_code=404, detail="Carrera no encontrada.")
-    assert_org_access(current_user, career.organization_id)
-    db.delete(career)
-    db.commit()
+    validar_acceso_organizacion(usuario_actual, carrera.id_organizacion)
+    sesion_bd.delete(carrera)
+    sesion_bd.commit()
 
 
-# --- Asignaturas ---
-@router.get("/subjects", response_model=list[SubjectRead])
-def list_subjects(
-    organization_id: int | None = Query(default=None),
-    career_id: int | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[SubjectRead]:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    stmt = (
-        select(Subject)
-        .where(Subject.organization_id == scoped_org_id)
-        .order_by(Subject.name.asc())
+# ==============================================================================
+# Asignaturas
+# ==============================================================================
+@enrutador.get("/subjects", response_model=list[MateriaLeer])
+def listar_materias(
+    id_organizacion: int | None = Query(default=None),
+    id_carrera: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[MateriaLeer]:
+    """Lista las materias del catálogo institucional filtradas opcionalmente por carrera."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    consulta = (
+        select(Materia)
+        .where(Materia.id_organizacion == id_org_alcance)
+        .order_by(Materia.nombre.asc())
     )
-    if career_id is not None:
-        stmt = stmt.where(Subject.career_id == career_id)
-    subjects = list(db.scalars(stmt).all())
-    return _serialize_subjects(db, subjects, scoped_org_id)
+    if id_carrera is not None:
+        consulta = consulta.where(Materia.id_carrera == id_carrera)
+    materias = list(sesion_bd.scalars(consulta).all())
+    return _serializar_materias(sesion_bd, materias, id_org_alcance)
 
 
-@router.post("/subjects", response_model=SubjectRead, status_code=status.HTTP_201_CREATED)
-def create_subject(
-    payload: SubjectCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> SubjectRead:
-    assert_org_access(current_user, payload.organization_id)
-    org = db.get(Organization, payload.organization_id)
-    if org is None:
+@enrutador.post("/subjects", response_model=MateriaLeer, status_code=status.HTTP_201_CREATED)
+def crear_materia(
+    carga: MateriaCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> MateriaLeer:
+    """Crea una asignatura dentro del catálogo de la escuela."""
+    validar_acceso_organizacion(usuario_actual, carga.id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, carga.id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    if payload.career_id is not None:
-        career = db.get(Career, payload.career_id)
-        if career is None or career.organization_id != org.id:
+    if carga.id_carrera is not None:
+        carrera = sesion_bd.get(Carrera, carga.id_carrera)
+        if carrera is None or carrera.id_organizacion != organizacion.id:
             raise HTTPException(status_code=404, detail="Carrera no encontrada en la organización.")
 
-    subject = Subject(
-        organization_id=org.id,
-        career_id=payload.career_id,
-        name=payload.name.strip(),
-        code=payload.code.strip().upper(),
+    materia = Materia(
+        id_organizacion=organizacion.id,
+        id_carrera=carga.id_carrera,
+        nombre=carga.nombre.strip(),
+        codigo=carga.codigo.strip().upper(),
     )
-    db.add(subject)
+    sesion_bd.add(materia)
     try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
+        sesion_bd.commit()
+    except IntegrityError as excepcion:
+        sesion_bd.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Ya existe una asignatura con el código '{subject.code}'.",
-        ) from exc
-    db.refresh(subject)
-    return _serialize_subjects(db, [subject], org.id)[0]
+            detail=f"Ya existe una asignatura con el código '{materia.codigo}'.",
+        ) from excepcion
+    sesion_bd.refresh(materia)
+    return _serializar_materias(sesion_bd, [materia], organizacion.id)[0]
 
 
-@router.delete("/subjects/{subject_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_subject(
-    subject_id: int,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
+@enrutador.delete("/subjects/{id_materia}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_materia(
+    id_materia: int,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
 ) -> None:
-    subject = db.get(Subject, subject_id)
-    if subject is None:
+    """Elimina una materia del catálogo escolar."""
+    materia = sesion_bd.get(Materia, id_materia)
+    if materia is None:
         raise HTTPException(status_code=404, detail="Asignatura no encontrada.")
-    assert_org_access(current_user, subject.organization_id)
-    db.delete(subject)
-    db.commit()
+    validar_acceso_organizacion(usuario_actual, materia.id_organizacion)
+    sesion_bd.delete(materia)
+    sesion_bd.commit()
 
 
-# --- Asignaciones Grupo-Materia-Profesor y Horarios ---
-@router.get("/courses", response_model=list[CourseAssignmentRead])
-def list_courses(
-    organization_id: int | None = Query(default=None),
-    group_id: int | None = Query(default=None),
-    teacher_user_id: int | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[CourseAssignmentRead]:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
+# ==============================================================================
+# Asignaciones Grupo-Materia-Profesor y Horarios
+# ==============================================================================
+@enrutador.get("/courses", response_model=list[AsignacionCursoLeer])
+def listar_cursos(
+    id_organizacion: int | None = Query(default=None),
+    id_grupo: int | None = Query(default=None),
+    id_usuario_docente: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[AsignacionCursoLeer]:
+    """Lista cursos asignados a grupos; un docente solo puede consultar sus propios cursos."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
 
-    effective_teacher_id = teacher_user_id
-    if current_user.role == "teacher":
-        if teacher_user_id is not None and teacher_user_id != current_user.id:
+    id_docente_efectivo = id_usuario_docente
+    if usuario_actual.rol == "teacher":
+        if id_usuario_docente is not None and id_usuario_docente != usuario_actual.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Solo puedes consultar tus propias asignaciones de materias.",
             )
-        effective_teacher_id = current_user.id
+        id_docente_efectivo = usuario_actual.id
 
-    stmt = (
-        select(CourseAssignment)
+    consulta = (
+        select(AsignacionCurso)
         .options(
-            selectinload(CourseAssignment.subject),
-            selectinload(CourseAssignment.group),
-            selectinload(CourseAssignment.teacher),
-            selectinload(CourseAssignment.schedules),
+            selectinload(AsignacionCurso.materia),
+            selectinload(AsignacionCurso.grupo),
+            selectinload(AsignacionCurso.docente),
+            selectinload(AsignacionCurso.horarios),
         )
-        .where(CourseAssignment.organization_id == scoped_org_id)
-        .order_by(CourseAssignment.id.desc())
+        .where(AsignacionCurso.id_organizacion == id_org_alcance)
+        .order_by(AsignacionCurso.id.desc())
     )
-    if group_id is not None:
-        stmt = stmt.where(CourseAssignment.group_id == group_id)
-    if effective_teacher_id is not None:
-        stmt = stmt.where(CourseAssignment.teacher_user_id == effective_teacher_id)
+    if id_grupo is not None:
+        consulta = consulta.where(AsignacionCurso.id_grupo == id_grupo)
+    if id_docente_efectivo is not None:
+        consulta = consulta.where(AsignacionCurso.id_usuario_docente == id_docente_efectivo)
 
-    courses = list(db.scalars(stmt).all())
-    return serialize_courses_batch(db, courses, scoped_org_id)
+    cursos = list(sesion_bd.scalars(consulta).all())
+    return serializar_cursos_lote(sesion_bd, cursos, id_org_alcance)
 
 
-@router.post("/courses", response_model=CourseAssignmentRead, status_code=status.HTTP_201_CREATED)
-def create_course(
-    payload: CourseAssignmentCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> CourseAssignmentRead:
-    assert_org_access(current_user, payload.organization_id)
-    org = db.get(Organization, payload.organization_id)
-    if org is None:
+@enrutador.post("/courses", response_model=AsignacionCursoLeer, status_code=status.HTTP_201_CREATED)
+def crear_curso(
+    carga: AsignacionCursoCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> AsignacionCursoLeer:
+    """Asigna una asignatura y profesor a un grupo junto con sus bloques horarios iniciales."""
+    validar_acceso_organizacion(usuario_actual, carga.id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, carga.id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    group = db.get(Group, payload.group_id)
-    if group is None or group.organization_id != org.id:
+    grupo = sesion_bd.get(Grupo, carga.id_grupo)
+    if grupo is None or grupo.id_organizacion != organizacion.id:
         raise HTTPException(status_code=404, detail="Grupo no encontrado en la organización.")
 
-    subject = db.get(Subject, payload.subject_id)
-    if subject is None or subject.organization_id != org.id:
+    materia = sesion_bd.get(Materia, carga.id_materia)
+    if materia is None or materia.id_organizacion != organizacion.id:
         raise HTTPException(status_code=404, detail="Asignatura no encontrada en la organización.")
 
-    if payload.teacher_user_id is not None:
-        _validate_teacher_user(db, org.id, payload.teacher_user_id)
+    if carga.id_usuario_docente is not None:
+        _validar_usuario_docente(sesion_bd, organizacion.id, carga.id_usuario_docente)
 
-    for sl in payload.schedules:
-        validate_schedule_times(sl.start_time, sl.end_time)
+    for horario in carga.horarios:
+        validar_horarios_clase(horario.hora_inicio, horario.hora_fin)
 
-    course = CourseAssignment(
-        organization_id=org.id,
-        group_id=group.id,
-        subject_id=subject.id,
-        teacher_user_id=payload.teacher_user_id,
-        term=payload.term.strip() if payload.term else None,
-        is_active=True,
+    curso = AsignacionCurso(
+        id_organizacion=organizacion.id,
+        id_grupo=grupo.id,
+        id_materia=materia.id,
+        id_usuario_docente=carga.id_usuario_docente,
+        periodo_lectivo=carga.periodo_lectivo.strip() if carga.periodo_lectivo else None,
+        esta_activo=True,
     )
-    db.add(course)
+    sesion_bd.add(curso)
     try:
-        db.flush()
-    except IntegrityError as exc:
-        db.rollback()
+        sesion_bd.flush()
+    except IntegrityError as excepcion:
+        sesion_bd.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Este grupo ya tiene asignada esa asignatura.",
-        ) from exc
+        ) from excepcion
 
-    for sl in payload.schedules:
-        db.add(
-            ClassSchedule(
-                course_assignment_id=course.id,
-                day_of_week=sl.day_of_week,
-                start_time=sl.start_time,
-                end_time=sl.end_time,
-                classroom=sl.classroom.strip() if sl.classroom else None,
+    for horario in carga.horarios:
+        sesion_bd.add(
+            HorarioClase(
+                id_asignacion_curso=curso.id,
+                dia_semana=horario.dia_semana,
+                hora_inicio=horario.hora_inicio,
+                hora_fin=horario.hora_fin,
+                aula=horario.aula.strip() if horario.aula else None,
             )
         )
 
-    record_audit_log(
-        db,
-        organization_id=org.id,
-        action="create_course_assignment",
-        target_type="course_assignment",
-        target_id=course.id,
-        target_summary=f"{subject.name} -> {group.name}",
-        executed_by_user=current_user,
-        authorized_by_user=current_user,
+    registrar_auditoria(
+        sesion_bd,
+        id_organizacion=organizacion.id,
+        accion="create_course_assignment",
+        tipo_objetivo="course_assignment",
+        id_objetivo=curso.id,
+        resumen_objetivo=f"{materia.nombre} -> {grupo.nombre}",
+        usuario_ejecutor=usuario_actual,
+        usuario_autorizador=usuario_actual,
     )
-    db.commit()
-    loaded = _load_course_or_404(db, course.id)
-    return serialize_courses_batch(db, [loaded], org.id)[0]
+    sesion_bd.commit()
+    curso_cargado = _cargar_curso_o_404(sesion_bd, curso.id)
+    return serializar_cursos_lote(sesion_bd, [curso_cargado], organizacion.id)[0]
 
 
-@router.patch("/courses/{course_id}", response_model=CourseAssignmentRead)
-def update_course(
-    course_id: int,
-    payload: CourseAssignmentUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> CourseAssignmentRead:
-    course = _load_course_or_404(db, course_id)
-    assert_org_access(current_user, course.organization_id)
+@enrutador.patch("/courses/{id_curso}", response_model=AsignacionCursoLeer)
+def actualizar_curso(
+    id_curso: int,
+    carga: AsignacionCursoActualizar,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> AsignacionCursoLeer:
+    """Reasigna docente, periodo lectivo o estado activo de una asignatura en un grupo."""
+    curso = _cargar_curso_o_404(sesion_bd, id_curso)
+    validar_acceso_organizacion(usuario_actual, curso.id_organizacion)
 
-    data = payload.model_dump(exclude_unset=True)
-    if "teacher_user_id" in data and data["teacher_user_id"] is not None:
-        _validate_teacher_user(db, course.organization_id, data["teacher_user_id"])
+    datos_parciales = carga.model_dump(exclude_unset=True)
+    if (
+        "id_usuario_docente" in datos_parciales
+        and datos_parciales["id_usuario_docente"] is not None
+    ):
+        _validar_usuario_docente(
+            sesion_bd, curso.id_organizacion, datos_parciales["id_usuario_docente"]
+        )
 
-    for field, value in data.items():
-        if field == "term" and value is not None:
-            setattr(course, field, value.strip() or None)
+    for campo, valor in datos_parciales.items():
+        if campo == "periodo_lectivo" and valor is not None:
+            setattr(curso, campo, valor.strip() or None)
         else:
-            setattr(course, field, value)
+            setattr(curso, campo, valor)
 
-    db.commit()
-    loaded = _load_course_or_404(db, course.id)
-    return serialize_courses_batch(db, [loaded], course.organization_id)[0]
+    sesion_bd.commit()
+    curso_cargado = _cargar_curso_o_404(sesion_bd, curso.id)
+    return serializar_cursos_lote(sesion_bd, [curso_cargado], curso.id_organizacion)[0]
 
 
-@router.delete("/courses/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_course(
-    course_id: int,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
+@enrutador.delete("/courses/{id_curso}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_curso(
+    id_curso: int,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
 ) -> None:
-    course = db.get(CourseAssignment, course_id)
-    if course is None:
+    """Elimina la asignación de una asignatura en un grupo junto con sus horarios."""
+    curso = sesion_bd.get(AsignacionCurso, id_curso)
+    if curso is None:
         raise HTTPException(status_code=404, detail="Asignación de asignatura no encontrada.")
-    assert_org_access(current_user, course.organization_id)
-    db.delete(course)
-    db.commit()
+    validar_acceso_organizacion(usuario_actual, curso.id_organizacion)
+    sesion_bd.delete(curso)
+    sesion_bd.commit()
 
 
-@router.post(
-    "/courses/{course_id}/schedules",
-    response_model=ClassScheduleRead,
+@enrutador.post(
+    "/courses/{id_curso}/schedules",
+    response_model=HorarioClaseLeer,
     status_code=status.HTTP_201_CREATED,
 )
-def add_course_schedule(
-    course_id: int,
-    payload: ClassScheduleCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> ClassScheduleRead:
-    course = db.get(CourseAssignment, course_id)
-    if course is None:
+def agregar_horario_curso(
+    id_curso: int,
+    carga: HorarioClaseCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> HorarioClaseLeer:
+    """Agrega un bloque semanal (día, hora inicio/fin y aula) a una asignatura asignada."""
+    curso = sesion_bd.get(AsignacionCurso, id_curso)
+    if curso is None:
         raise HTTPException(status_code=404, detail="Asignación de asignatura no encontrada.")
-    assert_org_access(current_user, course.organization_id)
-    validate_schedule_times(payload.start_time, payload.end_time)
+    validar_acceso_organizacion(usuario_actual, curso.id_organizacion)
+    validar_horarios_clase(carga.hora_inicio, carga.hora_fin)
 
-    schedule = ClassSchedule(
-        course_assignment_id=course.id,
-        day_of_week=payload.day_of_week,
-        start_time=payload.start_time,
-        end_time=payload.end_time,
-        classroom=payload.classroom.strip() if payload.classroom else None,
+    horario = HorarioClase(
+        id_asignacion_curso=curso.id,
+        dia_semana=carga.dia_semana,
+        hora_inicio=carga.hora_inicio,
+        hora_fin=carga.hora_fin,
+        aula=carga.aula.strip() if carga.aula else None,
     )
-    db.add(schedule)
-    db.commit()
-    db.refresh(schedule)
-    return ClassScheduleRead.model_validate(schedule)
+    sesion_bd.add(horario)
+    sesion_bd.commit()
+    sesion_bd.refresh(horario)
+    return HorarioClaseLeer.model_validate(horario)
 
 
-@router.delete("/schedules/{schedule_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_schedule(
-    schedule_id: int,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
+@enrutador.delete("/schedules/{id_horario}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_horario(
+    id_horario: int,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
 ) -> None:
-    schedule = db.get(ClassSchedule, schedule_id)
-    if schedule is None:
+    """Elimina un bloque semanal específico de horario."""
+    horario = sesion_bd.get(HorarioClase, id_horario)
+    if horario is None:
         raise HTTPException(status_code=404, detail="Bloque de horario no encontrado.")
-    course = db.get(CourseAssignment, schedule.course_assignment_id)
-    if course is None:
+    curso = sesion_bd.get(AsignacionCurso, horario.id_asignacion_curso)
+    if curso is None:
         raise HTTPException(status_code=404, detail="Curso asociado no encontrado.")
-    assert_org_access(current_user, course.organization_id)
-    db.delete(schedule)
-    db.commit()
+    validar_acceso_organizacion(usuario_actual, curso.id_organizacion)
+    sesion_bd.delete(horario)
+    sesion_bd.commit()
 
 
-# --- Herencia automática de materias para alumnos ---
-@router.get("/students/{person_id}/courses", response_model=list[CourseAssignmentRead])
-def get_student_inherited_courses(
-    person_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[CourseAssignmentRead]:
-    person = db.scalars(
-        select(Person)
-        .options(selectinload(Person.group_links))
-        .where(Person.id == person_id)
+# ==============================================================================
+# Herencia automática de materias para alumnos
+# ==============================================================================
+@enrutador.get("/students/{id_persona}/courses", response_model=list[AsignacionCursoLeer])
+def obtener_cursos_heredados_alumno(
+    id_persona: int,
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[AsignacionCursoLeer]:
+    """Devuelve las materias que hereda automáticamente un alumno según sus grupos."""
+    persona = sesion_bd.scalars(
+        select(Persona)
+        .options(selectinload(Persona.enlaces_grupos))
+        .where(Persona.id == id_persona)
     ).first()
-    if person is None:
+    if persona is None:
         raise HTTPException(status_code=404, detail="Alumno no encontrado.")
-    assert_org_access(current_user, person.organization_id)
+    validar_acceso_organizacion(usuario_actual, persona.id_organizacion)
 
-    student_group_ids = {link.group_id for link in person.group_links}
-    if current_user.role == "teacher":
-        teacher_gids = get_teacher_group_ids(db, current_user.id)
-        if not (student_group_ids & teacher_gids):
+    ids_grupos_alumno = {enlace.id_grupo for enlace in persona.enlaces_grupos}
+    if usuario_actual.rol == "teacher":
+        ids_grupos_docente = obtener_ids_grupos_docente(sesion_bd, usuario_actual.id)
+        if not (ids_grupos_alumno & ids_grupos_docente):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Este alumno no pertenece a ninguno de tus grupos.",
             )
 
-    if not student_group_ids:
+    if not ids_grupos_alumno:
         return []
 
-    stmt = (
-        select(CourseAssignment)
+    consulta = (
+        select(AsignacionCurso)
         .options(
-            selectinload(CourseAssignment.subject),
-            selectinload(CourseAssignment.group),
-            selectinload(CourseAssignment.teacher),
-            selectinload(CourseAssignment.schedules),
+            selectinload(AsignacionCurso.materia),
+            selectinload(AsignacionCurso.grupo),
+            selectinload(AsignacionCurso.docente),
+            selectinload(AsignacionCurso.horarios),
         )
         .where(
-            CourseAssignment.organization_id == person.organization_id,
-            CourseAssignment.group_id.in_(student_group_ids),
-            CourseAssignment.is_active.is_(True),
+            AsignacionCurso.id_organizacion == persona.id_organizacion,
+            AsignacionCurso.id_grupo.in_(ids_grupos_alumno),
+            AsignacionCurso.esta_activo.is_(True),
         )
-        .order_by(CourseAssignment.id.asc())
+        .order_by(AsignacionCurso.id.asc())
     )
-    if current_user.role == "teacher":
-        stmt = stmt.where(CourseAssignment.teacher_user_id == current_user.id)
+    if usuario_actual.rol == "teacher":
+        consulta = consulta.where(AsignacionCurso.id_usuario_docente == usuario_actual.id)
 
-    courses = list(db.scalars(stmt).all())
-    return serialize_courses_batch(db, courses, person.organization_id)
+    cursos = list(sesion_bd.scalars(consulta).all())
+    return serializar_cursos_lote(sesion_bd, cursos, persona.id_organizacion)
 
 
-# --- Generación automática de sesiones y portal docente ---
-@router.post("/sessions/generate", response_model=GenerateSessionsResponse)
-def generate_academic_sessions(
-    payload: GenerateSessionsRequest,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "teacher")),
-    db: Session = Depends(get_db),
-) -> GenerateSessionsResponse:
-    scoped_org_id = resolve_org_scope(current_user, payload.organization_id)
-    target_date = payload.target_date or date.today()
+# ==============================================================================
+# Generación automática de sesiones y portal docente
+# ==============================================================================
+@enrutador.post("/sessions/generate", response_model=RespuestaGenerarSesiones)
+def generar_sesiones_academicas(
+    carga: SolicitudGenerarSesiones,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin", "teacher")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaGenerarSesiones:
+    """Genera de forma idempotente todas las sesiones de clase programadas para una fecha."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, carga.id_organizacion)
+    fecha_objetivo = carga.fecha_objetivo or date.today()
 
-    if payload.course_assignment_id is not None:
-        assignment = db.get(CourseAssignment, payload.course_assignment_id)
-        if assignment is None or assignment.organization_id != scoped_org_id:
+    if carga.id_asignacion_curso is not None:
+        asignacion = sesion_bd.get(AsignacionCurso, carga.id_asignacion_curso)
+        if asignacion is None or asignacion.id_organizacion != id_org_alcance:
             raise HTTPException(status_code=404, detail="Asignación de asignatura no encontrada.")
-        if current_user.role == "teacher" and assignment.teacher_user_id != current_user.id:
+        if usuario_actual.rol == "teacher" and asignacion.id_usuario_docente != usuario_actual.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No puedes generar sesiones para materias de otro docente.",
             )
 
-    created_count, existing_count, sessions = generate_sessions_for_date(
-        db,
-        organization_id=scoped_org_id,
-        target_date=target_date,
-        course_assignment_id=payload.course_assignment_id,
-        teacher_user_id=current_user.id if current_user.role == "teacher" else None,
+    cantidad_creadas, cantidad_existentes, sesiones = generar_sesiones_para_fecha(
+        sesion_bd,
+        id_organizacion=id_org_alcance,
+        fecha_objetivo=fecha_objetivo,
+        id_asignacion_curso=carga.id_asignacion_curso,
+        id_usuario_docente=usuario_actual.id if usuario_actual.rol == "teacher" else None,
     )
-    serialized = serialize_sessions_batch(db, sessions, scoped_org_id)
-    return GenerateSessionsResponse(
-        target_date=target_date,
-        created_count=created_count,
-        existing_count=existing_count,
-        sessions=serialized,
+    sesiones_serializadas = serializar_sesiones_lote(sesion_bd, sesiones, id_org_alcance)
+    return RespuestaGenerarSesiones(
+        fecha_objetivo=fecha_objetivo,
+        cantidad_creadas=cantidad_creadas,
+        cantidad_existentes=cantidad_existentes,
+        sesiones=sesiones_serializadas,
     )
 
 
-@router.post("/courses/{course_id}/start-session", response_model=SessionRead)
-def start_course_session(
-    course_id: int,
-    payload: StartCourseSessionRequest | None = Body(default=None),
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "teacher")),
-    db: Session = Depends(get_db),
-) -> SessionRead:
-    assignment = _load_course_or_404(db, course_id)
-    assert_org_access(current_user, assignment.organization_id)
+@enrutador.post("/courses/{id_curso}/start-session", response_model=SesionLeer)
+def iniciar_sesion_curso(
+    id_curso: int,
+    carga: SolicitudIniciarSesionCurso | None = Body(default=None),
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin", "teacher")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> SesionLeer:
+    """Inicia en 1 clic (o recupera si ya está abierta) la sesión de pase de lista de un curso."""
+    asignacion = _cargar_curso_o_404(sesion_bd, id_curso)
+    validar_acceso_organizacion(usuario_actual, asignacion.id_organizacion)
 
-    if current_user.role == "teacher" and assignment.teacher_user_id != current_user.id:
+    if usuario_actual.rol == "teacher" and asignacion.id_usuario_docente != usuario_actual.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Solo el profesor asignado o un administrador pueden iniciar esta sesión.",
         )
 
-    target_date = (payload.session_date if payload and payload.session_date else None) or date.today()
-    schedule_id = payload.schedule_id if payload else None
-    session = start_or_get_course_session(
-        db,
-        assignment=assignment,
-        target_date=target_date,
-        schedule_id=schedule_id,
+    fecha_objetivo = (carga.fecha_sesion if carga and carga.fecha_sesion else None) or date.today()
+    id_horario = carga.id_horario if carga else None
+    sesion = iniciar_o_obtener_sesion_curso(
+        sesion_bd,
+        asignacion=asignacion,
+        fecha_objetivo=fecha_objetivo,
+        id_horario=id_horario,
     )
-    return serialize_sessions_batch(db, [session], assignment.organization_id)[0]
+    return serializar_sesiones_lote(sesion_bd, [sesion], asignacion.id_organizacion)[0]
 
 
-@router.get("/teacher/agenda", response_model=TeacherAgendaResponse)
-def get_teacher_agenda(
-    organization_id: int | None = Query(default=None),
-    target_date: date | None = Query(default=None),
-    current_time: str | None = Query(default=None, pattern=r"^\d{2}:\d{2}$"),
-    teacher_user_id: int | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> TeacherAgendaResponse:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
+@enrutador.get("/teacher/agenda", response_model=RespuestaAgendaDocente)
+def obtener_agenda_docente(
+    id_organizacion: int | None = Query(default=None),
+    fecha_objetivo: date | None = Query(default=None),
+    hora_actual: str | None = Query(default=None, pattern=r"^\d{2}:\d{2}$"),
+    id_usuario_docente: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaAgendaDocente:
+    """Devuelve la agenda diaria del profesor ('Tu clase ahora') con aislamiento estricto."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
 
-    if current_user.role == "teacher":
-        if teacher_user_id is not None and teacher_user_id != current_user.id:
+    if usuario_actual.rol == "teacher":
+        if id_usuario_docente is not None and id_usuario_docente != usuario_actual.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Solo puedes consultar tu propia agenda docente.",
             )
-        resolved_teacher_id = current_user.id
+        id_docente_resuelto = usuario_actual.id
     else:
-        resolved_teacher_id = teacher_user_id if teacher_user_id is not None else current_user.id
+        id_docente_resuelto = (
+            id_usuario_docente if id_usuario_docente is not None else usuario_actual.id
+        )
 
-    resolved_date = target_date or date.today()
-    resolved_time = current_time or datetime.now().strftime("%H:%M")
-    return build_teacher_agenda(
-        db,
-        organization_id=scoped_org_id,
-        teacher_user_id=resolved_teacher_id,
-        target_date=resolved_date,
-        current_time_str=resolved_time,
+    fecha_resuelta = fecha_objetivo or date.today()
+    hora_resuelta = hora_actual or datetime.now().strftime("%H:%M")
+    return construir_agenda_docente(
+        sesion_bd,
+        id_organizacion=id_org_alcance,
+        id_usuario_docente=id_docente_resuelto,
+        fecha_objetivo=fecha_resuelta,
+        hora_actual_texto=hora_resuelta,
     )
 
 
-# --- Estadísticas administrativas (exclusivas para Superadmin / Org Admin) ---
-@router.get("/stats", response_model=AcademicStatsResponse)
-def get_academic_stats(
-    organization_id: int | None = Query(default=None),
-    date_from: date | None = Query(default=None),
-    date_to: date | None = Query(default=None),
-    career_id: int | None = Query(default=None),
-    group_id: int | None = Query(default=None),
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> AcademicStatsResponse:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    return compute_academic_stats(
-        db,
-        organization_id=scoped_org_id,
-        date_from=date_from,
-        date_to=date_to,
-        career_id=career_id,
-        group_id=group_id,
+# ==============================================================================
+# Estadísticas administrativas (exclusivas para Superadmin / Org Admin)
+# ==============================================================================
+@enrutador.get("/stats", response_model=RespuestaEstadisticasAcademicas)
+def obtener_estadisticas_academicas(
+    id_organizacion: int | None = Query(default=None),
+    fecha_desde: date | None = Query(default=None),
+    fecha_hasta: date | None = Query(default=None),
+    id_carrera: int | None = Query(default=None),
+    id_grupo: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaEstadisticasAcademicas:
+    """Consolida métricas escolares por asignatura, grupo y alumno en un rango de fechas."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    return calcular_estadisticas_academicas(
+        sesion_bd,
+        id_organizacion=id_org_alcance,
+        fecha_desde=fecha_desde,
+        fecha_hasta=fecha_hasta,
+        id_carrera=id_carrera,
+        id_grupo=id_grupo,
     )

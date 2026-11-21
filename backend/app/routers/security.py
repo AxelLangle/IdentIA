@@ -1,239 +1,287 @@
+"""Enrutador HTTP para credenciales delegadas de autorización y bitácora de auditoría.
+
+Permite a Superadmin y Org Admin emitir contraseñas delegadas temporales para
+operadores, revocarlas de inmediato y consultar la trazabilidad completa de
+eventos sensibles registrados en `audit_logs`.
+"""
+
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.models import AuditLog, DelegatedCredential, Organization, User
+from app.db import obtener_bd
+from app.models import CredencialDelegada, Organizacion, RegistroAuditoria, Usuario
 from app.schemas import (
-    AuditLogRead,
-    DelegatedCredentialCreate,
-    DelegatedCredentialCreateResponse,
-    DelegatedCredentialRead,
+    CredencialDelegadaCrear,
+    CredencialDelegadaLeer,
+    RegistroAuditoriaLeer,
+    RespuestaCrearCredencialDelegada,
 )
 from app.security import (
-    assert_org_access,
-    generate_delegated_secret,
-    hash_secret,
-    require_roles,
-    resolve_org_scope,
+    generar_hash_secreto,
+    generar_secreto_delegado,
+    requerir_roles,
+    resolver_alcance_organizacion,
+    validar_acceso_organizacion,
 )
-from app.services.security_service import record_audit_log
+from app.services.security_service import registrar_auditoria
 
-router = APIRouter(prefix="/api/security", tags=["security"])
+enrutador = APIRouter(prefix="/api/security", tags=["seguridad"])
 
 
-def _serialize_credential(
-    cred: DelegatedCredential,
-    users_map: dict[int, User],
-) -> DelegatedCredentialRead:
-    creator = users_map.get(cred.created_by_user_id) if cred.created_by_user_id else None
-    ops = [op.strip() for op in cred.allowed_operations.split(",") if op.strip()]
-    return DelegatedCredentialRead(
-        id=cred.id,
-        organization_id=cred.organization_id,
-        label=cred.label,
-        secret_prefix=cred.secret_prefix,
-        created_by_user_id=cred.created_by_user_id,
-        created_by_name=creator.full_name if creator else None,
-        assigned_to_user_id=cred.assigned_to_user_id,
-        assigned_to_name=cred.assigned_to_name,
-        allowed_operations=ops,
-        status=cred.status,
-        expires_at=cred.expires_at,
-        created_at=cred.created_at,
-        revoked_at=cred.revoked_at,
+def _serializar_credencial(
+    credencial: CredencialDelegada,
+    mapa_usuarios: dict[int, Usuario],
+) -> CredencialDelegadaLeer:
+    """Convierte una credencial delegada ORM a su vista pública sin exponer el hash."""
+    creador = (
+        mapa_usuarios.get(credencial.id_usuario_creador)
+        if credencial.id_usuario_creador
+        else None
+    )
+    operaciones = [
+        operacion.strip()
+        for operacion in credencial.operaciones_permitidas.split(",")
+        if operacion.strip()
+    ]
+    return CredencialDelegadaLeer(
+        id=credencial.id,
+        id_organizacion=credencial.id_organizacion,
+        etiqueta=credencial.etiqueta,
+        prefijo_secreto=credencial.prefijo_secreto,
+        id_usuario_creador=credencial.id_usuario_creador,
+        nombre_creador=creador.nombre_completo if creador else None,
+        id_usuario_asignado=credencial.id_usuario_asignado,
+        nombre_asignado=credencial.nombre_asignado,
+        operaciones_permitidas=operaciones,
+        estado=credencial.estado,
+        expira_en=credencial.expira_en,
+        creado_en=credencial.creado_en,
+        revocado_en=credencial.revocado_en,
     )
 
 
-@router.get("/delegated-credentials", response_model=list[DelegatedCredentialRead])
-def list_delegated_credentials(
-    organization_id: int | None = Query(default=None),
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> list[DelegatedCredentialRead]:
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    creds = list(
-        db.scalars(
-            select(DelegatedCredential)
-            .where(DelegatedCredential.organization_id == scoped_org_id)
-            .order_by(DelegatedCredential.id.desc())
+@enrutador.get("/delegated-credentials", response_model=list[CredencialDelegadaLeer])
+def listar_credenciales_delegadas(
+    id_organizacion: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[CredencialDelegadaLeer]:
+    """Lista credenciales delegadas de la organización marcando automáticamente las expiradas."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    credenciales = list(
+        sesion_bd.scalars(
+            select(CredencialDelegada)
+            .where(CredencialDelegada.id_organizacion == id_org_alcance)
+            .order_by(CredencialDelegada.id.desc())
         ).all()
     )
 
-    now = datetime.now()
-    dirty = False
-    for cred in creds:
-        if cred.status == "active" and cred.expires_at is not None and cred.expires_at < now:
-            cred.status = "expired"
-            dirty = True
-    if dirty:
-        db.commit()
+    ahora = datetime.now()
+    hubo_cambios = False
+    for credencial in credenciales:
+        if (
+            credencial.estado == "active"
+            and credencial.expira_en is not None
+            and credencial.expira_en < ahora
+        ):
+            credencial.estado = "expired"
+            hubo_cambios = True
+    if hubo_cambios:
+        sesion_bd.commit()
 
-    users_map = {u.id: u for u in db.scalars(select(User)).all()}
-    return [_serialize_credential(c, users_map) for c in creds]
+    mapa_usuarios = {usuario.id: usuario for usuario in sesion_bd.scalars(select(Usuario)).all()}
+    return [_serializar_credencial(credencial, mapa_usuarios) for credencial in credenciales]
 
 
-@router.post(
+@enrutador.post(
     "/delegated-credentials",
-    response_model=DelegatedCredentialCreateResponse,
+    response_model=RespuestaCrearCredencialDelegada,
     status_code=status.HTTP_201_CREATED,
 )
-def create_delegated_credential(
-    payload: DelegatedCredentialCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> DelegatedCredentialCreateResponse:
-    scoped_org_id = resolve_org_scope(current_user, payload.organization_id)
-    org = db.get(Organization, scoped_org_id)
-    if org is None:
+def crear_credencial_delegada(
+    carga: CredencialDelegadaCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaCrearCredencialDelegada:
+    """Emite una contraseña delegada hasheada y devuelve el secreto en claro una única vez."""
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, carga.id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, id_org_alcance)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    assigned_name = payload.assigned_to_name.strip() if payload.assigned_to_name else ""
-    if payload.assigned_to_user_id is not None:
-        assigned_user = db.get(User, payload.assigned_to_user_id)
-        if assigned_user is None or not assigned_user.is_active:
+    nombre_asignado = carga.nombre_asignado.strip() if carga.nombre_asignado else ""
+    if carga.id_usuario_asignado is not None:
+        usuario_asignado = sesion_bd.get(Usuario, carga.id_usuario_asignado)
+        if usuario_asignado is None or not usuario_asignado.esta_activo:
             raise HTTPException(status_code=404, detail="Usuario subordinado no encontrado.")
-        if assigned_user.organization_id not in (scoped_org_id, None):
+        if usuario_asignado.id_organizacion not in (id_org_alcance, None):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="El usuario asignado no pertenece a esta organización.",
             )
-        if not assigned_name:
-            assigned_name = assigned_user.full_name
+        if not nombre_asignado:
+            nombre_asignado = usuario_asignado.nombre_completo
 
-    if not assigned_name:
+    if not nombre_asignado:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Debes indicar el usuario o el nombre de la persona que utilizará la contraseña.",
         )
 
-    if payload.custom_secret:
-        plain_secret = payload.custom_secret.strip()
-        prefix = f"CUS-{plain_secret[:4].upper()}"
+    if carga.secreto_personalizado:
+        secreto_plano = carga.secreto_personalizado.strip()
+        prefijo = f"CUS-{secreto_plano[:4].upper()}"
     else:
-        plain_secret, prefix = generate_delegated_secret()
+        secreto_plano, prefijo = generar_secreto_delegado()
 
-    expires_at = (
-        datetime.now() + timedelta(days=payload.expires_in_days)
-        if payload.expires_in_days is not None
+    fecha_expiracion = (
+        datetime.now() + timedelta(days=carga.expira_en_dias)
+        if carga.expira_en_dias is not None
         else None
     )
-    allowed_ops = [op.strip() for op in payload.allowed_operations if op.strip()] or [
-        "revoke_biometrics"
-    ]
+    operaciones_limpias = [
+        operacion.strip() for operacion in carga.operaciones_permitidas if operacion.strip()
+    ] or ["revoke_biometrics"]
 
-    cred = DelegatedCredential(
-        organization_id=scoped_org_id,
-        label=payload.label.strip(),
-        secret_prefix=prefix,
-        secret_hash=hash_secret(plain_secret),
-        created_by_user_id=current_user.id,
-        assigned_to_user_id=payload.assigned_to_user_id,
-        assigned_to_name=assigned_name,
-        allowed_operations=",".join(allowed_ops),
-        status="active",
-        expires_at=expires_at,
+    credencial = CredencialDelegada(
+        id_organizacion=id_org_alcance,
+        etiqueta=carga.etiqueta.strip(),
+        prefijo_secreto=prefijo,
+        hash_secreto=generar_hash_secreto(secreto_plano),
+        id_usuario_creador=usuario_actual.id,
+        id_usuario_asignado=carga.id_usuario_asignado,
+        nombre_asignado=nombre_asignado,
+        operaciones_permitidas=",".join(operaciones_limpias),
+        estado="active",
+        expira_en=fecha_expiracion,
     )
-    db.add(cred)
-    db.flush()
+    sesion_bd.add(credencial)
+    sesion_bd.flush()
 
-    record_audit_log(
-        db,
-        organization_id=scoped_org_id,
-        action="create_delegated_credential",
-        target_type="delegated_credential",
-        target_id=cred.id,
-        target_summary=f"{cred.label} ({cred.secret_prefix})",
-        executed_by_user=current_user,
-        authorized_by_user=current_user,
-        delegated_credential=cred,
-        details=f"Asignada a: {assigned_name} | Permisos: {', '.join(allowed_ops)}",
-    )
-
-    db.commit()
-    db.refresh(cred)
-    users_map = {current_user.id: current_user}
-    return DelegatedCredentialCreateResponse(
-        credential=_serialize_credential(cred, users_map),
-        plain_secret=plain_secret,
+    registrar_auditoria(
+        sesion_bd,
+        id_organizacion=id_org_alcance,
+        accion="create_delegated_credential",
+        tipo_objetivo="delegated_credential",
+        id_objetivo=credencial.id,
+        resumen_objetivo=f"{credencial.etiqueta} ({credencial.prefijo_secreto})",
+        usuario_ejecutor=usuario_actual,
+        usuario_autorizador=usuario_actual,
+        credencial_delegada=credencial,
+        detalles=f"Asignada a: {nombre_asignado} | Permisos: {', '.join(operaciones_limpias)}",
     )
 
+    sesion_bd.commit()
+    sesion_bd.refresh(credencial)
+    mapa_usuarios = {usuario_actual.id: usuario_actual}
+    return RespuestaCrearCredencialDelegada(
+        credencial=_serializar_credencial(credencial, mapa_usuarios),
+        secreto_plano=secreto_plano,
+    )
 
-@router.post("/delegated-credentials/{cred_id}/revoke", response_model=DelegatedCredentialRead)
-def revoke_delegated_credential(
-    cred_id: int,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> DelegatedCredentialRead:
-    cred = db.get(DelegatedCredential, cred_id)
-    if cred is None:
+
+@enrutador.post(
+    "/delegated-credentials/{id_credencial}/revoke",
+    response_model=CredencialDelegadaLeer,
+)
+def revocar_credencial_delegada(
+    id_credencial: int,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> CredencialDelegadaLeer:
+    """Invalida de inmediato una credencial delegada y registra el hecho en auditoría."""
+    credencial = sesion_bd.get(CredencialDelegada, id_credencial)
+    if credencial is None:
         raise HTTPException(status_code=404, detail="Credencial delegada no encontrada.")
-    assert_org_access(current_user, cred.organization_id)
+    validar_acceso_organizacion(usuario_actual, credencial.id_organizacion)
 
-    if cred.status != "revoked":
-        cred.status = "revoked"
-        cred.revoked_at = datetime.now()
-        record_audit_log(
-            db,
-            organization_id=cred.organization_id,
-            action="revoke_delegated_credential",
-            target_type="delegated_credential",
-            target_id=cred.id,
-            target_summary=f"{cred.label} ({cred.secret_prefix})",
-            executed_by_user=current_user,
-            authorized_by_user=current_user,
-            delegated_credential=cred,
-            details=f"Revocada credencial asignada a {cred.assigned_to_name}",
+    if credencial.estado != "revoked":
+        credencial.estado = "revoked"
+        credencial.revocado_en = datetime.now()
+        registrar_auditoria(
+            sesion_bd,
+            id_organizacion=credencial.id_organizacion,
+            accion="revoke_delegated_credential",
+            tipo_objetivo="delegated_credential",
+            id_objetivo=credencial.id,
+            resumen_objetivo=f"{credencial.etiqueta} ({credencial.prefijo_secreto})",
+            usuario_ejecutor=usuario_actual,
+            usuario_autorizador=usuario_actual,
+            credencial_delegada=credencial,
+            detalles=f"Revocada credencial asignada a {credencial.nombre_asignado}",
         )
-        db.commit()
-        db.refresh(cred)
+        sesion_bd.commit()
+        sesion_bd.refresh(credencial)
 
-    users_map = {u.id: u for u in db.scalars(select(User)).all()}
-    return _serialize_credential(cred, users_map)
+    mapa_usuarios = {usuario.id: usuario for usuario in sesion_bd.scalars(select(Usuario)).all()}
+    return _serializar_credencial(credencial, mapa_usuarios)
 
 
-@router.get("/audit-logs", response_model=list[AuditLogRead])
-def list_audit_logs(
-    organization_id: int | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> list[AuditLogRead]:
-    stmt = select(AuditLog).order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(limit)
-    if current_user.role == "superadmin":
-        if organization_id is not None:
-            stmt = stmt.where(AuditLog.organization_id == organization_id)
+@enrutador.get("/audit-logs", response_model=list[RegistroAuditoriaLeer])
+def listar_registros_auditoria(
+    id_organizacion: int | None = Query(default=None),
+    limite: int = Query(default=100, ge=1, le=500),
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[RegistroAuditoriaLeer]:
+    """Devuelve las entradas más recientes de la bitácora de auditoría de la organización."""
+    consulta = (
+        select(RegistroAuditoria)
+        .order_by(RegistroAuditoria.creado_en.desc(), RegistroAuditoria.id.desc())
+        .limit(limite)
+    )
+    if usuario_actual.rol == "superadmin":
+        if id_organizacion is not None:
+            consulta = consulta.where(RegistroAuditoria.id_organizacion == id_organizacion)
     else:
-        scoped_org_id = resolve_org_scope(current_user, organization_id)
-        stmt = stmt.where(AuditLog.organization_id == scoped_org_id)
+        id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+        consulta = consulta.where(RegistroAuditoria.id_organizacion == id_org_alcance)
 
-    logs = list(db.scalars(stmt).all())
-    users_map = {u.id: u for u in db.scalars(select(User)).all()}
-    creds_map = {c.id: c for c in db.scalars(select(DelegatedCredential)).all()}
+    registros = list(sesion_bd.scalars(consulta).all())
+    mapa_usuarios = {usuario.id: usuario for usuario in sesion_bd.scalars(select(Usuario)).all()}
+    mapa_credenciales = {
+        credencial.id: credencial
+        for credencial in sesion_bd.scalars(select(CredencialDelegada)).all()
+    }
 
-    results: list[AuditLogRead] = []
-    for entry in logs:
-        exec_user = users_map.get(entry.executed_by_user_id) if entry.executed_by_user_id else None
-        auth_user = users_map.get(entry.authorized_by_user_id) if entry.authorized_by_user_id else None
-        cred = creds_map.get(entry.delegated_credential_id) if entry.delegated_credential_id else None
-        results.append(
-            AuditLogRead(
-                id=entry.id,
-                organization_id=entry.organization_id,
-                action=entry.action,
-                target_type=entry.target_type,
-                target_id=entry.target_id,
-                target_summary=entry.target_summary,
-                executed_by_user_id=entry.executed_by_user_id,
-                executed_by_name=exec_user.full_name if exec_user else None,
-                authorized_by_user_id=entry.authorized_by_user_id,
-                authorized_by_name=auth_user.full_name if auth_user else None,
-                delegated_credential_id=entry.delegated_credential_id,
-                delegated_credential_prefix=cred.secret_prefix if cred else None,
-                delegated_assigned_to_name=cred.assigned_to_name if cred else None,
-                details=entry.details,
-                created_at=entry.created_at,
+    resultados: list[RegistroAuditoriaLeer] = []
+    for entrada in registros:
+        usuario_ejecutor = (
+            mapa_usuarios.get(entrada.id_usuario_ejecutor)
+            if entrada.id_usuario_ejecutor
+            else None
+        )
+        usuario_autorizador = (
+            mapa_usuarios.get(entrada.id_usuario_autorizador)
+            if entrada.id_usuario_autorizador
+            else None
+        )
+        credencial = (
+            mapa_credenciales.get(entrada.id_credencial_delegada)
+            if entrada.id_credencial_delegada
+            else None
+        )
+        resultados.append(
+            RegistroAuditoriaLeer(
+                id=entrada.id,
+                id_organizacion=entrada.id_organizacion,
+                accion=entrada.accion,
+                tipo_objetivo=entrada.tipo_objetivo,
+                id_objetivo=entrada.id_objetivo,
+                resumen_objetivo=entrada.resumen_objetivo,
+                id_usuario_ejecutor=entrada.id_usuario_ejecutor,
+                nombre_ejecutor=usuario_ejecutor.nombre_completo if usuario_ejecutor else None,
+                id_usuario_autorizador=entrada.id_usuario_autorizador,
+                nombre_autorizador=(
+                    usuario_autorizador.nombre_completo if usuario_autorizador else None
+                ),
+                id_credencial_delegada=entrada.id_credencial_delegada,
+                prefijo_credencial_delegada=credencial.prefijo_secreto if credencial else None,
+                nombre_asignado_credencial=credencial.nombre_asignado if credencial else None,
+                detalles=entrada.detalles,
+                creado_en=entrada.creado_en,
             )
         )
-    return results
+    return resultados

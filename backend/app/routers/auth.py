@@ -1,224 +1,270 @@
+"""Enrutador HTTP de autenticación JWT y administración de usuarios del sistema.
+
+Provee inicio de sesión, consulta del perfil actual y CRUD de cuentas RBAC
+con validación dinámica de rol según la modalidad de la organización
+(`teacher` solo en escuelas, `supervisor` solo en empresas).
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.models import Organization, User
-from app.schemas import LoginRequest, LoginResponse, UserCreate, UserRead, UserUpdate
-from app.security import (
-    create_access_token,
-    get_current_user,
-    hash_secret,
-    require_roles,
-    resolve_org_scope,
-    verify_secret,
+from app.db import obtener_bd
+from app.models import Organizacion, Usuario
+from app.schemas import (
+    RespuestaInicioSesion,
+    SolicitudInicioSesion,
+    UsuarioActualizar,
+    UsuarioCrear,
+    UsuarioLeer,
 )
-from app.services.security_service import record_audit_log
+from app.security import (
+    crear_token_acceso,
+    generar_hash_secreto,
+    obtener_usuario_actual,
+    requerir_roles,
+    resolver_alcance_organizacion,
+    verificar_secreto,
+)
+from app.services.security_service import registrar_auditoria
 
-router = APIRouter(prefix="/api", tags=["auth"])
+enrutador = APIRouter(prefix="/api", tags=["autenticacion"])
 
 
-def _validate_role_for_org_mode(role: str, org: Organization | None) -> None:
-    """Impide asignar roles docentes en empresa o supervisores en escuela."""
-    if org is None:
+def _validar_rol_para_modo_organizacion(rol: str, organizacion: Organizacion | None) -> None:
+    """Impide asignar el rol docente en empresa o el rol supervisor en escuela."""
+    if organizacion is None:
         return
-    if org.mode == "enterprise" and role == "teacher":
+    if organizacion.modo == "enterprise" and rol == "teacher":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El rol 'Profesor' solo está disponible en organizaciones escolares. En modo empresa utiliza 'Supervisor'.",
         )
-    if org.mode == "education" and role == "supervisor":
+    if organizacion.modo == "education" and rol == "supervisor":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El rol 'Supervisor' solo está disponible en organizaciones empresariales. En modo escolar utiliza 'Profesor'.",
         )
 
 
-def _serialize_user(user: User, org_map: dict[int, Organization] | None = None) -> UserRead:
-    org = None
-    if user.organization_id is not None:
-        org = org_map.get(user.organization_id) if org_map is not None else user.organization
-    return UserRead(
-        id=user.id,
-        email=user.email,
-        full_name=user.full_name,
-        role=user.role,
-        organization_id=user.organization_id,
-        organization_name=org.name if org else None,
-        organization_mode=org.mode if org else None,
-        is_active=user.is_active,
-        created_by_user_id=user.created_by_user_id,
-        created_at=user.created_at,
+def _serializar_usuario(
+    usuario: Usuario,
+    mapa_organizaciones: dict[int, Organizacion] | None = None,
+) -> UsuarioLeer:
+    """Convierte un registro ORM `Usuario` a su esquema JSON público `UsuarioLeer`."""
+    organizacion = None
+    if usuario.id_organizacion is not None:
+        organizacion = (
+            mapa_organizaciones.get(usuario.id_organizacion)
+            if mapa_organizaciones is not None
+            else usuario.organizacion
+        )
+    return UsuarioLeer(
+        id=usuario.id,
+        correo=usuario.correo,
+        nombre_completo=usuario.nombre_completo,
+        rol=usuario.rol,
+        id_organizacion=usuario.id_organizacion,
+        nombre_organizacion=organizacion.nombre if organizacion else None,
+        modo_organizacion=organizacion.modo if organizacion else None,
+        esta_activo=usuario.esta_activo,
+        id_usuario_creador=usuario.id_usuario_creador,
+        creado_en=usuario.creado_en,
     )
 
 
-@router.post("/auth/login", response_model=LoginResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
-    email_norm = payload.email.strip().lower()
-    user = db.scalars(select(User).where(User.email == email_norm)).first()
-    if user is None or not user.is_active or not verify_secret(payload.password, user.password_hash):
+@enrutador.post("/auth/login", response_model=RespuestaInicioSesion)
+def iniciar_sesion(
+    carga: SolicitudInicioSesion,
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaInicioSesion:
+    """Autentica correo y contraseña con `scrypt` y emite un token JWT."""
+    correo_normalizado = carga.correo.strip().lower()
+    usuario = sesion_bd.scalars(
+        select(Usuario).where(Usuario.correo == correo_normalizado)
+    ).first()
+    if (
+        usuario is None
+        or not usuario.esta_activo
+        or not verificar_secreto(carga.contrasena, usuario.hash_contrasena)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Correo o contraseña incorrectos.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token = create_access_token(user)
-    return LoginResponse(access_token=token, user=_serialize_user(user))
+    token = crear_token_acceso(usuario)
+    return RespuestaInicioSesion(token_acceso=token, usuario=_serializar_usuario(usuario))
 
 
-@router.get("/auth/me", response_model=UserRead)
-def get_me(current_user: User = Depends(get_current_user)) -> UserRead:
-    return _serialize_user(current_user)
+@enrutador.get("/auth/me", response_model=UsuarioLeer)
+def obtener_perfil_actual(
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+) -> UsuarioLeer:
+    """Devuelve la información del usuario autenticado correspondiente al token Bearer."""
+    return _serializar_usuario(usuario_actual)
 
 
-@router.get("/users", response_model=list[UserRead])
-def list_users(
-    organization_id: int | None = Query(default=None),
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> list[UserRead]:
-    stmt = select(User).order_by(User.id.asc())
-    if current_user.role == "superadmin":
-        if organization_id is not None:
-            stmt = stmt.where(User.organization_id == organization_id)
+@enrutador.get("/users", response_model=list[UsuarioLeer])
+def listar_usuarios(
+    id_organizacion: int | None = Query(default=None),
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[UsuarioLeer]:
+    """Lista cuentas de usuario respetando el aislamiento multi-organización."""
+    consulta = select(Usuario).order_by(Usuario.id.asc())
+    if usuario_actual.rol == "superadmin":
+        if id_organizacion is not None:
+            consulta = consulta.where(Usuario.id_organizacion == id_organizacion)
     else:
-        scoped_org_id = resolve_org_scope(current_user, organization_id)
-        stmt = stmt.where(User.organization_id == scoped_org_id)
+        id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+        consulta = consulta.where(Usuario.id_organizacion == id_org_alcance)
 
-    users = list(db.scalars(stmt).all())
-    org_map = {org.id: org for org in db.scalars(select(Organization)).all()}
-    return [_serialize_user(u, org_map) for u in users]
+    usuarios = list(sesion_bd.scalars(consulta).all())
+    mapa_organizaciones = {
+        org.id: org for org in sesion_bd.scalars(select(Organizacion)).all()
+    }
+    return [_serializar_usuario(usuario, mapa_organizaciones) for usuario in usuarios]
 
 
-@router.post("/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def create_user(
-    payload: UserCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> UserRead:
-    if current_user.role == "org_admin":
-        if payload.role == "superadmin":
+@enrutador.post("/users", response_model=UsuarioLeer, status_code=status.HTTP_201_CREATED)
+def crear_usuario(
+    carga: UsuarioCrear,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> UsuarioLeer:
+    """Registra un nuevo usuario operativo, docente, supervisor o administrador."""
+    if usuario_actual.rol == "org_admin":
+        if carga.rol == "superadmin":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Un administrador de organización no puede crear usuarios Superadmin.",
             )
-        target_org_id: int | None = resolve_org_scope(current_user, payload.organization_id)
-        target_org = db.get(Organization, target_org_id)
+        id_org_objetivo: int | None = resolver_alcance_organizacion(
+            usuario_actual, carga.id_organizacion
+        )
+        organizacion_objetivo = sesion_bd.get(Organizacion, id_org_objetivo)
     else:
-        if payload.role == "superadmin":
-            target_org_id = None
-            target_org = None
+        if carga.rol == "superadmin":
+            id_org_objetivo = None
+            organizacion_objetivo = None
         else:
-            if payload.organization_id is None:
+            if carga.id_organizacion is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Debes indicar organization_id para este rol.",
+                    detail="Debes indicar id_organizacion para este rol.",
                 )
-            org = db.get(Organization, payload.organization_id)
-            if org is None:
+            organizacion = sesion_bd.get(Organizacion, carga.id_organizacion)
+            if organizacion is None:
                 raise HTTPException(status_code=404, detail="Organización no encontrada.")
-            target_org_id = org.id
-            target_org = org
+            id_org_objetivo = organizacion.id
+            organizacion_objetivo = organizacion
 
-    _validate_role_for_org_mode(payload.role, target_org)
+    _validar_rol_para_modo_organizacion(carga.rol, organizacion_objetivo)
 
-    email_norm = payload.email.strip().lower()
-    existing = db.scalars(select(User).where(User.email == email_norm)).first()
-    if existing is not None:
+    correo_normalizado = carga.correo.strip().lower()
+    existente = sesion_bd.scalars(
+        select(Usuario).where(Usuario.correo == correo_normalizado)
+    ).first()
+    if existente is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Ya existe una cuenta registrada con el correo '{email_norm}'.",
+            detail=f"Ya existe una cuenta registrada con el correo '{correo_normalizado}'.",
         )
 
-    user = User(
-        email=email_norm,
-        full_name=payload.full_name.strip(),
-        password_hash=hash_secret(payload.password),
-        role=payload.role,
-        organization_id=target_org_id,
-        created_by_user_id=current_user.id,
+    nuevo_usuario = Usuario(
+        correo=correo_normalizado,
+        nombre_completo=carga.nombre_completo.strip(),
+        hash_contrasena=generar_hash_secreto(carga.contrasena),
+        rol=carga.rol,
+        id_organizacion=id_org_objetivo,
+        id_usuario_creador=usuario_actual.id,
     )
-    db.add(user)
-    db.flush()
+    sesion_bd.add(nuevo_usuario)
+    sesion_bd.flush()
 
-    record_audit_log(
-        db,
-        organization_id=target_org_id,
-        action="create_user",
-        target_type="user",
-        target_id=user.id,
-        target_summary=f"{user.full_name} ({user.email})",
-        executed_by_user=current_user,
-        authorized_by_user=current_user,
-        details=f"Rol asignado: {user.role}",
+    registrar_auditoria(
+        sesion_bd,
+        id_organizacion=id_org_objetivo,
+        accion="create_user",
+        tipo_objetivo="user",
+        id_objetivo=nuevo_usuario.id,
+        resumen_objetivo=f"{nuevo_usuario.nombre_completo} ({nuevo_usuario.correo})",
+        usuario_ejecutor=usuario_actual,
+        usuario_autorizador=usuario_actual,
+        detalles=f"Rol asignado: {nuevo_usuario.rol}",
     )
 
-    db.commit()
-    db.refresh(user)
-    return _serialize_user(user)
+    sesion_bd.commit()
+    sesion_bd.refresh(nuevo_usuario)
+    return _serializar_usuario(nuevo_usuario)
 
 
-@router.patch("/users/{user_id}", response_model=UserRead)
-def update_user(
-    user_id: int,
-    payload: UserUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
-) -> UserRead:
-    target = db.get(User, user_id)
-    if target is None:
+@enrutador.patch("/users/{id_usuario}", response_model=UsuarioLeer)
+def actualizar_usuario(
+    id_usuario: int,
+    carga: UsuarioActualizar,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> UsuarioLeer:
+    """Actualiza nombre, rol, estado activo o contraseña de un usuario existente."""
+    usuario_objetivo = sesion_bd.get(Usuario, id_usuario)
+    if usuario_objetivo is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
 
-    if current_user.role == "org_admin":
-        if target.role == "superadmin" or target.organization_id != current_user.organization_id:
+    if usuario_actual.rol == "org_admin":
+        if (
+            usuario_objetivo.rol == "superadmin"
+            or usuario_objetivo.id_organizacion != usuario_actual.id_organizacion
+        ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Acceso denegado a usuarios fuera de tu organización.",
             )
-        if payload.role == "superadmin":
+        if carga.rol == "superadmin":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No puedes asignar el rol Superadmin.",
             )
 
-    if target.id == current_user.id and payload.is_active is False:
+    if usuario_objetivo.id == usuario_actual.id and carga.esta_activo is False:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No puedes desactivar tu propia cuenta activa.",
         )
 
-    changes: list[str] = []
-    if payload.full_name is not None:
-        target.full_name = payload.full_name.strip()
-        changes.append("nombre")
-    if payload.role is not None and payload.role != target.role:
-        if payload.role == "superadmin" and target.organization_id is not None:
-            target.organization_id = None
-        elif payload.role != "superadmin" and target.organization_id is not None:
-            target_org = db.get(Organization, target.organization_id)
-            _validate_role_for_org_mode(payload.role, target_org)
-        target.role = payload.role
-        changes.append(f"rol={payload.role}")
-    if payload.is_active is not None:
-        target.is_active = payload.is_active
-        changes.append(f"activo={payload.is_active}")
-    if payload.password is not None:
-        target.password_hash = hash_secret(payload.password)
-        changes.append("contraseña")
+    cambios_realizados: list[str] = []
+    if carga.nombre_completo is not None:
+        usuario_objetivo.nombre_completo = carga.nombre_completo.strip()
+        cambios_realizados.append("nombre")
+    if carga.rol is not None and carga.rol != usuario_objetivo.rol:
+        if carga.rol == "superadmin" and usuario_objetivo.id_organizacion is not None:
+            usuario_objetivo.id_organizacion = None
+        elif carga.rol != "superadmin" and usuario_objetivo.id_organizacion is not None:
+            organizacion_objetivo = sesion_bd.get(Organizacion, usuario_objetivo.id_organizacion)
+            _validar_rol_para_modo_organizacion(carga.rol, organizacion_objetivo)
+        usuario_objetivo.rol = carga.rol
+        cambios_realizados.append(f"rol={carga.rol}")
+    if carga.esta_activo is not None:
+        usuario_objetivo.esta_activo = carga.esta_activo
+        cambios_realizados.append(f"activo={carga.esta_activo}")
+    if carga.contrasena is not None:
+        usuario_objetivo.hash_contrasena = generar_hash_secreto(carga.contrasena)
+        cambios_realizados.append("contraseña")
 
-    record_audit_log(
-        db,
-        organization_id=target.organization_id,
-        action="update_user",
-        target_type="user",
-        target_id=target.id,
-        target_summary=f"{target.full_name} ({target.email})",
-        executed_by_user=current_user,
-        authorized_by_user=current_user,
-        details=", ".join(changes) if changes else "actualización",
+    registrar_auditoria(
+        sesion_bd,
+        id_organizacion=usuario_objetivo.id_organizacion,
+        accion="update_user",
+        tipo_objetivo="user",
+        id_objetivo=usuario_objetivo.id,
+        resumen_objetivo=f"{usuario_objetivo.nombre_completo} ({usuario_objetivo.correo})",
+        usuario_ejecutor=usuario_actual,
+        usuario_autorizador=usuario_actual,
+        detalles=", ".join(cambios_realizados) if cambios_realizados else "actualización",
     )
 
-    db.commit()
-    db.refresh(target)
-    return _serialize_user(target)
+    sesion_bd.commit()
+    sesion_bd.refresh(usuario_objetivo)
+    return _serializar_usuario(usuario_objetivo)

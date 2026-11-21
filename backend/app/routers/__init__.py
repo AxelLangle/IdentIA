@@ -1,41 +1,45 @@
-"""Routers HTTP y utilidades compartidas de serialización de IdentIA."""
+"""Enrutadores HTTP de FastAPI y convertidores compartidos de geometría facial."""
 
-from app.schemas import FaceBoxSchema, QualityReportSchema
-from app.vision.quality import FaceBox, QualityReport
+from app.schemas import EsquemaCuadroRostro, EsquemaReporteCalidad
+from app.vision.quality import CuadroRostro, ReporteCalidad
 
 
-def to_face_box_schema(box: FaceBox, img_w: int, img_h: int) -> FaceBoxSchema:
-    """Convierte una detección FaceBox a coordenadas absolutas y normalizadas."""
-    return FaceBoxSchema(
-        x=box.x,
-        y=box.y,
-        w=box.w,
-        h=box.h,
-        confidence=round(box.confidence, 4),
-        image_width=img_w,
-        image_height=img_h,
-        nx=round(max(0.0, box.x) / max(img_w, 1), 4),
-        ny=round(max(0.0, box.y) / max(img_h, 1), 4),
-        nw=round(max(0.0, box.w) / max(img_w, 1), 4),
-        nh=round(max(0.0, box.h) / max(img_h, 1), 4),
+def convertir_a_esquema_cuadro_rostro(
+    cuadro: CuadroRostro,
+    ancho_imagen: int,
+    alto_imagen: int,
+) -> EsquemaCuadroRostro:
+    """Convierte una detección `CuadroRostro` a coordenadas absolutas y normalizadas (0..1)."""
+    return EsquemaCuadroRostro(
+        coordenada_x=cuadro.coordenada_x,
+        coordenada_y=cuadro.coordenada_y,
+        ancho=cuadro.ancho,
+        alto=cuadro.alto,
+        confianza=round(cuadro.confianza, 4),
+        ancho_imagen=ancho_imagen,
+        alto_imagen=alto_imagen,
+        coordenada_x_normalizada=round(max(0.0, cuadro.coordenada_x) / max(ancho_imagen, 1), 4),
+        coordenada_y_normalizada=round(max(0.0, cuadro.coordenada_y) / max(alto_imagen, 1), 4),
+        ancho_normalizado=round(max(0.0, cuadro.ancho) / max(ancho_imagen, 1), 4),
+        alto_normalizado=round(max(0.0, cuadro.alto) / max(alto_imagen, 1), 4),
     )
 
 
-def to_quality_schema(quality: QualityReport) -> QualityReportSchema:
-    """Convierte un QualityReport interno a esquema JSON de respuesta."""
-    return QualityReportSchema(
-        ok=quality.ok,
-        reason=quality.reason,
-        blur_score=round(quality.blur_score, 2),
-        brightness=round(quality.brightness, 2),
-        face_width=quality.face_width,
-        face_height=quality.face_height,
-        pose_hint=quality.pose_hint,
-        shadow_asymmetry=round(quality.shadow_asymmetry, 2),
-        backlight_detected=quality.backlight_detected,
-        yaw_ratio=round(quality.yaw_ratio, 4),
-        pitch_ratio=round(quality.pitch_ratio, 4),
-        mouth_ratio=round(quality.mouth_ratio, 4),
-        pose_matches=quality.pose_matches,
-        pose_feedback=quality.pose_feedback,
+def convertir_a_esquema_calidad(calidad: ReporteCalidad) -> EsquemaReporteCalidad:
+    """Convierte un `ReporteCalidad` interno al esquema JSON de respuesta HTTP."""
+    return EsquemaReporteCalidad(
+        es_valida=calidad.es_valida,
+        motivo=calidad.motivo,
+        puntaje_nitidez=round(calidad.puntaje_nitidez, 2),
+        brillo=round(calidad.brillo, 2),
+        ancho_rostro=calidad.ancho_rostro,
+        alto_rostro=calidad.alto_rostro,
+        pose_estimada=calidad.pose_estimada,
+        asimetria_sombra=round(calidad.asimetria_sombra, 2),
+        contraluz_detectado=calidad.contraluz_detectado,
+        relacion_giro_horizontal=round(calidad.relacion_giro_horizontal, 4),
+        relacion_inclinacion_vertical=round(calidad.relacion_inclinacion_vertical, 4),
+        relacion_boca=round(calidad.relacion_boca, 4),
+        pose_coincide=calidad.pose_coincide,
+        retroalimentacion_pose=calidad.retroalimentacion_pose,
     )

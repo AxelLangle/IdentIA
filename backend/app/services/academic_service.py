@@ -1,3 +1,11 @@
+"""Servicio de lógica académica para el dominio educativo de IdentIA.
+
+Implementa el aislamiento estricto por docente, validación de horarios semanales,
+serialización por lotes libre de N+1, generación idempotente de sesiones de clase,
+construcción de la agenda diaria ("Tu clase ahora") y cálculo de estadísticas por
+asignatura, grupo y alumno.
+"""
+
 from collections import defaultdict
 from datetime import date, datetime
 from fastapi import HTTPException, status
@@ -5,792 +13,863 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
-    AttendanceEvent,
-    AttendanceSession,
-    Career,
-    ClassSchedule,
-    CourseAssignment,
-    Group,
-    Organization,
-    Person,
-    PersonGroup,
-    Subject,
-    User,
-    WorkShift,
+    AsignacionCurso,
+    Carrera,
+    EventoAsistencia,
+    Grupo,
+    HorarioClase,
+    Organizacion,
+    Persona,
+    PersonaGrupo,
+    SesionAsistencia,
+    TurnoLaboral,
+    Usuario,
 )
 from app.schemas import (
-    AcademicStatsResponse,
-    AcademicStatsSummary,
-    ClassScheduleRead,
-    CourseAssignmentRead,
-    GroupAttendanceStat,
-    SessionRead,
-    StudentGroupAttendanceStat,
-    SubjectAttendanceStat,
-    TeacherAgendaResponse,
-    TeacherAgendaSlot,
+    AsignacionCursoLeer,
+    BloqueAgendaDocente,
+    EstadisticaAsistenciaAlumnoGrupo,
+    EstadisticaAsistenciaGrupo,
+    EstadisticaAsistenciaMateria,
+    HorarioClaseLeer,
+    RespuestaAgendaDocente,
+    RespuestaEstadisticasAcademicas,
+    ResumenEstadisticasAcademicas,
+    SesionLeer,
 )
 
 
-def get_teacher_course_ids(db: Session, teacher_user_id: int) -> set[int]:
-    """Devuelve los IDs de cursos activos asignados al docente."""
-    rows = db.scalars(
-        select(CourseAssignment.id).where(
-            CourseAssignment.teacher_user_id == teacher_user_id,
-            CourseAssignment.is_active.is_(True),
+def obtener_ids_cursos_docente(sesion_bd: Session, id_usuario_docente: int) -> set[int]:
+    """Devuelve el conjunto de IDs de asignaciones activas que imparte un docente."""
+    filas = sesion_bd.scalars(
+        select(AsignacionCurso.id).where(
+            AsignacionCurso.id_usuario_docente == id_usuario_docente,
+            AsignacionCurso.esta_activo.is_(True),
         )
     ).all()
-    return set(rows)
+    return set(filas)
 
 
-def get_teacher_group_ids(db: Session, teacher_user_id: int) -> set[int]:
-    """Devuelve los IDs de grupos donde el docente imparte al menos una materia activa."""
-    rows = db.scalars(
-        select(CourseAssignment.group_id)
+def obtener_ids_grupos_docente(sesion_bd: Session, id_usuario_docente: int) -> set[int]:
+    """Devuelve los IDs de grupos donde el docente imparte al menos una asignatura activa."""
+    filas = sesion_bd.scalars(
+        select(AsignacionCurso.id_grupo)
         .where(
-            CourseAssignment.teacher_user_id == teacher_user_id,
-            CourseAssignment.is_active.is_(True),
+            AsignacionCurso.id_usuario_docente == id_usuario_docente,
+            AsignacionCurso.esta_activo.is_(True),
         )
         .distinct()
     ).all()
-    return set(rows)
+    return set(filas)
 
 
-def assert_session_teacher_access(
-    db: Session,
-    current_user: User,
-    session: AttendanceSession,
+def validar_acceso_docente_sesion(
+    sesion_bd: Session,
+    usuario_actual: Usuario,
+    sesion: SesionAsistencia,
 ) -> None:
-    """Impide que un docente opere sesiones que no pertenecen a sus asignaturas."""
-    if current_user.role != "teacher":
+    """Impide que un docente consulte o modifique sesiones de asignaturas ajenas."""
+    if usuario_actual.rol != "teacher":
         return
-    teacher_courses = get_teacher_course_ids(db, current_user.id)
-    if session.course_assignment_id is None or session.course_assignment_id not in teacher_courses:
+    cursos_docente = obtener_ids_cursos_docente(sesion_bd, usuario_actual.id)
+    if sesion.id_asignacion_curso is None or sesion.id_asignacion_curso not in cursos_docente:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Solo puedes operar sesiones de tus materias asignadas.",
         )
 
 
-def validate_schedule_times(start_time: str, end_time: str) -> None:
-    """Valida formato HH:MM y que la hora de inicio sea anterior al fin."""
+def validar_horarios_clase(hora_inicio: str, hora_fin: str) -> None:
+    """Valida formato HH:MM y verifica que la hora de inicio sea anterior a la de fin."""
     try:
-        sh, sm = (int(p) for p in start_time.split(":"))
-        eh, em = (int(p) for p in end_time.split(":"))
-    except ValueError as exc:
+        hora_ini, min_ini = (int(parte) for parte in hora_inicio.split(":"))
+        hora_ter, min_ter = (int(parte) for parte in hora_fin.split(":"))
+    except ValueError as excepcion:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Formato de horario inválido. Usa HH:MM.",
-        ) from exc
+        ) from excepcion
 
-    if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+    if not (0 <= hora_ini <= 23 and 0 <= min_ini <= 59 and 0 <= hora_ter <= 23 and 0 <= min_ter <= 59):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Las horas deben estar entre 00:00 y 23:59.",
         )
-    if (sh, sm) >= (eh, em):
+    if (hora_ini, min_ini) >= (hora_ter, min_ter):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="La hora de inicio de clase debe ser anterior a la hora de fin.",
         )
 
 
-def _group_student_counts(db: Session, organization_id: int) -> dict[int, int]:
-    rows = db.execute(
-        select(PersonGroup.group_id, func.count(PersonGroup.person_id))
-        .join(Person, Person.id == PersonGroup.person_id)
+def _contar_alumnos_por_grupo(sesion_bd: Session, id_organizacion: int) -> dict[int, int]:
+    """Cuenta alumnos activos (excluyendo docentes) inscritos en cada grupo."""
+    filas = sesion_bd.execute(
+        select(PersonaGrupo.id_grupo, func.count(PersonaGrupo.id_persona))
+        .join(Persona, Persona.id == PersonaGrupo.id_persona)
         .where(
-            Person.organization_id == organization_id,
-            Person.is_active.is_(True),
-            Person.role != "teacher",
+            Persona.id_organizacion == id_organizacion,
+            Persona.esta_activo.is_(True),
+            Persona.rol != "teacher",
         )
-        .group_by(PersonGroup.group_id)
+        .group_by(PersonaGrupo.id_grupo)
     ).all()
-    return {gid: int(cnt) for gid, cnt in rows}
+    return {id_grupo: int(conteo) for id_grupo, conteo in filas}
 
 
-def serialize_courses_batch(
-    db: Session,
-    courses: list[CourseAssignment],
-    organization_id: int,
-) -> list[CourseAssignmentRead]:
+def serializar_cursos_lote(
+    sesion_bd: Session,
+    cursos: list[AsignacionCurso],
+    id_organizacion: int,
+) -> list[AsignacionCursoLeer]:
     """Serializa una lista de asignaciones de curso evitando consultas N+1."""
-    if not courses:
+    if not cursos:
         return []
 
-    student_counts = _group_student_counts(db, organization_id)
-    org = db.get(Organization, organization_id)
-    org_period_type = org.academic_period_type if org else "semestral"
-    career_map = {
-        c.id: c
-        for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
+    conteo_estudiantes = _contar_alumnos_por_grupo(sesion_bd, id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, id_organizacion)
+    tipo_periodo_org = organizacion.tipo_periodo_academico if organizacion else "semestral"
+    mapa_carreras = {
+        carrera.id: carrera
+        for carrera in sesion_bd.scalars(
+            select(Carrera).where(Carrera.id_organizacion == id_organizacion)
+        ).all()
     }
 
-    result: list[CourseAssignmentRead] = []
-    for c in courses:
-        sorted_schedules = sorted(
-            c.schedules,
-            key=lambda s: (s.day_of_week, s.start_time, s.id),
+    resultado: list[AsignacionCursoLeer] = []
+    for curso in cursos:
+        horarios_ordenados = sorted(
+            curso.horarios,
+            key=lambda horario: (horario.dia_semana, horario.hora_inicio, horario.id),
         )
-        career_id = c.group.career_id if c.group else None
-        career = career_map.get(career_id) if career_id else None
-        effective_period = (
-            (c.group.period_type if c.group else None)
-            or (career.period_type if career and career.period_type else None)
-            or org_period_type
+        id_carrera = curso.grupo.id_carrera if curso.grupo else None
+        carrera = mapa_carreras.get(id_carrera) if id_carrera else None
+        # Herencia de tipo de periodo: grupo -> carrera -> organización
+        tipo_periodo_efectivo = (
+            (curso.grupo.tipo_periodo if curso.grupo else None)
+            or (carrera.tipo_periodo if carrera and carrera.tipo_periodo else None)
+            or tipo_periodo_org
         )
-        result.append(
-            CourseAssignmentRead(
-                id=c.id,
-                organization_id=c.organization_id,
-                group_id=c.group_id,
-                group_name=c.group.name if c.group else "",
-                group_code=c.group.code if c.group else "",
-                group_default_classroom=c.group.default_classroom if c.group else None,
-                semester=c.group.semester if c.group else None,
-                period_type=effective_period,
-                career_id=career_id,
-                career_name=career.name if career else None,
-                subject_id=c.subject_id,
-                subject_name=c.subject.name if c.subject else "",
-                subject_code=c.subject.code if c.subject else "",
-                teacher_user_id=c.teacher_user_id,
-                teacher_name=c.teacher.full_name if c.teacher else None,
-                teacher_email=c.teacher.email if c.teacher else None,
-                term=c.term,
-                is_active=c.is_active,
-                students_count=student_counts.get(c.group_id, 0),
-                schedules=[
-                    ClassScheduleRead(
-                        id=s.id,
-                        course_assignment_id=s.course_assignment_id,
-                        day_of_week=s.day_of_week,
-                        start_time=s.start_time,
-                        end_time=s.end_time,
-                        classroom=s.classroom,
-                        created_at=s.created_at,
+        resultado.append(
+            AsignacionCursoLeer(
+                id=curso.id,
+                id_organizacion=curso.id_organizacion,
+                id_grupo=curso.id_grupo,
+                nombre_grupo=curso.grupo.nombre if curso.grupo else "",
+                codigo_grupo=curso.grupo.codigo if curso.grupo else "",
+                aula_defecto_grupo=curso.grupo.aula_defecto if curso.grupo else None,
+                semestre=curso.grupo.semestre if curso.grupo else None,
+                tipo_periodo=tipo_periodo_efectivo,
+                id_carrera=id_carrera,
+                nombre_carrera=carrera.nombre if carrera else None,
+                id_materia=curso.id_materia,
+                nombre_materia=curso.materia.nombre if curso.materia else "",
+                codigo_materia=curso.materia.codigo if curso.materia else "",
+                id_usuario_docente=curso.id_usuario_docente,
+                nombre_docente=curso.docente.nombre_completo if curso.docente else None,
+                correo_docente=curso.docente.correo if curso.docente else None,
+                periodo_lectivo=curso.periodo_lectivo,
+                esta_activo=curso.esta_activo,
+                cantidad_estudiantes=conteo_estudiantes.get(curso.id_grupo, 0),
+                horarios=[
+                    HorarioClaseLeer(
+                        id=horario.id,
+                        id_asignacion_curso=horario.id_asignacion_curso,
+                        dia_semana=horario.dia_semana,
+                        hora_inicio=horario.hora_inicio,
+                        hora_fin=horario.hora_fin,
+                        aula=horario.aula,
+                        creado_en=horario.creado_en,
                     )
-                    for s in sorted_schedules
+                    for horario in horarios_ordenados
                 ],
-                created_at=c.created_at,
+                creado_en=curso.creado_en,
             )
         )
-    return result
+    return resultado
 
 
-def serialize_sessions_batch(
-    db: Session,
-    sessions: list[AttendanceSession],
-    organization_id: int,
-) -> list[SessionRead]:
-    """Serializa sesiones incluyendo metadatos académicos (materia, carrera, profesor)."""
-    if not sessions:
+def serializar_sesiones_lote(
+    sesion_bd: Session,
+    sesiones: list[SesionAsistencia],
+    id_organizacion: int,
+) -> list[SesionLeer]:
+    """Serializa sesiones con metadatos de grupo, asignatura, carrera, profesor y turno."""
+    if not sesiones:
         return []
 
-    session_ids = [s.id for s in sessions]
-    event_counts = {
-        sid: int(cnt)
-        for sid, cnt in db.execute(
-            select(AttendanceEvent.session_id, func.count(AttendanceEvent.id))
-            .where(AttendanceEvent.session_id.in_(session_ids))
-            .group_by(AttendanceEvent.session_id)
+    ids_sesiones = [sesion.id for sesion in sesiones]
+    conteo_eventos = {
+        id_sesion: int(conteo)
+        for id_sesion, conteo in sesion_bd.execute(
+            select(EventoAsistencia.id_sesion, func.count(EventoAsistencia.id))
+            .where(EventoAsistencia.id_sesion.in_(ids_sesiones))
+            .group_by(EventoAsistencia.id_sesion)
         ).all()
     }
-    group_map = {
-        g.id: g
-        for g in db.scalars(select(Group).where(Group.organization_id == organization_id)).all()
+    mapa_grupos = {
+        grupo.id: grupo
+        for grupo in sesion_bd.scalars(
+            select(Grupo).where(Grupo.id_organizacion == id_organizacion)
+        ).all()
     }
-    career_map = {
-        c.id: c.name
-        for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
+    mapa_carreras = {
+        carrera.id: carrera.nombre
+        for carrera in sesion_bd.scalars(
+            select(Carrera).where(Carrera.id_organizacion == id_organizacion)
+        ).all()
     }
-    shift_map = {
-        sh.id: sh
-        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
+    mapa_turnos = {
+        turno.id: turno
+        for turno in sesion_bd.scalars(
+            select(TurnoLaboral).where(TurnoLaboral.id_organizacion == id_organizacion)
+        ).all()
     }
 
-    course_ids = [s.course_assignment_id for s in sessions if s.course_assignment_id is not None]
-    course_map: dict[int, CourseAssignment] = {}
-    if course_ids:
-        loaded_courses = db.scalars(
-            select(CourseAssignment)
+    ids_cursos = [
+        sesion.id_asignacion_curso
+        for sesion in sesiones
+        if sesion.id_asignacion_curso is not None
+    ]
+    mapa_cursos: dict[int, AsignacionCurso] = {}
+    if ids_cursos:
+        cursos_cargados = sesion_bd.scalars(
+            select(AsignacionCurso)
             .options(
-                selectinload(CourseAssignment.subject),
-                selectinload(CourseAssignment.group),
-                selectinload(CourseAssignment.teacher),
+                selectinload(AsignacionCurso.materia),
+                selectinload(AsignacionCurso.grupo),
+                selectinload(AsignacionCurso.docente),
             )
-            .where(CourseAssignment.id.in_(course_ids))
+            .where(AsignacionCurso.id.in_(ids_cursos))
         ).all()
-        course_map = {c.id: c for c in loaded_courses}
+        mapa_cursos = {curso.id: curso for curso in cursos_cargados}
 
-    result: list[SessionRead] = []
-    for s in sessions:
-        group = group_map.get(s.group_id) if s.group_id else None
-        course = course_map.get(s.course_assignment_id) if s.course_assignment_id else None
-        shift = shift_map.get(s.work_shift_id) if s.work_shift_id else None
-        career_id = group.career_id if group else (course.group.career_id if course and course.group else None)
-        if career_id is None and course and course.subject:
-            career_id = course.subject.career_id
+    resultado: list[SesionLeer] = []
+    for sesion in sesiones:
+        grupo = mapa_grupos.get(sesion.id_grupo) if sesion.id_grupo else None
+        curso = mapa_cursos.get(sesion.id_asignacion_curso) if sesion.id_asignacion_curso else None
+        turno = mapa_turnos.get(sesion.id_turno_laboral) if sesion.id_turno_laboral else None
 
-        result.append(
-            SessionRead(
-                id=s.id,
-                organization_id=s.organization_id,
-                group_id=s.group_id,
-                group_name=group.name if group else (course.group.name if course and course.group else None),
-                course_assignment_id=s.course_assignment_id,
-                schedule_id=s.schedule_id,
-                work_shift_id=s.work_shift_id,
-                work_shift_name=shift.name if shift else None,
-                work_shift_code=shift.code if shift else None,
-                work_shift_crosses_midnight=shift.crosses_midnight if shift else False,
-                subject_name=course.subject.name if course and course.subject else None,
-                subject_code=course.subject.code if course and course.subject else None,
-                career_name=career_map.get(career_id) if career_id else None,
-                teacher_name=course.teacher.full_name if course and course.teacher else None,
-                title=s.title,
-                session_date=s.session_date,
-                session_type=s.session_type,
-                expected_start_time=s.expected_start_time,
-                status=s.status,
-                created_at=s.created_at,
-                closed_at=s.closed_at,
-                events_count=event_counts.get(s.id, 0),
+        id_carrera = (
+            grupo.id_carrera
+            if grupo
+            else (curso.grupo.id_carrera if curso and curso.grupo else None)
+        )
+        if id_carrera is None and curso and curso.materia:
+            id_carrera = curso.materia.id_carrera
+
+        resultado.append(
+            SesionLeer(
+                id=sesion.id,
+                id_organizacion=sesion.id_organizacion,
+                id_grupo=sesion.id_grupo,
+                nombre_grupo=(
+                    grupo.nombre
+                    if grupo
+                    else (curso.grupo.nombre if curso and curso.grupo else None)
+                ),
+                id_asignacion_curso=sesion.id_asignacion_curso,
+                id_horario=sesion.id_horario,
+                id_turno_laboral=sesion.id_turno_laboral,
+                nombre_turno_laboral=turno.nombre if turno else None,
+                codigo_turno_laboral=turno.codigo if turno else None,
+                turno_cruza_medianoche=turno.cruza_medianoche if turno else False,
+                nombre_materia=curso.materia.nombre if curso and curso.materia else None,
+                codigo_materia=curso.materia.codigo if curso and curso.materia else None,
+                nombre_carrera=mapa_carreras.get(id_carrera) if id_carrera else None,
+                nombre_docente=curso.docente.nombre_completo if curso and curso.docente else None,
+                titulo=sesion.titulo,
+                fecha_sesion=sesion.fecha_sesion,
+                tipo_sesion=sesion.tipo_sesion,
+                hora_inicio_esperada=sesion.hora_inicio_esperada,
+                estado=sesion.estado,
+                creado_en=sesion.creado_en,
+                cerrado_en=sesion.cerrado_en,
+                cantidad_eventos=conteo_eventos.get(sesion.id, 0),
             )
         )
-    return result
+    return resultado
 
 
-def generate_sessions_for_date(
-    db: Session,
+def generar_sesiones_para_fecha(
+    sesion_bd: Session,
     *,
-    organization_id: int,
-    target_date: date,
-    course_assignment_id: int | None = None,
-    teacher_user_id: int | None = None,
-) -> tuple[int, int, list[AttendanceSession]]:
+    id_organizacion: int,
+    fecha_objetivo: date,
+    id_asignacion_curso: int | None = None,
+    id_usuario_docente: int | None = None,
+) -> tuple[int, int, list[SesionAsistencia]]:
     """Genera de forma idempotente sesiones académicas para los horarios del día indicado."""
-    weekday = target_date.weekday()
-    stmt = (
-        select(CourseAssignment)
+    dia_semana = fecha_objetivo.weekday()
+    consulta = (
+        select(AsignacionCurso)
         .options(
-            selectinload(CourseAssignment.subject),
-            selectinload(CourseAssignment.group),
-            selectinload(CourseAssignment.schedules),
+            selectinload(AsignacionCurso.materia),
+            selectinload(AsignacionCurso.grupo),
+            selectinload(AsignacionCurso.horarios),
         )
         .where(
-            CourseAssignment.organization_id == organization_id,
-            CourseAssignment.is_active.is_(True),
+            AsignacionCurso.id_organizacion == id_organizacion,
+            AsignacionCurso.esta_activo.is_(True),
         )
     )
-    if course_assignment_id is not None:
-        stmt = stmt.where(CourseAssignment.id == course_assignment_id)
-    if teacher_user_id is not None:
-        stmt = stmt.where(CourseAssignment.teacher_user_id == teacher_user_id)
+    if id_asignacion_curso is not None:
+        consulta = consulta.where(AsignacionCurso.id == id_asignacion_curso)
+    if id_usuario_docente is not None:
+        consulta = consulta.where(AsignacionCurso.id_usuario_docente == id_usuario_docente)
 
-    courses = list(db.scalars(stmt).all())
-    if not courses:
+    cursos = list(sesion_bd.scalars(consulta).all())
+    if not cursos:
         return 0, 0, []
 
-    course_ids = [c.id for c in courses]
-    existing_sessions = list(
-        db.scalars(
-            select(AttendanceSession).where(
-                AttendanceSession.organization_id == organization_id,
-                AttendanceSession.session_date == target_date,
-                AttendanceSession.course_assignment_id.in_(course_ids),
+    ids_cursos = [curso.id for curso in cursos]
+    sesiones_existentes = list(
+        sesion_bd.scalars(
+            select(SesionAsistencia).where(
+                SesionAsistencia.id_organizacion == id_organizacion,
+                SesionAsistencia.fecha_sesion == fecha_objetivo,
+                SesionAsistencia.id_asignacion_curso.in_(ids_cursos),
             )
         ).all()
     )
-    existing_by_slot: dict[tuple[int, int], AttendanceSession] = {
-        (s.course_assignment_id, s.schedule_id): s
-        for s in existing_sessions
-        if s.course_assignment_id is not None and s.schedule_id is not None
+    existentes_por_bloque: dict[tuple[int, int], SesionAsistencia] = {
+        (sesion.id_asignacion_curso, sesion.id_horario): sesion
+        for sesion in sesiones_existentes
+        if sesion.id_asignacion_curso is not None and sesion.id_horario is not None
     }
 
-    created_count = 0
-    existing_count = 0
-    resulting_sessions: list[AttendanceSession] = []
+    cantidad_creadas = 0
+    cantidad_existentes = 0
+    sesiones_resultantes: list[SesionAsistencia] = []
 
-    for course in courses:
-        day_slots = sorted(
-            [sl for sl in course.schedules if sl.day_of_week == weekday],
-            key=lambda sl: (sl.start_time, sl.id),
+    for curso in cursos:
+        bloques_del_dia = sorted(
+            [horario for horario in curso.horarios if horario.dia_semana == dia_semana],
+            key=lambda horario: (horario.hora_inicio, horario.id),
         )
-        for slot in day_slots:
-            key = (course.id, slot.id)
-            if key in existing_by_slot:
-                existing_count += 1
-                resulting_sessions.append(existing_by_slot[key])
+        for bloque in bloques_del_dia:
+            clave = (curso.id, bloque.id)
+            if clave in existentes_por_bloque:
+                cantidad_existentes += 1
+                sesiones_resultantes.append(existentes_por_bloque[clave])
                 continue
 
-            subject_label = course.subject.name if course.subject else "Clase"
-            group_label = course.group.name if course.group else "Grupo"
-            session = AttendanceSession(
-                organization_id=organization_id,
-                group_id=course.group_id,
-                course_assignment_id=course.id,
-                schedule_id=slot.id,
-                title=f"{subject_label} — {group_label} ({slot.start_time}-{slot.end_time})",
-                session_date=target_date,
-                session_type="class",
-                expected_start_time=slot.start_time,
-                status="open",
+            etiqueta_materia = curso.materia.nombre if curso.materia else "Clase"
+            etiqueta_grupo = curso.grupo.nombre if curso.grupo else "Grupo"
+            nueva_sesion = SesionAsistencia(
+                id_organizacion=id_organizacion,
+                id_grupo=curso.id_grupo,
+                id_asignacion_curso=curso.id,
+                id_horario=bloque.id,
+                titulo=f"{etiqueta_materia} — {etiqueta_grupo} ({bloque.hora_inicio}-{bloque.hora_fin})",
+                fecha_sesion=fecha_objetivo,
+                tipo_sesion="class",
+                hora_inicio_esperada=bloque.hora_inicio,
+                estado="open",
             )
-            db.add(session)
-            created_count += 1
-            resulting_sessions.append(session)
+            sesion_bd.add(nueva_sesion)
+            cantidad_creadas += 1
+            sesiones_resultantes.append(nueva_sesion)
 
-    if created_count > 0:
-        db.commit()
-        for sess in resulting_sessions:
-            db.refresh(sess)
+    if cantidad_creadas > 0:
+        sesion_bd.commit()
+        for sesion in sesiones_resultantes:
+            sesion_bd.refresh(sesion)
 
-    return created_count, existing_count, resulting_sessions
+    return cantidad_creadas, cantidad_existentes, sesiones_resultantes
 
 
-def start_or_get_course_session(
-    db: Session,
+def iniciar_o_obtener_sesion_curso(
+    sesion_bd: Session,
     *,
-    assignment: CourseAssignment,
-    target_date: date,
-    schedule_id: int | None = None,
-) -> AttendanceSession:
-    """Obtiene la sesión abierta del curso para hoy o crea una nueva lista para el kiosco."""
-    schedule: ClassSchedule | None = None
-    if schedule_id is not None:
-        schedule = db.get(ClassSchedule, schedule_id)
-        if schedule is None or schedule.course_assignment_id != assignment.id:
+    asignacion: AsignacionCurso,
+    fecha_objetivo: date,
+    id_horario: int | None = None,
+) -> SesionAsistencia:
+    """Obtiene la sesión abierta del curso para hoy o crea una lista para el kiosco."""
+    horario_seleccionado: HorarioClase | None = None
+    if id_horario is not None:
+        horario_seleccionado = sesion_bd.get(HorarioClase, id_horario)
+        if (
+            horario_seleccionado is None
+            or horario_seleccionado.id_asignacion_curso != asignacion.id
+        ):
             raise HTTPException(
                 status_code=404,
                 detail="Horario no encontrado para la asignatura seleccionada.",
             )
-        existing_slot = db.scalars(
-            select(AttendanceSession)
+        sesion_bloque_abierta = sesion_bd.scalars(
+            select(SesionAsistencia)
             .where(
-                AttendanceSession.course_assignment_id == assignment.id,
-                AttendanceSession.schedule_id == schedule.id,
-                AttendanceSession.session_date == target_date,
-                AttendanceSession.status == "open",
+                SesionAsistencia.id_asignacion_curso == asignacion.id,
+                SesionAsistencia.id_horario == horario_seleccionado.id,
+                SesionAsistencia.fecha_sesion == fecha_objetivo,
+                SesionAsistencia.estado == "open",
             )
-            .order_by(AttendanceSession.id.desc())
+            .order_by(SesionAsistencia.id.desc())
         ).first()
-        if existing_slot is not None:
-            return existing_slot
+        if sesion_bloque_abierta is not None:
+            return sesion_bloque_abierta
     else:
-        existing_open = db.scalars(
-            select(AttendanceSession)
+        sesion_abierta = sesion_bd.scalars(
+            select(SesionAsistencia)
             .where(
-                AttendanceSession.course_assignment_id == assignment.id,
-                AttendanceSession.session_date == target_date,
-                AttendanceSession.status == "open",
+                SesionAsistencia.id_asignacion_curso == asignacion.id,
+                SesionAsistencia.fecha_sesion == fecha_objetivo,
+                SesionAsistencia.estado == "open",
             )
-            .order_by(AttendanceSession.id.desc())
+            .order_by(SesionAsistencia.id.desc())
         ).first()
-        if existing_open is not None:
-            return existing_open
+        if sesion_abierta is not None:
+            return sesion_abierta
 
-        weekday = target_date.weekday()
-        day_slots = sorted(
-            [sl for sl in assignment.schedules if sl.day_of_week == weekday],
-            key=lambda sl: sl.start_time,
+        dia_semana = fecha_objetivo.weekday()
+        bloques_del_dia = sorted(
+            [horario for horario in asignacion.horarios if horario.dia_semana == dia_semana],
+            key=lambda horario: horario.hora_inicio,
         )
-        if day_slots:
-            schedule = day_slots[0]
+        if bloques_del_dia:
+            horario_seleccionado = bloques_del_dia[0]
 
-    subject_label = assignment.subject.name if assignment.subject else "Materia"
-    group_label = assignment.group.name if assignment.group else "Grupo"
-    if schedule is not None:
-        title = f"{subject_label} — {group_label} ({schedule.start_time}-{schedule.end_time})"
-        expected_start = schedule.start_time
-        resolved_schedule_id = schedule.id
+    etiqueta_materia = asignacion.materia.nombre if asignacion.materia else "Materia"
+    etiqueta_grupo = asignacion.grupo.nombre if asignacion.grupo else "Grupo"
+    if horario_seleccionado is not None:
+        titulo = (
+            f"{etiqueta_materia} — {etiqueta_grupo} "
+            f"({horario_seleccionado.hora_inicio}-{horario_seleccionado.hora_fin})"
+        )
+        inicio_esperado = horario_seleccionado.hora_inicio
+        id_horario_resuelto = horario_seleccionado.id
     else:
-        title = f"{subject_label} — {group_label} ({target_date.isoformat()})"
-        expected_start = assignment.group.schedule_start if assignment.group else None
-        resolved_schedule_id = None
+        titulo = f"{etiqueta_materia} — {etiqueta_grupo} ({fecha_objetivo.isoformat()})"
+        inicio_esperado = asignacion.grupo.hora_inicio_horario if asignacion.grupo else None
+        id_horario_resuelto = None
 
-    session = AttendanceSession(
-        organization_id=assignment.organization_id,
-        group_id=assignment.group_id,
-        course_assignment_id=assignment.id,
-        schedule_id=resolved_schedule_id,
-        title=title,
-        session_date=target_date,
-        session_type="class",
-        expected_start_time=expected_start,
-        status="open",
+    nueva_sesion = SesionAsistencia(
+        id_organizacion=asignacion.id_organizacion,
+        id_grupo=asignacion.id_grupo,
+        id_asignacion_curso=asignacion.id,
+        id_horario=id_horario_resuelto,
+        titulo=titulo,
+        fecha_sesion=fecha_objetivo,
+        tipo_sesion="class",
+        hora_inicio_esperada=inicio_esperado,
+        estado="open",
     )
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    return session
+    sesion_bd.add(nueva_sesion)
+    sesion_bd.commit()
+    sesion_bd.refresh(nueva_sesion)
+    return nueva_sesion
 
 
-def build_teacher_agenda(
-    db: Session,
+def construir_agenda_docente(
+    sesion_bd: Session,
     *,
-    organization_id: int,
-    teacher_user_id: int,
-    target_date: date,
-    current_time_str: str,
-) -> TeacherAgendaResponse:
-    """Construye la agenda diaria y lista de cursos del profesor en su jornada actual."""
-    courses = list(
-        db.scalars(
-            select(CourseAssignment)
+    id_organizacion: int,
+    id_usuario_docente: int,
+    fecha_objetivo: date,
+    hora_actual_texto: str,
+) -> RespuestaAgendaDocente:
+    """Construye la agenda diaria y lista de asignaturas del profesor para la jornada actual."""
+    cursos = list(
+        sesion_bd.scalars(
+            select(AsignacionCurso)
             .options(
-                selectinload(CourseAssignment.subject),
-                selectinload(CourseAssignment.group),
-                selectinload(CourseAssignment.teacher),
-                selectinload(CourseAssignment.schedules),
+                selectinload(AsignacionCurso.materia),
+                selectinload(AsignacionCurso.grupo),
+                selectinload(AsignacionCurso.docente),
+                selectinload(AsignacionCurso.horarios),
             )
             .where(
-                CourseAssignment.organization_id == organization_id,
-                CourseAssignment.teacher_user_id == teacher_user_id,
-                CourseAssignment.is_active.is_(True),
+                AsignacionCurso.id_organizacion == id_organizacion,
+                AsignacionCurso.id_usuario_docente == id_usuario_docente,
+                AsignacionCurso.esta_activo.is_(True),
             )
-            .order_by(CourseAssignment.id.asc())
+            .order_by(AsignacionCurso.id.asc())
         ).all()
     )
-    serialized_courses = serialize_courses_batch(db, courses, organization_id)
-    course_read_map = {c.id: c for c in serialized_courses}
+    cursos_serializados = serializar_cursos_lote(sesion_bd, cursos, id_organizacion)
+    mapa_cursos_leidos = {curso.id: curso for curso in cursos_serializados}
 
-    course_ids = [c.id for c in courses]
-    day_sessions: list[AttendanceSession] = []
-    if course_ids:
-        day_sessions = list(
-            db.scalars(
-                select(AttendanceSession)
+    ids_cursos = [curso.id for curso in cursos]
+    sesiones_dia: list[SesionAsistencia] = []
+    if ids_cursos:
+        sesiones_dia = list(
+            sesion_bd.scalars(
+                select(SesionAsistencia)
                 .where(
-                    AttendanceSession.organization_id == organization_id,
-                    AttendanceSession.session_date == target_date,
-                    AttendanceSession.course_assignment_id.in_(course_ids),
+                    SesionAsistencia.id_organizacion == id_organizacion,
+                    SesionAsistencia.fecha_sesion == fecha_objetivo,
+                    SesionAsistencia.id_asignacion_curso.in_(ids_cursos),
                 )
-                .order_by(AttendanceSession.id.desc())
+                .order_by(SesionAsistencia.id.desc())
             ).all()
         )
-    serialized_sessions = serialize_sessions_batch(db, day_sessions, organization_id)
-    session_by_slot: dict[int, SessionRead] = {}
-    session_by_course: dict[int, SessionRead] = {}
-    for sess in serialized_sessions:
-        if sess.schedule_id is not None:
-            prev = session_by_slot.get(sess.schedule_id)
-            if prev is None or (prev.status != "open" and sess.status == "open"):
-                session_by_slot[sess.schedule_id] = sess
-        if sess.course_assignment_id is not None:
-            prev_c = session_by_course.get(sess.course_assignment_id)
-            if prev_c is None or (prev_c.status != "open" and sess.status == "open"):
-                session_by_course[sess.course_assignment_id] = sess
+    sesiones_serializadas = serializar_sesiones_lote(sesion_bd, sesiones_dia, id_organizacion)
 
-    weekday = target_date.weekday()
-    today_slots: list[TeacherAgendaSlot] = []
-    for course in courses:
-        c_read = course_read_map[course.id]
-        for sl in course.schedules:
-            if sl.day_of_week != weekday:
+    sesion_por_horario: dict[int, SesionLeer] = {}
+    sesion_por_curso: dict[int, SesionLeer] = {}
+    for sesion in sesiones_serializadas:
+        if sesion.id_horario is not None:
+            previa = sesion_por_horario.get(sesion.id_horario)
+            if previa is None or (previa.estado != "open" and sesion.estado == "open"):
+                sesion_por_horario[sesion.id_horario] = sesion
+        if sesion.id_asignacion_curso is not None:
+            previa_curso = sesion_por_curso.get(sesion.id_asignacion_curso)
+            if previa_curso is None or (previa_curso.estado != "open" and sesion.estado == "open"):
+                sesion_por_curso[sesion.id_asignacion_curso] = sesion
+
+    dia_semana = fecha_objetivo.weekday()
+    bloques_hoy: list[BloqueAgendaDocente] = []
+    for curso in cursos:
+        curso_leido = mapa_cursos_leidos[curso.id]
+        for horario in curso.horarios:
+            if horario.dia_semana != dia_semana:
                 continue
-            if sl.start_time <= current_time_str <= sl.end_time:
-                slot_status = "in_progress"
-            elif current_time_str < sl.start_time:
-                slot_status = "upcoming"
+            if horario.hora_inicio <= hora_actual_texto <= horario.hora_fin:
+                estado_bloque = "in_progress"
+            elif hora_actual_texto < horario.hora_inicio:
+                estado_bloque = "upcoming"
             else:
-                slot_status = "finished"
+                estado_bloque = "finished"
 
-            matched_session = session_by_slot.get(sl.id) or session_by_course.get(course.id)
-            today_slots.append(
-                TeacherAgendaSlot(
-                    schedule_id=sl.id,
-                    course_assignment_id=course.id,
-                    subject_name=c_read.subject_name,
-                    subject_code=c_read.subject_code,
-                    group_id=c_read.group_id,
-                    group_name=c_read.group_name,
-                    group_code=c_read.group_code,
-                    career_name=c_read.career_name,
-                    day_of_week=sl.day_of_week,
-                    start_time=sl.start_time,
-                    end_time=sl.end_time,
-                    classroom=sl.classroom,
-                    slot_status=slot_status,
-                    students_count=c_read.students_count,
-                    session=matched_session,
+            sesion_vinculada = (
+                sesion_por_horario.get(horario.id) or sesion_por_curso.get(curso.id)
+            )
+            bloques_hoy.append(
+                BloqueAgendaDocente(
+                    id_horario=horario.id,
+                    id_asignacion_curso=curso.id,
+                    nombre_materia=curso_leido.nombre_materia,
+                    codigo_materia=curso_leido.codigo_materia,
+                    id_grupo=curso_leido.id_grupo,
+                    nombre_grupo=curso_leido.nombre_grupo,
+                    codigo_grupo=curso_leido.codigo_grupo,
+                    nombre_carrera=curso_leido.nombre_carrera,
+                    dia_semana=horario.dia_semana,
+                    hora_inicio=horario.hora_inicio,
+                    hora_fin=horario.hora_fin,
+                    aula=horario.aula,
+                    estado_bloque=estado_bloque,
+                    cantidad_estudiantes=curso_leido.cantidad_estudiantes,
+                    sesion=sesion_vinculada,
                 )
             )
 
-    today_slots.sort(key=lambda item: (item.start_time, item.end_time, item.schedule_id))
+    bloques_hoy.sort(key=lambda bloque: (bloque.hora_inicio, bloque.hora_fin, bloque.id_horario))
 
-    current_slot = next((s for s in today_slots if s.slot_status == "in_progress"), None)
-    if current_slot is None:
-        current_slot = next((s for s in today_slots if s.slot_status == "upcoming"), None)
-
-    return TeacherAgendaResponse(
-        target_date=target_date,
-        current_time=current_time_str,
-        current_slot=current_slot,
-        today_slots=today_slots,
-        courses=serialized_courses,
+    # Selecciona primero la clase en curso; si no hay ninguna, la próxima clase del día
+    bloque_actual = next(
+        (bloque for bloque in bloques_hoy if bloque.estado_bloque == "in_progress"),
+        None,
     )
-
-
-def compute_academic_stats(
-    db: Session,
-    *,
-    organization_id: int,
-    date_from: date | None = None,
-    date_to: date | None = None,
-    career_id: int | None = None,
-    group_id: int | None = None,
-) -> AcademicStatsResponse:
-    """Calcula estadísticas por asignatura y consolidadas por grupo/alumno."""
-    org = db.get(Organization, organization_id)
-    org_period_type = org.academic_period_type if org else "semestral"
-    careers = list(
-        db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
-    )
-    career_obj_map = {c.id: c for c in careers}
-    career_map = {c.id: c.name for c in careers}
-
-    groups_stmt = select(Group).where(Group.organization_id == organization_id).order_by(Group.name.asc())
-    if career_id is not None:
-        groups_stmt = groups_stmt.where(Group.career_id == career_id)
-    if group_id is not None:
-        groups_stmt = groups_stmt.where(Group.id == group_id)
-    groups = list(db.scalars(groups_stmt).all())
-    group_map = {g.id: g for g in groups}
-    filtered_group_ids = set(group_map.keys())
-
-    subjects = list(
-        db.scalars(select(Subject).where(Subject.organization_id == organization_id)).all()
-    )
-
-    courses = list(
-        db.scalars(
-            select(CourseAssignment)
-            .options(
-                selectinload(CourseAssignment.subject),
-                selectinload(CourseAssignment.group),
-                selectinload(CourseAssignment.teacher),
-            )
-            .where(CourseAssignment.organization_id == organization_id)
-            .order_by(CourseAssignment.id.asc())
-        ).all()
-    )
-    if filtered_group_ids or career_id is not None or group_id is not None:
-        courses = [c for c in courses if c.group_id in filtered_group_ids]
-
-    # Alumnos activos por grupo
-    group_students_map: dict[int, list[Person]] = defaultdict(list)
-    if filtered_group_ids:
-        pg_rows = db.execute(
-            select(PersonGroup.group_id, Person)
-            .join(Person, Person.id == PersonGroup.person_id)
-            .where(
-                PersonGroup.group_id.in_(filtered_group_ids),
-                Person.organization_id == organization_id,
-                Person.is_active.is_(True),
-                Person.role != "teacher",
-            )
-            .order_by(Person.full_name.asc())
-        ).all()
-        for gid, person in pg_rows:
-            group_students_map[gid].append(person)
-
-    course_ids = [c.id for c in courses]
-    sessions_by_course: dict[int, list[AttendanceSession]] = defaultdict(list)
-    session_ids: list[int] = []
-    if course_ids:
-        sess_stmt = select(AttendanceSession).where(
-            AttendanceSession.organization_id == organization_id,
-            AttendanceSession.course_assignment_id.in_(course_ids),
+    if bloque_actual is None:
+        bloque_actual = next(
+            (bloque for bloque in bloques_hoy if bloque.estado_bloque == "upcoming"),
+            None,
         )
-        if date_from is not None:
-            sess_stmt = sess_stmt.where(AttendanceSession.session_date >= date_from)
-        if date_to is not None:
-            sess_stmt = sess_stmt.where(AttendanceSession.session_date <= date_to)
-        sessions = list(db.scalars(sess_stmt).all())
-        for sess in sessions:
-            if sess.course_assignment_id is not None:
-                sessions_by_course[sess.course_assignment_id].append(sess)
-                session_ids.append(sess.id)
 
-    # Mapeo único (session_id, person_id) -> status
-    event_status_map: dict[tuple[int, int], str] = {}
-    if session_ids:
-        events = list(
-            db.scalars(
-                select(AttendanceEvent)
-                .where(AttendanceEvent.session_id.in_(session_ids))
-                .order_by(AttendanceEvent.id.asc())
+    return RespuestaAgendaDocente(
+        fecha_objetivo=fecha_objetivo,
+        hora_actual=hora_actual_texto,
+        bloque_actual=bloque_actual,
+        bloques_hoy=bloques_hoy,
+        cursos=cursos_serializados,
+    )
+
+
+def calcular_estadisticas_academicas(
+    sesion_bd: Session,
+    *,
+    id_organizacion: int,
+    fecha_desde: date | None = None,
+    fecha_hasta: date | None = None,
+    id_carrera: int | None = None,
+    id_grupo: int | None = None,
+) -> RespuestaEstadisticasAcademicas:
+    """Calcula estadísticas académicas por asignatura y consolidadas por grupo y alumno."""
+    organizacion = sesion_bd.get(Organizacion, id_organizacion)
+    tipo_periodo_org = organizacion.tipo_periodo_academico if organizacion else "semestral"
+
+    from app.models import Materia  # import local para mantener encabezado limpio
+
+    carreras = list(
+        sesion_bd.scalars(
+            select(Carrera).where(Carrera.id_organizacion == id_organizacion)
+        ).all()
+    )
+    mapa_objetos_carrera = {carrera.id: carrera for carrera in carreras}
+    mapa_nombres_carrera = {carrera.id: carrera.nombre for carrera in carreras}
+
+    consulta_grupos = (
+        select(Grupo)
+        .where(Grupo.id_organizacion == id_organizacion)
+        .order_by(Grupo.nombre.asc())
+    )
+    if id_carrera is not None:
+        consulta_grupos = consulta_grupos.where(Grupo.id_carrera == id_carrera)
+    if id_grupo is not None:
+        consulta_grupos = consulta_grupos.where(Grupo.id == id_grupo)
+    grupos = list(sesion_bd.scalars(consulta_grupos).all())
+    mapa_grupos = {grupo.id: grupo for grupo in grupos}
+    ids_grupos_filtrados = set(mapa_grupos.keys())
+
+    materias = list(
+        sesion_bd.scalars(
+            select(Materia).where(Materia.id_organizacion == id_organizacion)
+        ).all()
+    )
+
+    cursos = list(
+        sesion_bd.scalars(
+            select(AsignacionCurso)
+            .options(
+                selectinload(AsignacionCurso.materia),
+                selectinload(AsignacionCurso.grupo),
+                selectinload(AsignacionCurso.docente),
+            )
+            .where(AsignacionCurso.id_organizacion == id_organizacion)
+            .order_by(AsignacionCurso.id.asc())
+        ).all()
+    )
+    if ids_grupos_filtrados or id_carrera is not None or id_grupo is not None:
+        cursos = [curso for curso in cursos if curso.id_grupo in ids_grupos_filtrados]
+
+    # Alumnos activos agrupados por grupo escolar
+    alumnos_por_grupo: dict[int, list[Persona]] = defaultdict(list)
+    if ids_grupos_filtrados:
+        filas_alumnos = sesion_bd.execute(
+            select(PersonaGrupo.id_grupo, Persona)
+            .join(Persona, Persona.id == PersonaGrupo.id_persona)
+            .where(
+                PersonaGrupo.id_grupo.in_(ids_grupos_filtrados),
+                Persona.id_organizacion == id_organizacion,
+                Persona.esta_activo.is_(True),
+                Persona.rol != "teacher",
+            )
+            .order_by(Persona.nombre_completo.asc())
+        ).all()
+        for gid, alumno in filas_alumnos:
+            alumnos_por_grupo[gid].append(alumno)
+
+    ids_cursos = [curso.id for curso in cursos]
+    sesiones_por_curso: dict[int, list[SesionAsistencia]] = defaultdict(list)
+    ids_sesiones: list[int] = []
+    if ids_cursos:
+        consulta_sesiones = select(SesionAsistencia).where(
+            SesionAsistencia.id_organizacion == id_organizacion,
+            SesionAsistencia.id_asignacion_curso.in_(ids_cursos),
+        )
+        if fecha_desde is not None:
+            consulta_sesiones = consulta_sesiones.where(
+                SesionAsistencia.fecha_sesion >= fecha_desde
+            )
+        if fecha_hasta is not None:
+            consulta_sesiones = consulta_sesiones.where(
+                SesionAsistencia.fecha_sesion <= fecha_hasta
+            )
+        sesiones = list(sesion_bd.scalars(consulta_sesiones).all())
+        for sesion in sesiones:
+            if sesion.id_asignacion_curso is not None:
+                sesiones_por_curso[sesion.id_asignacion_curso].append(sesion)
+                ids_sesiones.append(sesion.id)
+
+    # Mapeo único `(id_sesion, id_persona) -> estado` conservando el primer evento de la sesión
+    mapa_estado_evento: dict[tuple[int, int], str] = {}
+    if ids_sesiones:
+        eventos = list(
+            sesion_bd.scalars(
+                select(EventoAsistencia)
+                .where(EventoAsistencia.id_sesion.in_(ids_sesiones))
+                .order_by(EventoAsistencia.id.asc())
             ).all()
         )
-        for ev in events:
-            key = (ev.session_id, ev.person_id)
-            if key not in event_status_map:
-                event_status_map[key] = ev.status
+        for evento in eventos:
+            clave = (evento.id_sesion, evento.id_persona)
+            if clave not in mapa_estado_evento:
+                mapa_estado_evento[clave] = evento.estado
 
-    by_subject: list[SubjectAttendanceStat] = []
-    courses_by_group: dict[int, list[CourseAssignment]] = defaultdict(list)
+    por_materia: list[EstadisticaAsistenciaMateria] = []
+    cursos_por_grupo: dict[int, list[AsignacionCurso]] = defaultdict(list)
 
-    for course in courses:
-        courses_by_group[course.group_id].append(course)
-        group_students = group_students_map.get(course.group_id, [])
-        student_ids = [p.id for p in group_students]
-        course_sessions = sessions_by_course.get(course.id, [])
+    for curso in cursos:
+        cursos_por_grupo[curso.id_grupo].append(curso)
+        alumnos_grupo = alumnos_por_grupo.get(curso.id_grupo, [])
+        ids_alumnos = [alumno.id for alumno in alumnos_grupo]
+        sesiones_curso = sesiones_por_curso.get(curso.id, [])
 
-        sessions_count = len(course_sessions)
-        enrolled_count = len(student_ids)
-        expected = sessions_count * enrolled_count
+        cantidad_sesiones = len(sesiones_curso)
+        inscritos = len(ids_alumnos)
+        esperados = cantidad_sesiones * inscritos
 
-        present = 0
-        on_time = 0
-        late = 0
-        manual = 0
-        for sess in course_sessions:
-            for sid in student_ids:
-                st = event_status_map.get((sess.id, sid))
-                if st is not None:
-                    present += 1
-                    if st == "on_time":
-                        on_time += 1
-                    elif st == "late":
-                        late += 1
-                    elif st == "manual":
-                        manual += 1
+        asistencias = 0
+        puntuales = 0
+        retardos = 0
+        manuales = 0
+        for sesion in sesiones_curso:
+            for id_alumno in ids_alumnos:
+                estado_ev = mapa_estado_evento.get((sesion.id, id_alumno))
+                if estado_ev is not None:
+                    asistencias += 1
+                    if estado_ev == "on_time":
+                        puntuales += 1
+                    elif estado_ev == "late":
+                        retardos += 1
+                    elif estado_ev == "manual":
+                        manuales += 1
 
-        absent = max(0, expected - present)
-        rate = round((present / expected) * 100.0, 2) if expected > 0 else 0.0
-        cid = course.group.career_id if course.group else None
-        career_obj = career_obj_map.get(cid) if cid else None
-        subj_period_type = (
-            (course.group.period_type if course.group else None)
-            or (career_obj.period_type if career_obj and career_obj.period_type else None)
-            or org_period_type
+        faltas = max(0, esperados - asistencias)
+        tasa = round((asistencias / esperados) * 100.0, 2) if esperados > 0 else 0.0
+        cid = curso.grupo.id_carrera if curso.grupo else None
+        carrera_obj = mapa_objetos_carrera.get(cid) if cid else None
+        tipo_periodo_materia = (
+            (curso.grupo.tipo_periodo if curso.grupo else None)
+            or (carrera_obj.tipo_periodo if carrera_obj and carrera_obj.tipo_periodo else None)
+            or tipo_periodo_org
         )
 
-        by_subject.append(
-            SubjectAttendanceStat(
-                course_assignment_id=course.id,
-                subject_id=course.subject_id,
-                subject_name=course.subject.name if course.subject else "",
-                subject_code=course.subject.code if course.subject else "",
-                group_id=course.group_id,
-                group_name=course.group.name if course.group else "",
-                group_code=course.group.code if course.group else "",
-                career_id=cid,
-                career_name=career_map.get(cid) if cid else None,
-                semester=course.group.semester if course.group else None,
-                period_type=subj_period_type,
-                teacher_name=course.teacher.full_name if course.teacher else None,
-                sessions_count=sessions_count,
-                enrolled_students=enrolled_count,
-                expected_records=expected,
-                present_count=present,
-                on_time_count=on_time,
-                late_count=late,
-                manual_count=manual,
-                absent_count=absent,
-                attendance_rate=rate,
+        por_materia.append(
+            EstadisticaAsistenciaMateria(
+                id_asignacion_curso=curso.id,
+                id_materia=curso.id_materia,
+                nombre_materia=curso.materia.nombre if curso.materia else "",
+                codigo_materia=curso.materia.codigo if curso.materia else "",
+                id_grupo=curso.id_grupo,
+                nombre_grupo=curso.grupo.nombre if curso.grupo else "",
+                codigo_grupo=curso.grupo.codigo if curso.grupo else "",
+                id_carrera=cid,
+                nombre_carrera=mapa_nombres_carrera.get(cid) if cid else None,
+                semestre=curso.grupo.semestre if curso.grupo else None,
+                tipo_periodo=tipo_periodo_materia,
+                nombre_docente=curso.docente.nombre_completo if curso.docente else None,
+                cantidad_sesiones=cantidad_sesiones,
+                estudiantes_inscritos=inscritos,
+                registros_esperados=esperados,
+                cantidad_asistencias=asistencias,
+                cantidad_puntuales=puntuales,
+                cantidad_retardos=retardos,
+                cantidad_manuales=manuales,
+                cantidad_faltas=faltas,
+                tasa_asistencia=tasa,
             )
         )
 
-    by_group: list[GroupAttendanceStat] = []
-    grand_expected = 0
-    grand_present = 0
-    grand_sessions = 0
+    por_grupo: list[EstadisticaAsistenciaGrupo] = []
+    gran_total_esperados = 0
+    gran_total_asistencias = 0
+    gran_total_sesiones = 0
 
-    for g in groups:
-        group_courses = courses_by_group.get(g.id, [])
-        group_students = group_students_map.get(g.id, [])
-        all_group_sessions: list[AttendanceSession] = []
-        for c in group_courses:
-            all_group_sessions.extend(sessions_by_course.get(c.id, []))
+    for grupo in grupos:
+        cursos_grupo = cursos_por_grupo.get(grupo.id, [])
+        alumnos_grupo = alumnos_por_grupo.get(grupo.id, [])
+        todas_sesiones_grupo: list[SesionAsistencia] = []
+        for curso in cursos_grupo:
+            todas_sesiones_grupo.extend(sesiones_por_curso.get(curso.id, []))
 
-        total_sessions = len(all_group_sessions)
-        total_expected = total_sessions * len(group_students)
-        total_present = 0
-        total_on_time = 0
-        total_late = 0
-        students_breakdown: list[StudentGroupAttendanceStat] = []
+        total_sesiones = len(todas_sesiones_grupo)
+        total_esperados = total_sesiones * len(alumnos_grupo)
+        total_asistencias = 0
+        total_puntuales = 0
+        total_retardos = 0
+        desglose_estudiantes: list[EstadisticaAsistenciaAlumnoGrupo] = []
 
-        for person in group_students:
-            s_present = 0
-            s_on_time = 0
-            s_late = 0
-            for sess in all_group_sessions:
-                st = event_status_map.get((sess.id, person.id))
-                if st is not None:
-                    s_present += 1
-                    if st == "on_time":
-                        s_on_time += 1
-                    elif st == "late":
-                        s_late += 1
-            s_absent = max(0, total_sessions - s_present)
-            s_rate = round((s_present / total_sessions) * 100.0, 2) if total_sessions > 0 else 0.0
-            total_present += s_present
-            total_on_time += s_on_time
-            total_late += s_late
-            students_breakdown.append(
-                StudentGroupAttendanceStat(
-                    person_id=person.id,
-                    external_id=person.external_id,
-                    full_name=person.full_name,
-                    expected_records=total_sessions,
-                    present_count=s_present,
-                    on_time_count=s_on_time,
-                    late_count=s_late,
-                    absent_count=s_absent,
-                    attendance_rate=s_rate,
+        for alumno in alumnos_grupo:
+            al_asistencias = 0
+            al_puntuales = 0
+            al_retardos = 0
+            for sesion in todas_sesiones_grupo:
+                estado_ev = mapa_estado_evento.get((sesion.id, alumno.id))
+                if estado_ev is not None:
+                    al_asistencias += 1
+                    if estado_ev == "on_time":
+                        al_puntuales += 1
+                    elif estado_ev == "late":
+                        al_retardos += 1
+            al_faltas = max(0, total_sesiones - al_asistencias)
+            al_tasa = (
+                round((al_asistencias / total_sesiones) * 100.0, 2)
+                if total_sesiones > 0
+                else 0.0
+            )
+            total_asistencias += al_asistencias
+            total_puntuales += al_puntuales
+            total_retardos += al_retardos
+            desglose_estudiantes.append(
+                EstadisticaAsistenciaAlumnoGrupo(
+                    id_persona=alumno.id,
+                    identificador_externo=alumno.identificador_externo,
+                    nombre_completo=alumno.nombre_completo,
+                    registros_esperados=total_sesiones,
+                    cantidad_asistencias=al_asistencias,
+                    cantidad_puntuales=al_puntuales,
+                    cantidad_retardos=al_retardos,
+                    cantidad_faltas=al_faltas,
+                    tasa_asistencia=al_tasa,
                 )
             )
 
-        total_absent = max(0, total_expected - total_present)
-        g_rate = round((total_present / total_expected) * 100.0, 2) if total_expected > 0 else 0.0
-        grand_expected += total_expected
-        grand_present += total_present
-        grand_sessions += total_sessions
-
-        grp_career = career_obj_map.get(g.career_id) if g.career_id else None
-        grp_period_type = (
-            g.period_type
-            or (grp_career.period_type if grp_career and grp_career.period_type else None)
-            or org_period_type
+        total_faltas = max(0, total_esperados - total_asistencias)
+        tasa_grupo = (
+            round((total_asistencias / total_esperados) * 100.0, 2)
+            if total_esperados > 0
+            else 0.0
         )
-        by_group.append(
-            GroupAttendanceStat(
-                group_id=g.id,
-                group_name=g.name,
-                group_code=g.code,
-                career_id=g.career_id,
-                career_name=career_map.get(g.career_id) if g.career_id else None,
-                semester=g.semester,
-                period_type=grp_period_type,
-                subjects_count=len(group_courses),
-                students_count=len(group_students),
-                total_sessions=total_sessions,
-                total_expected=total_expected,
-                total_present=total_present,
-                total_on_time=total_on_time,
-                total_late=total_late,
-                total_absent=total_absent,
-                overall_attendance_rate=g_rate,
-                students_breakdown=students_breakdown,
+        gran_total_esperados += total_esperados
+        gran_total_asistencias += total_asistencias
+        gran_total_sesiones += total_sesiones
+
+        carrera_grupo = mapa_objetos_carrera.get(grupo.id_carrera) if grupo.id_carrera else None
+        tipo_periodo_grupo = (
+            grupo.tipo_periodo
+            or (
+                carrera_grupo.tipo_periodo
+                if carrera_grupo and carrera_grupo.tipo_periodo
+                else None
+            )
+            or tipo_periodo_org
+        )
+        por_grupo.append(
+            EstadisticaAsistenciaGrupo(
+                id_grupo=grupo.id,
+                nombre_grupo=grupo.nombre,
+                codigo_grupo=grupo.codigo,
+                id_carrera=grupo.id_carrera,
+                nombre_carrera=(
+                    mapa_nombres_carrera.get(grupo.id_carrera) if grupo.id_carrera else None
+                ),
+                semestre=grupo.semestre,
+                tipo_periodo=tipo_periodo_grupo,
+                cantidad_materias=len(cursos_grupo),
+                cantidad_estudiantes=len(alumnos_grupo),
+                total_sesiones=total_sesiones,
+                total_esperados=total_esperados,
+                total_asistencias=total_asistencias,
+                total_puntuales=total_puntuales,
+                total_retardos=total_retardos,
+                total_faltas=total_faltas,
+                tasa_asistencia_general=tasa_grupo,
+                desglose_estudiantes=desglose_estudiantes,
             )
         )
 
-    overall_rate = round((grand_present / grand_expected) * 100.0, 2) if grand_expected > 0 else 0.0
+    tasa_global = (
+        round((gran_total_asistencias / gran_total_esperados) * 100.0, 2)
+        if gran_total_esperados > 0
+        else 0.0
+    )
 
-    return AcademicStatsResponse(
-        organization_id=organization_id,
-        date_from=date_from,
-        date_to=date_to,
-        summary=AcademicStatsSummary(
-            total_careers=len(careers),
-            total_groups=len(groups),
-            total_subjects=len(subjects),
-            total_courses=len(courses),
-            total_sessions=grand_sessions,
-            overall_attendance_rate=overall_rate,
+    return RespuestaEstadisticasAcademicas(
+        id_organizacion=id_organizacion,
+        fecha_desde=fecha_desde,
+        fecha_hasta=fecha_hasta,
+        resumen=ResumenEstadisticasAcademicas(
+            total_carreras=len(carreras),
+            total_grupos=len(grupos),
+            total_materias=len(materias),
+            total_cursos=len(cursos),
+            total_sesiones=gran_total_sesiones,
+            tasa_asistencia_general=tasa_global,
         ),
-        by_subject=by_subject,
-        by_group=by_group,
+        por_materia=por_materia,
+        por_grupo=por_grupo,
     )

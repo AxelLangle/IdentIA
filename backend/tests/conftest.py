@@ -1,3 +1,10 @@
+"""Fixtures y utilidades sintéticas compartidas para las pruebas de IdentIA.
+
+Genera imágenes BGR nítidas en memoria, vectores unitarios L2 reproducibles,
+landmarks calibrados para las 6 poses y un motor biométrico simulado determinista
+junto con clientes HTTP aislados sobre bases de datos SQLite temporales.
+"""
+
 from collections.abc import Generator
 from pathlib import Path
 import cv2
@@ -6,169 +13,206 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import get_settings
-from app.db import create_db_engine, get_db
-from app.main import create_app
-from app.vision.engine import normalize_embedding
-from app.vision.quality import FaceBox
+from app.config import obtener_configuracion
+from app.db import crear_motor_bd, obtener_bd
+from app.main import crear_aplicacion
+from app.vision.engine import normalizar_vector
+from app.vision.quality import CuadroRostro
 
 
-def make_sharp_face_image(
-    width: int = 400,
-    height: int = 400,
-    face_box: tuple[int, int, int, int] = (100, 80, 180, 200),
-    brightness_base: int = 140,
-    blur: bool = False,
+def crear_imagen_rostro_nitida(
+    ancho: int = 400,
+    alto: int = 400,
+    cuadro_rostro: tuple[int, int, int, int] = (100, 80, 180, 200),
+    brillo_base: int = 140,
+    desenfocada: bool = False,
 ) -> np.ndarray:
-    """Genera una imagen BGR sintética en memoria con textura nítida para pruebas."""
-    img = np.full((height, width, 3), brightness_base, dtype=np.uint8)
-    x, y, w, h = face_box
-    if not blur:
-        # Patrón de tablero de alto contraste dentro de la región facial para varianza Laplaciana alta
-        for row in range(y, min(height, y + h), 8):
-            for col in range(x, min(width, x + w), 8):
-                if ((row // 8) + (col // 8)) % 2 == 0:
+    """Genera una imagen BGR sintética en memoria con textura tipo tablero para nitidez."""
+    imagen = np.full((alto, ancho, 3), brillo_base, dtype=np.uint8)
+    coord_x, coord_y, ancho_r, alto_r = cuadro_rostro
+    if not desenfocada:
+        # Dibuja cuadrícula de alto contraste dentro del rostro para elevar varianza Laplaciana
+        for fila in range(coord_y, min(alto, coord_y + alto_r), 8):
+            for columna in range(coord_x, min(ancho, coord_x + ancho_r), 8):
+                if ((fila // 8) + (columna // 8)) % 2 == 0:
                     cv2.rectangle(
-                        img,
-                        (col, row),
-                        (min(width, col + 8), min(height, row + 8)),
-                        (min(255, brightness_base + 55), min(255, brightness_base + 55), min(255, brightness_base + 55)),
+                        imagen,
+                        (columna, fila),
+                        (min(ancho, columna + 8), min(alto, fila + 8)),
+                        (
+                            min(255, brillo_base + 55),
+                            min(255, brillo_base + 55),
+                            min(255, brillo_base + 55),
+                        ),
                         -1,
                     )
                 else:
                     cv2.rectangle(
-                        img,
-                        (col, row),
-                        (min(width, col + 8), min(height, row + 8)),
-                        (max(0, brightness_base - 55), max(0, brightness_base - 55), max(0, brightness_base - 55)),
+                        imagen,
+                        (columna, fila),
+                        (min(ancho, columna + 8), min(alto, fila + 8)),
+                        (
+                            max(0, brillo_base - 55),
+                            max(0, brillo_base - 55),
+                            max(0, brillo_base - 55),
+                        ),
                         -1,
                     )
-    return img
+    return imagen
 
 
-def encode_jpeg_bytes(image_bgr: np.ndarray) -> bytes:
-    ok, buf = cv2.imencode(".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-    assert ok
-    return buf.tobytes()
+def codificar_bytes_jpeg(imagen_bgr: np.ndarray) -> bytes:
+    """Codifica una imagen BGR en memoria a bytes JPEG de prueba."""
+    exito, bufer = cv2.imencode(".jpg", imagen_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    assert exito
+    return bufer.tobytes()
 
 
-def make_unit_vector(seed: int, dim: int = 128) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    vec = rng.normal(size=dim).astype(np.float32)
-    return normalize_embedding(vec)
+def crear_vector_unitario(semilla: int, dimensiones: int = 128) -> np.ndarray:
+    """Genera un embedding pseudoaleatorio normalizado L2 reproducible a partir de `semilla`."""
+    generador = np.random.default_rng(semilla)
+    vector = generador.normal(size=dimensiones).astype(np.float32)
+    return normalizar_vector(vector)
 
 
-def make_pose_landmarks(pose: str) -> list[tuple[float, float]]:
-    """Genera los 5 landmarks de YuNet calibrados para cada una de las 6 poses."""
-    right_eye = (150.0, 145.0)
-    left_eye = (230.0, 145.0)
-    right_mouth = (162.0, 225.0)
-    left_mouth = (218.0, 225.0)
-    nose = (190.0, 188.0)
+def crear_puntos_pose(etiqueta_pose: str) -> list[tuple[float, float]]:
+    """Genera los 5 puntos de referencia YuNet calibrados para cada una de las 6 poses."""
+    ojo_derecho = (150.0, 145.0)
+    ojo_izquierdo = (230.0, 145.0)
+    boca_derecha = (162.0, 225.0)
+    boca_izquierda = (218.0, 225.0)
+    nariz = (190.0, 188.0)
 
-    if pose == "left":
-        nose = (210.0, 188.0)
-    elif pose == "right":
-        nose = (170.0, 188.0)
-    elif pose == "up":
-        nose = (190.0, 173.0)
-    elif pose == "down":
-        nose = (190.0, 203.0)
-    elif pose == "smile":
-        right_mouth = (152.0, 225.0)
-        left_mouth = (228.0, 225.0)
+    if etiqueta_pose == "left":
+        nariz = (210.0, 188.0)
+    elif etiqueta_pose == "right":
+        nariz = (170.0, 188.0)
+    elif etiqueta_pose == "up":
+        nariz = (190.0, 173.0)
+    elif etiqueta_pose == "down":
+        nariz = (190.0, 203.0)
+    elif etiqueta_pose == "smile":
+        boca_derecha = (152.0, 225.0)
+        boca_izquierda = (228.0, 225.0)
 
-    return [right_eye, left_eye, nose, right_mouth, left_mouth]
+    return [ojo_derecho, ojo_izquierdo, nariz, boca_derecha, boca_izquierda]
 
 
-class FakeBiometricEngine:
+class MotorBiometricoSimulado:
     """Motor biométrico determinista para pruebas rápidas de integración HTTP."""
 
     def __init__(self) -> None:
-        self.next_boxes: list[FaceBox] = [
-            FaceBox(
-                x=100,
-                y=80,
-                w=180,
-                h=200,
-                confidence=0.98,
-                landmarks=make_pose_landmarks("frontal"),
+        self.siguientes_cuadros: list[CuadroRostro] = [
+            CuadroRostro(
+                coordenada_x=100,
+                coordenada_y=80,
+                ancho=180,
+                alto=200,
+                confianza=0.98,
+                puntos_referencia=crear_puntos_pose("frontal"),
             )
         ]
-        self.next_embedding: np.ndarray = make_unit_vector(1)
+        self.siguiente_vector: np.ndarray = crear_vector_unitario(1)
 
-    def detect(
+    def detectar(
         self,
-        image_bgr: np.ndarray,
-        allow_backlight_fallback: bool = True,
-    ) -> list[tuple[FaceBox, np.ndarray]]:
-        results: list[tuple[FaceBox, np.ndarray]] = []
-        for idx, box in enumerate(self.next_boxes):
-            row = np.zeros(15, dtype=np.float32)
-            row[0], row[1], row[2], row[3] = box.x, box.y, box.w, box.h
-            for lm_idx, (lx, ly) in enumerate(box.landmarks[:5]):
-                row[4 + lm_idx * 2] = lx
-                row[5 + lm_idx * 2] = ly
-            row[14] = box.confidence
-            results.append((box, row))
-        results.sort(key=lambda item: item[0].w * item[0].h, reverse=True)
-        return results
+        imagen_bgr: np.ndarray,
+        permitir_respaldo_contraluz: bool = True,
+    ) -> list[tuple[CuadroRostro, np.ndarray]]:
+        """Devuelve detecciones sintéticas ordenadas por área simulando YuNet."""
+        resultados: list[tuple[CuadroRostro, np.ndarray]] = []
+        for cuadro in self.siguientes_cuadros:
+            fila = np.zeros(15, dtype=np.float32)
+            fila[0], fila[1], fila[2], fila[3] = (
+                cuadro.coordenada_x,
+                cuadro.coordenada_y,
+                cuadro.ancho,
+                cuadro.alto,
+            )
+            for indice_punto, (punto_x, punto_y) in enumerate(cuadro.puntos_referencia[:5]):
+                fila[4 + indice_punto * 2] = punto_x
+                fila[5 + indice_punto * 2] = punto_y
+            fila[14] = cuadro.confianza
+            resultados.append((cuadro, fila))
+        resultados.sort(
+            key=lambda elemento: elemento[0].ancho * elemento[0].alto,
+            reverse=True,
+        )
+        return resultados
 
-    def extract_embedding(self, image_bgr: np.ndarray, raw_face_row: np.ndarray) -> np.ndarray:
-        return normalize_embedding(self.next_embedding)
+    def extraer_vector(
+        self,
+        imagen_bgr: np.ndarray,
+        fila_rostro_cruda: np.ndarray,
+    ) -> np.ndarray:
+        """Devuelve el embedding determinista configurado para la prueba en curso."""
+        return normalizar_vector(self.siguiente_vector)
 
 
 @pytest.fixture()
-def fake_engine() -> FakeBiometricEngine:
-    return FakeBiometricEngine()
+def motor_simulado() -> MotorBiometricoSimulado:
+    """Provee un motor biométrico simulado limpio por cada prueba."""
+    return MotorBiometricoSimulado()
 
 
 @pytest.fixture()
-def raw_api_client(
-    tmp_path: Path, fake_engine: FakeBiometricEngine
-) -> Generator[tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path], None, None]:
-    db_file = tmp_path / "test_identia.db"
-    test_engine = create_db_engine(f"sqlite:///{db_file.as_posix()}")
-    TestingSessionLocal = sessionmaker(
-        bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False
+def cliente_api_sin_autenticar(
+    tmp_path: Path,
+    motor_simulado: MotorBiometricoSimulado,
+) -> Generator[
+    tuple[TestClient, sessionmaker[Session], MotorBiometricoSimulado, Path],
+    None,
+    None,
+]:
+    """Inicializa una instancia FastAPI aislada sobre SQLite temporal sin sesión iniciada."""
+    archivo_bd = tmp_path / "prueba_identia.db"
+    motor_prueba = crear_motor_bd(f"sqlite:///{archivo_bd.as_posix()}")
+    FabricaSesionesPrueba = sessionmaker(
+        bind=motor_prueba,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
     )
 
-    app = create_app(
-        biometric_engine=fake_engine,
-        init_models=False,
-        db_engine=test_engine,
-        session_factory=TestingSessionLocal,
+    aplicacion = crear_aplicacion(
+        motor_biometrico=motor_simulado,
+        inicializar_modelos=False,
+        motor_bd_personalizado=motor_prueba,
+        fabrica_sesiones=FabricaSesionesPrueba,
     )
 
-    def _override_get_db() -> Generator[Session, None, None]:
-        db = TestingSessionLocal()
+    def _sobrescribir_obtener_bd() -> Generator[Session, None, None]:
+        sesion_bd = FabricaSesionesPrueba()
         try:
-            yield db
+            yield sesion_bd
         finally:
-            db.close()
+            sesion_bd.close()
 
-    app.dependency_overrides[get_db] = _override_get_db
+    aplicacion.dependency_overrides[obtener_bd] = _sobrescribir_obtener_bd
 
-    with TestClient(app) as client:
-        yield client, TestingSessionLocal, fake_engine, tmp_path
+    with TestClient(aplicacion) as cliente:
+        yield cliente, FabricaSesionesPrueba, motor_simulado, tmp_path
 
-    test_engine.dispose()
+    motor_prueba.dispose()
 
 
 @pytest.fixture()
-def api_client(
-    raw_api_client: tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path],
-) -> tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path]:
-    client, TestingSessionLocal, fake_engine, tmp_path = raw_api_client
-    settings = get_settings()
-    login_res = client.post(
+def cliente_api(
+    cliente_api_sin_autenticar: tuple[
+        TestClient, sessionmaker[Session], MotorBiometricoSimulado, Path
+    ],
+) -> tuple[TestClient, sessionmaker[Session], MotorBiometricoSimulado, Path]:
+    """Devuelve un `TestClient` autenticado como Superadmin para pruebas generales."""
+    cliente, FabricaSesionesPrueba, motor_simulado, ruta_temporal = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    respuesta_login = cliente.post(
         "/api/auth/login",
         json={
-            "email": settings.bootstrap_superadmin_email,
-            "password": settings.bootstrap_superadmin_password,
+            "correo": configuracion.correo_superadmin_inicial,
+            "contrasena": configuracion.contrasena_superadmin_inicial,
         },
     )
-    assert login_res.status_code == 200
-    token = login_res.json()["access_token"]
-    client.headers.update({"Authorization": f"Bearer {token}"})
-    return client, TestingSessionLocal, fake_engine, tmp_path
+    assert respuesta_login.status_code == 200
+    token = respuesta_login.json()["token_acceso"]
+    cliente.headers.update({"Authorization": f"Bearer {token}"})
+    return cliente, FabricaSesionesPrueba, motor_simulado, ruta_temporal
