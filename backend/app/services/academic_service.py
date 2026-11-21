@@ -16,6 +16,7 @@ from app.models import (
     PersonGroup,
     Subject,
     User,
+    WorkShift,
 )
 from app.schemas import (
     AcademicStatsResponse,
@@ -199,6 +200,10 @@ def serialize_sessions_batch(
         c.id: c.name
         for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
     }
+    shift_map = {
+        sh.id: sh
+        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
+    }
 
     course_ids = [s.course_assignment_id for s in sessions if s.course_assignment_id is not None]
     course_map: dict[int, CourseAssignment] = {}
@@ -218,6 +223,7 @@ def serialize_sessions_batch(
     for s in sessions:
         group = group_map.get(s.group_id) if s.group_id else None
         course = course_map.get(s.course_assignment_id) if s.course_assignment_id else None
+        shift = shift_map.get(s.work_shift_id) if s.work_shift_id else None
         career_id = group.career_id if group else (course.group.career_id if course and course.group else None)
         if career_id is None and course and course.subject:
             career_id = course.subject.career_id
@@ -230,6 +236,10 @@ def serialize_sessions_batch(
                 group_name=group.name if group else (course.group.name if course and course.group else None),
                 course_assignment_id=s.course_assignment_id,
                 schedule_id=s.schedule_id,
+                work_shift_id=s.work_shift_id,
+                work_shift_name=shift.name if shift else None,
+                work_shift_code=shift.code if shift else None,
+                work_shift_crosses_midnight=shift.crosses_midnight if shift else False,
                 subject_name=course.subject.name if course and course.subject else None,
                 subject_code=course.subject.code if course and course.subject else None,
                 career_name=career_map.get(career_id) if career_id else None,
