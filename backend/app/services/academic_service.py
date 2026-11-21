@@ -134,7 +134,11 @@ def serialize_courses_batch(
         )
         career_id = c.group.career_id if c.group else None
         career = career_map.get(career_id) if career_id else None
-        effective_period = (career.period_type if career and career.period_type else None) or org_period_type
+        effective_period = (
+            (c.group.period_type if c.group else None)
+            or (career.period_type if career and career.period_type else None)
+            or org_period_type
+        )
         result.append(
             CourseAssignmentRead(
                 id=c.id,
@@ -658,7 +662,9 @@ def compute_academic_stats(
         cid = course.group.career_id if course.group else None
         career_obj = career_obj_map.get(cid) if cid else None
         subj_period_type = (
-            career_obj.period_type if career_obj and career_obj.period_type else org_period_type
+            (course.group.period_type if course.group else None)
+            or (career_obj.period_type if career_obj and career_obj.period_type else None)
+            or org_period_type
         )
 
         by_subject.append(
@@ -745,7 +751,9 @@ def compute_academic_stats(
 
         grp_career = career_obj_map.get(g.career_id) if g.career_id else None
         grp_period_type = (
-            grp_career.period_type if grp_career and grp_career.period_type else org_period_type
+            g.period_type
+            or (grp_career.period_type if grp_career and grp_career.period_type else None)
+            or org_period_type
         )
         by_group.append(
             GroupAttendanceStat(
