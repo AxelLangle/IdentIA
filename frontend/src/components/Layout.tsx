@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import {
   Activity,
   BookOpen,
+  Briefcase,
   Building2,
   CalendarClock,
   GraduationCap,
@@ -19,6 +20,7 @@ export type NavTab =
   | "enrollment"
   | "sessions"
   | "academic"
+  | "enterprise_shifts"
   | "teacher_portal"
   | "security";
 
@@ -54,6 +56,7 @@ export function Layout({
 }: LayoutProps) {
   const canViewSecurity = currentUser.role === "superadmin" || currentUser.role === "org_admin";
   const isEducation = selectedOrg?.mode === "education";
+  const isEnterprise = selectedOrg?.mode === "enterprise";
   const isTeacher = currentUser.role === "teacher";
 
   const navItems: { id: NavTab; label: string; icon: typeof LayoutDashboard; visible: boolean }[] = [
@@ -71,6 +74,12 @@ export function Layout({
       label: "Estructura Académica",
       icon: GraduationCap,
       visible: isEducation && canViewSecurity,
+    },
+    {
+      id: "enterprise_shifts",
+      label: "Turnos y Jornadas",
+      icon: Briefcase,
+      visible: isEnterprise && canViewSecurity,
     },
     {
       id: "sessions",
