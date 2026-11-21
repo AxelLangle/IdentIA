@@ -37,7 +37,7 @@ router = APIRouter(prefix="/api/enterprise", tags=["enterprise"])
 def list_work_shifts(
     organization_id: int | None = Query(default=None),
     is_active: bool | None = Query(default=None),
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> list[WorkShiftRead]:
     scoped_org_id = resolve_org_scope(current_user, organization_id)
@@ -260,7 +260,7 @@ def assign_work_shift_persons(
 def start_shift_session(
     shift_id: int,
     payload: StartShiftSessionRequest | None = Body(default=None),
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> SessionRead:
     shift = db.get(WorkShift, shift_id)
@@ -278,7 +278,7 @@ def start_shift_session(
 @router.post("/sessions/generate", response_model=GenerateSessionsResponse)
 def generate_enterprise_sessions(
     payload: GenerateShiftSessionsRequest,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "operator")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
     db: Session = Depends(get_db),
 ) -> GenerateSessionsResponse:
     scoped_org_id = resolve_org_scope(current_user, payload.organization_id)
@@ -308,7 +308,7 @@ def get_enterprise_stats(
     date_to: date | None = Query(default=None),
     work_shift_id: int | None = Query(default=None),
     group_id: int | None = Query(default=None),
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
+    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor")),
     db: Session = Depends(get_db),
 ) -> EnterpriseStatsResponse:
     scoped_org_id = resolve_org_scope(current_user, organization_id)
