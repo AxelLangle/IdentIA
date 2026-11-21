@@ -499,9 +499,9 @@ def test_alembic_0002_recovers_from_partial_create_all(
             rev = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
         verify_engine.dispose()
 
-        assert rev == "0004_enterprise_work_shifts"
+        assert rev == "0005_group_period_type"
         assert "work_shifts" in table_names
-        assert {"career_id", "semester", "default_classroom", "default_work_shift_id"}.issubset(group_cols)
+        assert {"career_id", "semester", "period_type", "default_classroom", "default_work_shift_id"}.issubset(group_cols)
         assert "work_shift_id" in person_cols
         assert {"course_assignment_id", "schedule_id", "work_shift_id"}.issubset(session_cols)
     finally:
@@ -622,3 +622,167 @@ def test_academic_periods_default_classroom_and_multi_day_schedules(raw_api_clie
     assert s_data["by_subject"][0]["period_type"] == "cuatrimestral"
     g_match = next(item for item in s_data["by_group"] if item["group_id"] == group.json()["id"])
     assert g_match["period_type"] == "cuatrimestral"
+
+
+def test_period_type_change_requires_admin_password_and_group_override(
+    raw_api_client, tmp_path: Path, monkeypatch
+) -> None:
+    """Valida tipo de periodo propio por grupo, autorización con clave admin y migración 0005."""
+    client, _, _, _ = raw_api_client
+    settings = get_settings()
+    sa_headers = _auth_header(
+        client,
+        settings.bootstrap_superadmin_email,
+        settings.bootstrap_superadmin_password,
+    )
+
+    school = client.post(
+        "/api/organizations",
+        headers=sa_headers,
+        json={
+            "name": "Instituto Norte",
+            "mode": "education",
+            "academic_period_type": "semestral",
+            "admin_user": {
+                "full_name": "Admin Norte",
+                "email": "admin@norte.edu",
+                "password": "NorteAdmin99!",
+            },
+        },
+    ).json()
+    org_id = school["id"]
+    admin_headers = _auth_header(client, "admin@norte.edu", "NorteAdmin99!")
+
+    career = client.post(
+        "/api/academic/careers",
+        headers=admin_headers,
+        json={"organization_id": org_id, "name": "Sistemas", "code": "SIS"},
+    ).json()
+
+    grp = client.post(
+        "/api/groups",
+        headers=admin_headers,
+        json={
+            "organization_id": org_id,
+            "name": "301 SIS",
+            "code": "301-SIS",
+            "career_id": career["id"],
+            "semester": "3",
+            "default_classroom": "B-12",
+        },
+    ).json()
+    assert grp["period_type"] == "semestral"
+    assert grp["custom_period_type"] is None
+
+    # Editar aula fija o número sin cambiar tipo de periodo NO exige contraseña
+    edit_no_period = client.patch(
+        f"/api/groups/{grp['id']}",
+        headers=admin_headers,
+        json={"semester": "6", "default_classroom": "B-14"},
+    )
+    assert edit_no_period.status_code == 200, edit_no_period.text
+    assert edit_no_period.json()["default_classroom"] == "B-14"
+
+    # Cambiar tipo de periodo de grupo sin contraseña -> 400
+    grp_no_pass = client.patch(
+        f"/api/groups/{grp['id']}",
+        headers=admin_headers,
+        json={"period_type": "cuatrimestral"},
+    )
+    assert grp_no_pass.status_code == 400
+
+    # Contraseña incorrecta -> 403
+    grp_bad_pass = client.patch(
+        f"/api/groups/{grp['id']}",
+        headers=admin_headers,
+        json={"period_type": "cuatrimestral", "authorization_secret": "WrongPass!"},
+    )
+    assert grp_bad_pass.status_code == 403
+
+    # Contraseña válida de admin -> 200 y prioridad grupo > carrera > institución
+    grp_ok = client.patch(
+        f"/api/groups/{grp['id']}",
+        headers=admin_headers,
+        json={"period_type": "cuatrimestral", "authorization_secret": "NorteAdmin99!"},
+    )
+    assert grp_ok.status_code == 200, grp_ok.text
+    assert grp_ok.json()["custom_period_type"] == "cuatrimestral"
+    assert grp_ok.json()["period_type"] == "cuatrimestral"
+
+    # Carrera y organización también exigen contraseña admin al cambiar tipo de periodo
+    assert (
+        client.patch(
+            f"/api/academic/careers/{career['id']}",
+            headers=admin_headers,
+            json={"period_type": "trimestral"},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.patch(
+            f"/api/academic/careers/{career['id']}",
+            headers=admin_headers,
+            json={"period_type": "trimestral", "authorization_secret": "WrongPass"},
+        ).status_code
+        == 403
+    )
+    career_ok = client.patch(
+        f"/api/academic/careers/{career['id']}",
+        headers=admin_headers,
+        json={"period_type": "trimestral", "authorization_secret": "NorteAdmin99!"},
+    )
+    assert career_ok.status_code == 200
+    assert career_ok.json()["effective_period_type"] == "trimestral"
+
+    assert (
+        client.patch(
+            f"/api/organizations/{org_id}",
+            headers=admin_headers,
+            json={"academic_period_type": "bimestral"},
+        ).status_code
+        == 400
+    )
+    org_ok = client.patch(
+        f"/api/organizations/{org_id}",
+        headers=admin_headers,
+        json={"academic_period_type": "bimestral", "authorization_secret": "NorteAdmin99!"},
+    )
+    assert org_ok.status_code == 200
+    assert org_ok.json()["academic_period_type"] == "bimestral"
+
+    # Estadísticas reflejan el override propio del grupo ("cuatrimestral")
+    stats = client.get("/api/academic/stats", headers=admin_headers).json()
+    grp_stat = next(g for g in stats["by_group"] if g["group_id"] == grp["id"])
+    assert grp_stat["period_type"] == "cuatrimestral"
+
+    # Bitácora de auditoría registró los tres cambios de periodo
+    logs = client.get(f"/api/security/audit-logs?organization_id={org_id}", headers=admin_headers).json()
+    actions = {entry["action"] for entry in logs}
+    assert {
+        "change_group_period_type",
+        "change_career_period_type",
+        "change_org_period_type",
+    }.issubset(actions)
+
+    # Ciclo Alembic 0005 -> downgrade 0004 -> upgrade head
+    db_file = tmp_path / "alembic_0005.db"
+    db_url = f"sqlite:///{db_file.as_posix()}"
+    monkeypatch.setenv("IDENTIA_DATABASE_URL", db_url)
+    get_settings.cache_clear()
+    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    try:
+        command.upgrade(cfg, "head")
+        command.downgrade(cfg, "0004_enterprise_work_shifts")
+        eng_down = create_db_engine(db_url)
+        cols_down = {c["name"] for c in inspect(eng_down).get_columns("groups")}
+        eng_down.dispose()
+        assert "period_type" not in cols_down
+
+        command.upgrade(cfg, "head")
+        eng_up = create_db_engine(db_url)
+        cols_up = {c["name"] for c in inspect(eng_up).get_columns("groups")}
+        eng_up.dispose()
+        assert "period_type" in cols_up
+    finally:
+        get_settings.cache_clear()
