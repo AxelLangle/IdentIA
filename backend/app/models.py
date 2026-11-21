@@ -45,6 +45,9 @@ class Organization(Base):
     course_assignments: Mapped[list["CourseAssignment"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
+    work_shifts: Mapped[list["WorkShift"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
     users: Mapped[list["User"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
@@ -93,6 +96,9 @@ class Group(Base):
     career_id: Mapped[int | None] = mapped_column(
         ForeignKey("careers.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    default_work_shift_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_shifts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     code: Mapped[str] = mapped_column(String(40), nullable=False)
     semester: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -103,6 +109,9 @@ class Group(Base):
 
     organization: Mapped["Organization"] = relationship(back_populates="groups")
     career: Mapped["Career | None"] = relationship(back_populates="groups")
+    default_work_shift: Mapped["WorkShift | None"] = relationship(
+        foreign_keys=[default_work_shift_id]
+    )
     person_links: Mapped[list["PersonGroup"]] = relationship(
         back_populates="group", cascade="all, delete-orphan"
     )
@@ -184,6 +193,30 @@ class ClassSchedule(Base):
     course_assignment: Mapped["CourseAssignment"] = relationship(back_populates="schedules")
 
 
+class WorkShift(Base):
+    __tablename__ = "work_shifts"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "code", name="uq_work_shift_org_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    code: Mapped[str] = mapped_column(String(40), nullable=False)
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    crosses_midnight: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    days_of_week: Mapped[str] = mapped_column(String(30), nullable=False, default="0,1,2,3,4")
+    late_tolerance_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    early_exit_tolerance_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
+
+    organization: Mapped["Organization"] = relationship(back_populates="work_shifts")
+
+
 class Person(Base):
     __tablename__ = "persons"
     __table_args__ = (
@@ -193,6 +226,9 @@ class Person(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     organization_id: Mapped[int] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    work_shift_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_shifts.id", ondelete="SET NULL"), nullable=True, index=True
     )
     external_id: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
     full_name: Mapped[str] = mapped_column(String(160), nullable=False)
@@ -205,6 +241,7 @@ class Person(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive)
 
     organization: Mapped["Organization"] = relationship(back_populates="persons")
+    work_shift: Mapped["WorkShift | None"] = relationship(foreign_keys=[work_shift_id])
     group_links: Mapped[list["PersonGroup"]] = relationship(
         back_populates="person", cascade="all, delete-orphan"
     )
@@ -268,6 +305,9 @@ class AttendanceSession(Base):
     schedule_id: Mapped[int | None] = mapped_column(
         ForeignKey("class_schedules.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    work_shift_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_shifts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     session_date: Mapped[date] = mapped_column(Date, nullable=False)
     session_type: Mapped[str] = mapped_column(String(20), nullable=False, default="workday")
@@ -280,6 +320,7 @@ class AttendanceSession(Base):
     group: Mapped["Group | None"] = relationship(back_populates="sessions")
     course_assignment: Mapped["CourseAssignment | None"] = relationship()
     schedule: Mapped["ClassSchedule | None"] = relationship()
+    work_shift: Mapped["WorkShift | None"] = relationship(foreign_keys=[work_shift_id])
     events: Mapped[list["AttendanceEvent"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
@@ -295,15 +336,22 @@ class AttendanceEvent(Base):
     person_id: Mapped[int] = mapped_column(
         ForeignKey("persons.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    work_shift_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_shifts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     event_type: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="on_time")
     confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    worked_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    late_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    early_exit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     capture_mode: Mapped[str] = mapped_column(String(30), nullable=False, default="kiosk_individual")
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now_naive, index=True)
     notes: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     session: Mapped["AttendanceSession"] = relationship(back_populates="events")
     person: Mapped["Person"] = relationship(back_populates="attendance_events")
+    work_shift: Mapped["WorkShift | None"] = relationship(foreign_keys=[work_shift_id])
 
 
 class User(Base):
