@@ -9,6 +9,7 @@ import {
 import { AcademicPage } from "./pages/AcademicPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { EnrollmentPage } from "./pages/EnrollmentPage";
+import { EnterpriseShiftsPage } from "./pages/EnterpriseShiftsPage";
 import { KioskPage } from "./pages/KioskPage";
 import { LoginPage } from "./pages/LoginPage";
 import { SecurityPage } from "./pages/SecurityPage";
@@ -92,6 +93,8 @@ export function App() {
           setActiveTab((prev) =>
             prev === "academic" || prev === "teacher_portal" ? "dashboard" : prev
           );
+        } else if (targetOrg?.mode === "education") {
+          setActiveTab((prev) => (prev === "enterprise_shifts" ? "dashboard" : prev));
         }
         if (targetId !== null) {
           await loadOrgData(targetId);
@@ -153,6 +156,8 @@ export function App() {
       );
     } else if (currentUser?.role === "teacher" && targetOrg?.mode === "education") {
       setActiveTab("teacher_portal");
+    } else if (targetOrg?.mode === "education") {
+      setActiveTab((prev) => (prev === "enterprise_shifts" ? "dashboard" : prev));
     }
     await loadOrgData(orgId);
   };
@@ -270,6 +275,18 @@ export function App() {
                 currentUser={currentUser}
                 organization={selectedOrg}
                 groups={groups}
+                onRefreshOrg={refreshCurrentOrg}
+                onOpenSessionInKiosk={handleOpenSessionInKiosk}
+              />
+            )}
+          {activeTab === "enterprise_shifts" &&
+            selectedOrg.mode === "enterprise" &&
+            (currentUser.role === "superadmin" || currentUser.role === "org_admin") && (
+              <EnterpriseShiftsPage
+                currentUser={currentUser}
+                organization={selectedOrg}
+                groups={groups}
+                persons={persons}
                 onRefreshOrg={refreshCurrentOrg}
                 onOpenSessionInKiosk={handleOpenSessionInKiosk}
               />
