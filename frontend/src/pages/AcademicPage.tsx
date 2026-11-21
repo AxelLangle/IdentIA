@@ -9,15 +9,18 @@ import {
   Clock,
   GraduationCap,
   Layers,
+  Lock,
   Pencil,
   Plus,
   ScanFace,
   Trash2,
   X,
 } from "lucide-react";
+import { PasswordInput } from "../components/PasswordInput";
 import {
   ACADEMIC_PERIOD_OPTIONS,
   comparePeriodsNatural,
+  formatGroupPeriodLabel,
   getPeriodMeta,
 } from "../lib/academicPeriods";
 import { api } from "../lib/api";
@@ -50,6 +53,29 @@ interface PendingScheduleDraft {
   end_time: string;
   classroom: string;
 }
+
+type PendingPeriodChange =
+  | {
+      scope: "organization";
+      nextPeriodType: AcademicPeriodType;
+      summary: string;
+    }
+  | {
+      scope: "career";
+      careerId: number;
+      careerName: string;
+      nextPeriodType: string;
+      summary: string;
+    }
+  | {
+      scope: "group";
+      groupId: number;
+      groupName: string;
+      nextPeriodType: string;
+      semester: string | null;
+      classroom: string | null;
+      summary: string;
+    };
 
 const WEEKDAYS = [
   { value: 0, short: "Lun", mini: "L", label: "Lunes" },
@@ -97,7 +123,6 @@ export function AcademicPage({
   const [orgPeriodType, setOrgPeriodType] = useState<AcademicPeriodType>(
     organization.academic_period_type ?? "semestral"
   );
-  const [savingOrgPeriod, setSavingOrgPeriod] = useState(false);
 
   // Alta de carrera
   const [careerName, setCareerName] = useState("");
@@ -110,12 +135,20 @@ export function AcademicPage({
   const [groupCode, setGroupCode] = useState("");
   const [groupCareerId, setGroupCareerId] = useState<string>("");
   const [groupSemester, setGroupSemester] = useState("");
+  const [groupPeriodType, setGroupPeriodType] = useState<string>("");
   const [groupDefaultClassroom, setGroupDefaultClassroom] = useState("");
 
   // Edición rápida de grupo (aula fija / periodo)
   const [editingGroupId, setEditingGroupId] = useState<number | null>(null);
   const [editGroupSemester, setEditGroupSemester] = useState("");
+  const [editGroupPeriodType, setEditGroupPeriodType] = useState<string>("");
   const [editGroupClassroom, setEditGroupClassroom] = useState("");
+
+  // Autorización de administrador para cambiar tipo de periodo
+  const [pendingPeriodChange, setPendingPeriodChange] = useState<PendingPeriodChange | null>(null);
+  const [periodAuthSecret, setPeriodAuthSecret] = useState("");
+  const [periodAuthError, setPeriodAuthError] = useState<string | null>(null);
+  const [periodAuthSubmitting, setPeriodAuthSubmitting] = useState(false);
 
   // Alta de asignatura
   const [subjectName, setSubjectName] = useState("");
@@ -201,24 +234,22 @@ export function AcademicPage({
     }
   }, [subTab, loadStats]);
 
-  async function handleSaveOrgPeriod(e: FormEvent) {
+  function requestOrganizationPeriodChange(e: FormEvent) {
     e.preventDefault();
-    setSavingOrgPeriod(true);
     setErrorMsg(null);
     setStatusMsg(null);
-    try {
-      await api.updateOrganization(organization.id, {
-        academic_period_type: orgPeriodType,
-      });
-      await Promise.all([onRefreshOrg(), loadAcademicData()]);
-      setStatusMsg(
-        `Periodo académico general actualizado a ${getPeriodMeta(orgPeriodType).label}.`
-      );
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo guardar el periodo general.");
-    } finally {
-      setSavingOrgPeriod(false);
+    const currentOrgPeriod = organization.academic_period_type ?? "semestral";
+    if (orgPeriodType === currentOrgPeriod) {
+      setStatusMsg(`El periodo general actual ya es ${getPeriodMeta(orgPeriodType).label}.`);
+      return;
     }
+    setPeriodAuthSecret("");
+    setPeriodAuthError(null);
+    setPendingPeriodChange({
+      scope: "organization",
+      nextPeriodType: orgPeriodType,
+      summary: `Institución "${organization.name}": ${getPeriodMeta(currentOrgPeriod).label} → ${getPeriodMeta(orgPeriodType).label}`,
+    });
   }
 
   async function handleCreateCareer(e: FormEvent) {
@@ -244,15 +275,68 @@ export function AcademicPage({
     }
   }
 
-  async function handleUpdateCareerPeriod(careerId: number, value: string) {
+  function requestCareerPeriodChange(career: Career, nextValue: string) {
+    const currentVal = career.period_type ?? "";
+    if (nextValue === currentVal) return;
     setErrorMsg(null);
+    setStatusMsg(null);
+    const nextLabel = nextValue
+      ? getPeriodMeta(nextValue).label
+      : `Heredar general (${getPeriodMeta(organization.academic_period_type).label})`;
+    setPeriodAuthSecret("");
+    setPeriodAuthError(null);
+    setPendingPeriodChange({
+      scope: "career",
+      careerId: career.id,
+      careerName: career.name,
+      nextPeriodType: nextValue,
+      summary: `Carrera "${career.name}": ${getPeriodMeta(career.effective_period_type).label} → ${nextLabel}`,
+    });
+  }
+
+  async function handleConfirmPeriodChange(e: FormEvent) {
+    e.preventDefault();
+    if (!pendingPeriodChange) return;
+    setPeriodAuthError(null);
+    setPeriodAuthSubmitting(true);
     try {
-      await api.updateCareer(careerId, {
-        period_type: value ? (value as AcademicPeriodType) : null,
-      });
-      await Promise.all([loadAcademicData(), onRefreshOrg()]);
+      if (pendingPeriodChange.scope === "organization") {
+        await api.updateOrganization(organization.id, {
+          academic_period_type: pendingPeriodChange.nextPeriodType,
+          authorization_secret: periodAuthSecret,
+        });
+        setStatusMsg(
+          `Periodo académico general actualizado a ${getPeriodMeta(pendingPeriodChange.nextPeriodType).label}.`
+        );
+      } else if (pendingPeriodChange.scope === "career") {
+        await api.updateCareer(pendingPeriodChange.careerId, {
+          period_type: pendingPeriodChange.nextPeriodType
+            ? (pendingPeriodChange.nextPeriodType as AcademicPeriodType)
+            : null,
+          authorization_secret: periodAuthSecret,
+        });
+        setStatusMsg(`Tipo de periodo de "${pendingPeriodChange.careerName}" actualizado.`);
+      } else {
+        await api.updateGroup(pendingPeriodChange.groupId, {
+          semester: pendingPeriodChange.semester,
+          default_classroom: pendingPeriodChange.classroom,
+          period_type: pendingPeriodChange.nextPeriodType
+            ? (pendingPeriodChange.nextPeriodType as AcademicPeriodType)
+            : null,
+          authorization_secret: periodAuthSecret,
+        });
+        setEditingGroupId(null);
+        setStatusMsg(`Tipo de periodo de "${pendingPeriodChange.groupName}" actualizado.`);
+      }
+      setPendingPeriodChange(null);
+      setPeriodAuthSecret("");
+      await Promise.all([onRefreshOrg(), loadAcademicData()]);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo actualizar el periodo.");
+      setPeriodAuthError(
+        err instanceof Error ? err.message : "No se pudo autorizar el cambio de periodo."
+      );
+    } finally {
+      setPeriodAuthSubmitting(false);
     }
   }
 
@@ -277,6 +361,7 @@ export function AcademicPage({
         code: groupCode.trim(),
         career_id: groupCareerId ? Number(groupCareerId) : null,
         semester: groupSemester.trim() || null,
+        period_type: groupPeriodType ? (groupPeriodType as AcademicPeriodType) : null,
         default_classroom: groupDefaultClassroom.trim() || null,
         schedule_start: "07:00",
         schedule_end: "15:00",
@@ -284,6 +369,7 @@ export function AcademicPage({
       setGroupName("");
       setGroupCode("");
       setGroupSemester("");
+      setGroupPeriodType("");
       setGroupDefaultClassroom("");
       setStatusMsg("Grupo académico creado.");
       await Promise.all([onRefreshOrg(), loadAcademicData()]);
@@ -295,15 +381,38 @@ export function AcademicPage({
   function startEditGroup(g: Group) {
     setEditingGroupId(g.id);
     setEditGroupSemester(g.semester ?? "");
+    setEditGroupPeriodType(g.custom_period_type ?? "");
     setEditGroupClassroom(g.default_classroom ?? "");
   }
 
-  async function handleSaveGroupEdit(groupId: number) {
+  async function handleSaveGroupEdit(group: Group) {
     setErrorMsg(null);
+    const currentCustom = group.custom_period_type ?? "";
+    const trimmedSemester = editGroupSemester.trim() || null;
+    const trimmedClassroom = editGroupClassroom.trim() || null;
+
+    if (editGroupPeriodType !== currentCustom) {
+      const nextLabel = editGroupPeriodType
+        ? getPeriodMeta(editGroupPeriodType).label
+        : "Heredar de carrera/institución";
+      setPeriodAuthSecret("");
+      setPeriodAuthError(null);
+      setPendingPeriodChange({
+        scope: "group",
+        groupId: group.id,
+        groupName: group.name,
+        nextPeriodType: editGroupPeriodType,
+        semester: trimmedSemester,
+        classroom: trimmedClassroom,
+        summary: `Grupo "${group.name}": ${getPeriodMeta(group.period_type).label} → ${nextLabel}`,
+      });
+      return;
+    }
+
     try {
-      await api.updateGroup(groupId, {
-        semester: editGroupSemester.trim() || null,
-        default_classroom: editGroupClassroom.trim() || null,
+      await api.updateGroup(group.id, {
+        semester: trimmedSemester,
+        default_classroom: trimmedClassroom,
       });
       setEditingGroupId(null);
       await Promise.all([onRefreshOrg(), loadAcademicData()]);
@@ -569,7 +678,7 @@ export function AcademicPage({
 
   const selectedCareerForNewGroup = careers.find((c) => String(c.id) === groupCareerId);
   const newGroupPeriodMeta = getPeriodMeta(
-    selectedCareerForNewGroup?.effective_period_type ?? orgPeriodType
+    groupPeriodType || selectedCareerForNewGroup?.effective_period_type || orgPeriodType
   );
   const orgPeriodMeta = getPeriodMeta(orgPeriodType);
 
@@ -683,13 +792,18 @@ export function AcademicPage({
             <div className="space-y-6">
               {/* Periodo general de la institución */}
               <form
-                onSubmit={handleSaveOrgPeriod}
+                onSubmit={requestOrganizationPeriodChange}
                 className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4"
               >
                 <div>
-                  <h3 className="font-semibold text-sm">Periodo académico general de la institución</h3>
+                  <h3 className="font-semibold text-sm flex items-center gap-1.5">
+                    Periodo académico general de la institución
+                    <span title="Requiere contraseña de administrador para cambiar">
+                      <Lock className="w-3.5 h-3.5 text-amber-400" />
+                    </span>
+                  </h3>
                   <p className="text-xs text-slate-400">
-                    Se hereda por defecto en carreras y grupos (cada carrera puede sobrescribirlo si maneja otro sistema).
+                    Se hereda por defecto en carreras y grupos (cada carrera o grupo puede usar otro sistema; cambiarlo requiere contraseña admin).
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -706,10 +820,10 @@ export function AcademicPage({
                   </select>
                   <button
                     type="submit"
-                    disabled={savingOrgPeriod}
-                    className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-semibold"
+                    disabled={orgPeriodType === (organization.academic_period_type ?? "semestral")}
+                    className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-semibold"
                   >
-                    {savingOrgPeriod ? "Guardando..." : "Guardar periodo"}
+                    Cambiar periodo
                   </button>
                 </div>
               </form>
@@ -795,7 +909,7 @@ export function AcademicPage({
                       className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
                     />
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
                     <select
                       value={groupCareerId}
                       onChange={(e) => setGroupCareerId(e.target.value)}
@@ -805,6 +919,21 @@ export function AcademicPage({
                       {careers.map((c) => (
                         <option key={c.id} value={c.id}>
                           {c.name} ({c.code})
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={groupPeriodType}
+                      onChange={(e) => setGroupPeriodType(e.target.value)}
+                      className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                      title="Tipo de periodo del grupo"
+                    >
+                      <option value="">
+                        Heredar ({getPeriodMeta(selectedCareerForNewGroup?.effective_period_type ?? orgPeriodType).label})
+                      </option>
+                      {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
                         </option>
                       ))}
                     </select>
@@ -876,12 +1005,12 @@ export function AcademicPage({
                             <select
                               value={career.period_type ?? ""}
                               onChange={(e) =>
-                                void handleUpdateCareerPeriod(career.id, e.target.value)
+                                requestCareerPeriodChange(career, e.target.value)
                               }
                               className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-xs"
-                              title="Tipo de periodo de esta carrera"
+                              title="Tipo de periodo de esta carrera (requiere contraseña de administrador)"
                             >
-                              <option value="">Usar general ({orgPeriodMeta.label})</option>
+                              <option value="">Usar general ({getPeriodMeta(organization.academic_period_type).label})</option>
                               {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
                                 <option key={opt.value} value={opt.value}>
                                   {opt.label}
@@ -905,76 +1034,105 @@ export function AcademicPage({
                           </p>
                         ) : (
                           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                            {careerGroups.map((g) => (
-                              <div
-                                key={g.id}
-                                className="rounded-xl bg-slate-800/60 border border-slate-700/70 p-3.5 space-y-2"
-                              >
-                                <div className="flex items-start justify-between gap-2">
-                                  <div>
-                                    <p className="text-sm font-semibold">
-                                      {g.name}{" "}
-                                      <span className="text-xs font-normal text-slate-400">
-                                        ({g.code})
-                                      </span>
-                                    </p>
-                                    <p className="text-xs text-slate-400 mt-0.5">
-                                      {g.semester ? `${g.semester} · ` : ""}
-                                      {g.default_classroom ? `${g.default_classroom} · ` : ""}
-                                      {g.members_count} alumnos · {g.courses_count} materias
-                                    </p>
+                            {careerGroups.map((g) => {
+                              const gMeta = getPeriodMeta(g.period_type);
+                              const formattedPeriod = formatGroupPeriodLabel(g.semester, g.period_type);
+                              return (
+                                <div
+                                  key={g.id}
+                                  className="rounded-xl bg-slate-800/60 border border-slate-700/70 p-3.5 space-y-2"
+                                >
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div>
+                                      <p className="text-sm font-semibold">
+                                        {g.name}{" "}
+                                        <span className="text-xs font-normal text-slate-400">
+                                          ({g.code})
+                                        </span>
+                                      </p>
+                                      <p className="text-xs text-slate-400 mt-0.5">
+                                        {formattedPeriod ? (
+                                          <span className="text-indigo-300 font-medium">
+                                            {formattedPeriod}
+                                            {g.custom_period_type ? " (propio)" : ""} ·{" "}
+                                          </span>
+                                        ) : (
+                                          <span>
+                                            {gMeta.label}
+                                            {g.custom_period_type ? " (propio)" : ""} ·{" "}
+                                          </span>
+                                        )}
+                                        {g.default_classroom ? `${g.default_classroom} · ` : ""}
+                                        {g.members_count} alumnos · {g.courses_count} materias
+                                      </p>
+                                    </div>
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          editingGroupId === g.id
+                                            ? setEditingGroupId(null)
+                                            : startEditGroup(g)
+                                        }
+                                        className="p-1 text-slate-500 hover:text-indigo-300"
+                                        title="Editar periodo, tipo de periodo y aula fija"
+                                      >
+                                        <Pencil className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => void handleDeleteGroup(g.id)}
+                                        className="p-1 text-slate-500 hover:text-red-400"
+                                        title="Eliminar grupo"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
                                   </div>
-                                  <div className="flex items-center gap-1">
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        editingGroupId === g.id
-                                          ? setEditingGroupId(null)
-                                          : startEditGroup(g)
-                                      }
-                                      className="p-1 text-slate-500 hover:text-indigo-300"
-                                      title="Editar periodo y aula fija"
-                                    >
-                                      <Pencil className="w-3.5 h-3.5" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => void handleDeleteGroup(g.id)}
-                                      className="p-1 text-slate-500 hover:text-red-400"
-                                      title="Eliminar grupo"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  </div>
-                                </div>
 
-                                {editingGroupId === g.id && (
-                                  <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-700/60">
-                                    <input
-                                      type="text"
-                                      value={editGroupSemester}
-                                      onChange={(e) => setEditGroupSemester(e.target.value)}
-                                      placeholder={cMeta.singular}
-                                      className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
-                                    />
-                                    <input
-                                      type="text"
-                                      value={editGroupClassroom}
-                                      onChange={(e) => setEditGroupClassroom(e.target.value)}
-                                      placeholder="Aula fija (ej. Aula 33)"
-                                      className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
-                                    />
-                                    <button
-                                      type="button"
-                                      onClick={() => void handleSaveGroupEdit(g.id)}
-                                      className="col-span-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold"
-                                    >
-                                      Guardar cambios
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            ))}
+                                  {editingGroupId === g.id && (
+                                    <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-700/60">
+                                      <select
+                                        value={editGroupPeriodType}
+                                        onChange={(e) => setEditGroupPeriodType(e.target.value)}
+                                        className="col-span-2 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                        title="Cambiar tipo de periodo requiere contraseña de administrador"
+                                      >
+                                        <option value="">Heredar de carrera/institución</option>
+                                        {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                                          <option key={opt.value} value={opt.value}>
+                                            {opt.label}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <input
+                                        type="text"
+                                        value={editGroupSemester}
+                                        onChange={(e) => setEditGroupSemester(e.target.value)}
+                                        placeholder={`Núm. (${getPeriodMeta(editGroupPeriodType || g.period_type).prefix} ...)`}
+                                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                      />
+                                      <input
+                                        type="text"
+                                        value={editGroupClassroom}
+                                        onChange={(e) => setEditGroupClassroom(e.target.value)}
+                                        placeholder="Aula fija (ej. Aula 33)"
+                                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => void handleSaveGroupEdit(g)}
+                                        className="col-span-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold"
+                                      >
+                                        {editGroupPeriodType !== (g.custom_period_type ?? "")
+                                          ? "Continuar (requiere clave admin)"
+                                          : "Guardar cambios"}
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
                           </div>
                         )}
                       </div>
@@ -988,35 +1146,101 @@ export function AcademicPage({
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                       {groups
                         .filter((g) => g.career_id === null)
-                        .map((g) => (
-                          <div
-                            key={g.id}
-                            className="rounded-xl bg-slate-800/50 border border-slate-700/60 p-3 flex flex-wrap items-center justify-between gap-2"
-                          >
-                            <div>
-                              <p className="text-sm font-medium">
-                                {g.name} <span className="text-xs text-slate-400">({g.code})</span>
-                              </p>
-                              <p className="text-xs text-slate-400">
-                                {g.semester ? `${g.semester} · ` : ""}
-                                {g.default_classroom ? `${g.default_classroom} · ` : ""}
-                                {g.members_count} alumnos · {g.courses_count} materias
-                              </p>
-                            </div>
-                            <select
-                              defaultValue=""
-                              onChange={(e) => void handleLinkGroupCareer(g.id, e.target.value)}
-                              className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs"
+                        .map((g) => {
+                          const gMeta = getPeriodMeta(g.period_type);
+                          const formattedPeriod = formatGroupPeriodLabel(g.semester, g.period_type);
+                          return (
+                            <div
+                              key={g.id}
+                              className="rounded-xl bg-slate-800/50 border border-slate-700/60 p-3 space-y-2"
                             >
-                              <option value="">Asignar carrera...</option>
-                              {careers.map((c) => (
-                                <option key={c.id} value={c.id}>
-                                  {c.name}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        ))}
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div>
+                                  <p className="text-sm font-medium">
+                                    {g.name} <span className="text-xs text-slate-400">({g.code})</span>
+                                  </p>
+                                  <p className="text-xs text-slate-400">
+                                    {formattedPeriod ? (
+                                      <span className="text-indigo-300 font-medium">
+                                        {formattedPeriod} ·{" "}
+                                      </span>
+                                    ) : (
+                                      <span>{gMeta.label} · </span>
+                                    )}
+                                    {g.default_classroom ? `${g.default_classroom} · ` : ""}
+                                    {g.members_count} alumnos · {g.courses_count} materias
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      editingGroupId === g.id
+                                        ? setEditingGroupId(null)
+                                        : startEditGroup(g)
+                                    }
+                                    className="p-1 text-slate-500 hover:text-indigo-300"
+                                    title="Editar periodo, tipo de periodo y aula fija"
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                  <select
+                                    defaultValue=""
+                                    onChange={(e) => void handleLinkGroupCareer(g.id, e.target.value)}
+                                    className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs"
+                                  >
+                                    <option value="">Asignar carrera...</option>
+                                    {careers.map((c) => (
+                                      <option key={c.id} value={c.id}>
+                                        {c.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              </div>
+
+                              {editingGroupId === g.id && (
+                                <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-700/60">
+                                  <select
+                                    value={editGroupPeriodType}
+                                    onChange={(e) => setEditGroupPeriodType(e.target.value)}
+                                    className="col-span-2 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                  >
+                                    <option value="">Heredar de carrera/institución</option>
+                                    {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                                      <option key={opt.value} value={opt.value}>
+                                        {opt.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <input
+                                    type="text"
+                                    value={editGroupSemester}
+                                    onChange={(e) => setEditGroupSemester(e.target.value)}
+                                    placeholder={`Núm. (${getPeriodMeta(editGroupPeriodType || g.period_type).prefix} ...)`}
+                                    className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={editGroupClassroom}
+                                    onChange={(e) => setEditGroupClassroom(e.target.value)}
+                                    placeholder="Aula fija (ej. Aula 33)"
+                                    className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleSaveGroupEdit(g)}
+                                    className="col-span-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold"
+                                  >
+                                    {editGroupPeriodType !== (g.custom_period_type ?? "")
+                                      ? "Continuar (requiere clave admin)"
+                                      : "Guardar cambios"}
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                     </div>
                   </div>
                 )}
@@ -1252,10 +1476,11 @@ export function AcademicPage({
                         type="button"
                         disabled={selectedDays.length === 0}
                         onClick={appendSelectedDaysToPending}
-                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 disabled:opacity-40 text-xs font-medium text-indigo-300"
+                        className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 border border-emerald-400/50 text-white shadow-md shadow-emerald-950/50 ring-1 ring-emerald-400/30 disabled:opacity-40 disabled:shadow-none text-xs font-semibold transition-all"
                         title="Añade estos días para combinar con otros horarios o aulas distintas"
                       >
-                        + Agregar horario(s)
+                        <Plus className="w-3.5 h-3.5 shrink-0" />
+                        Agregar horario(s)
                       </button>
                     </div>
 
@@ -1330,7 +1555,9 @@ export function AcademicPage({
                               <p className="text-xs text-slate-400 mt-1">
                                 Grupo: <strong className="text-slate-200">{course.group_name}</strong>
                                 {course.career_name ? ` · ${course.career_name}` : ""}
-                                {course.semester ? ` · ${course.semester}` : ""}
+                                {course.semester
+                                  ? ` · ${formatGroupPeriodLabel(course.semester, course.period_type)}`
+                                  : ""}
                                 {course.group_default_classroom
                                   ? ` · Aula base: ${course.group_default_classroom}`
                                   : ""}{" "}
@@ -1460,9 +1687,10 @@ export function AcademicPage({
                                 <button
                                   type="button"
                                   onClick={() => void handleAddSchedulesToCourse(course)}
-                                  className="inline-flex items-center justify-center rounded bg-slate-700 hover:bg-indigo-600 text-[11px] font-semibold px-2 py-1"
+                                  className="inline-flex items-center justify-center gap-1 rounded bg-emerald-600 hover:bg-emerald-500 border border-emerald-400/40 text-white text-[11px] font-semibold px-2 py-1 shadow-sm"
                                 >
-                                  + Hora(s)
+                                  <Plus className="w-3 h-3" />
+                                  Hora(s)
                                 </button>
                               </div>
                             </div>
@@ -1611,7 +1839,8 @@ export function AcademicPage({
                                 {row.career_name ?? "—"}
                               </td>
                               <td className="py-2.5 pr-3 text-xs text-slate-300">
-                                {row.semester ?? "—"}
+                                {formatGroupPeriodLabel(row.semester, row.period_type) ??
+                                  getPeriodMeta(row.period_type).label}
                               </td>
                               <td className="py-2.5 pr-3 text-xs font-medium">{row.group_name}</td>
                               <td className="py-2.5 pr-3">
@@ -1703,9 +1932,10 @@ export function AcademicPage({
                                 </p>
                                 <p className="text-xs text-slate-400">
                                   {grp.career_name ?? "Sin carrera"} ·{" "}
-                                  {grp.semester ?? `Sin ${gMeta.singular.toLowerCase()}`} (
-                                  {gMeta.label}) · {grp.subjects_count} materias ·{" "}
-                                  {grp.students_count} alumnos · {grp.total_sessions} sesiones
+                                  {formatGroupPeriodLabel(grp.semester, grp.period_type) ??
+                                    `${gMeta.label} (sin núm.)`}{" "}
+                                  · {grp.subjects_count} materias · {grp.students_count} alumnos ·{" "}
+                                  {grp.total_sessions} sesiones
                                 </p>
                               </div>
                               <div className="flex items-center gap-4 text-xs">
@@ -1773,6 +2003,85 @@ export function AcademicPage({
             </div>
           )}
         </>
+      )}
+
+      {pendingPeriodChange && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <form
+            onSubmit={handleConfirmPeriodChange}
+            className="w-full max-w-md bg-slate-900 border border-amber-500/40 rounded-2xl p-6 space-y-4 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400 shrink-0">
+                  <Lock className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-base">Autorización de Administrador</h3>
+                  <p className="text-xs text-slate-400">
+                    Cambiar el tipo de periodo académico requiere contraseña de administrador.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setPendingPeriodChange(null);
+                  setPeriodAuthSecret("");
+                  setPeriodAuthError(null);
+                }}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-slate-800/70 border border-slate-700 px-3.5 py-2.5 text-xs text-slate-200">
+              {pendingPeriodChange.summary}
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Contraseña de administrador
+              </label>
+              <PasswordInput
+                required
+                autoFocus
+                value={periodAuthSecret}
+                onChange={(e) => setPeriodAuthSecret(e.target.value)}
+                placeholder="Ingresa la contraseña de administrador"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
+              />
+            </div>
+
+            {periodAuthError && (
+              <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+                {periodAuthError}
+              </p>
+            )}
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setPendingPeriodChange(null);
+                  setPeriodAuthSecret("");
+                  setPeriodAuthError(null);
+                }}
+                className="px-4 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                disabled={periodAuthSubmitting || !periodAuthSecret.trim()}
+                className="px-4 py-2 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white"
+              >
+                {periodAuthSubmitting ? "Validando..." : "Confirmar cambio"}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
     </div>
   );
