@@ -1,15 +1,20 @@
-import { useState, type FormEvent } from "react";
-import { CalendarPlus, Download, Lock, Plus, Trash2 } from "lucide-react";
+import { useEffect, useState, type FormEvent } from "react";
+import { CalendarCheck, CalendarPlus, Download, Lock, Plus, Trash2 } from "lucide-react";
+import { formatGroupPeriodLabel } from "../lib/academicPeriods";
 import { api } from "../lib/api";
 import type {
   AttendanceEvent,
   AttendanceSession,
+  AuthUser,
+  CourseAssignment,
   Group,
   Organization,
   Person,
+  WorkShift,
 } from "../types/api";
 
 interface SessionsPageProps {
+  currentUser: AuthUser;
   organization: Organization;
   groups: Group[];
   sessions: AttendanceSession[];
@@ -19,6 +24,7 @@ interface SessionsPageProps {
 }
 
 export function SessionsPage({
+  currentUser,
   organization,
   groups,
   sessions,
@@ -26,14 +32,26 @@ export function SessionsPage({
   events,
   onRefreshAll,
 }: SessionsPageProps) {
-  // Crear grupo
+  const isTeacher = currentUser.role === "teacher";
+  const isEducation = organization.mode === "education";
+  const isEnterprise = organization.mode === "enterprise";
+  const canManageGroups = currentUser.role === "superadmin" || currentUser.role === "org_admin";
+  const canGenerateAcademic =
+    isEducation && ["superadmin", "org_admin", "teacher"].includes(currentUser.role);
+  const canGenerateEnterprise =
+    isEnterprise && ["superadmin", "org_admin", "supervisor", "operator"].includes(currentUser.role);
+
+  const [courses, setCourses] = useState<CourseAssignment[]>([]);
+  const [workShifts, setWorkShifts] = useState<WorkShift[]>([]);
+  // Crear grupo / departamento
   const [groupName, setGroupName] = useState("");
   const [groupCode, setGroupCode] = useState("");
-  const [scheduleStart, setScheduleStart] = useState("08:00");
-  const [scheduleEnd, setScheduleEnd] = useState("17:00");
+  const [groupDefaultShiftId, setGroupDefaultShiftId] = useState<string>("");
 
   // Crear sesión
   const [sessionTitle, setSessionTitle] = useState("");
+  const [sessionCourseId, setSessionCourseId] = useState<string>("");
+  const [sessionShiftId, setSessionShiftId] = useState<string>("");
   const [sessionGroupId, setSessionGroupId] = useState<string>("");
   const [expectedStart, setExpectedStart] = useState("");
 
@@ -46,25 +64,102 @@ export function SessionsPage({
   const [manualNotes, setManualNotes] = useState("");
   const [filterSessionId, setFilterSessionId] = useState<string>("");
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    setGroupDefaultShiftId("");
+    setSessionCourseId("");
+    setSessionShiftId("");
+    setSessionGroupId("");
+    setManualSessionId("");
+    setManualPersonId("");
+    let cancelled = false;
+    if (isEducation) {
+      setWorkShifts([]);
+      api
+        .listCourses(organization.id)
+        .then((list) => {
+          if (!cancelled) setCourses(list);
+        })
+        .catch(() => {
+          if (!cancelled) setCourses([]);
+        });
+    } else {
+      setCourses([]);
+      api
+        .listWorkShifts(organization.id)
+        .then((list) => {
+          if (!cancelled) setWorkShifts(list);
+        })
+        .catch(() => {
+          if (!cancelled) setWorkShifts([]);
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [isEducation, organization.id]);
 
   const openSessions = sessions.filter((s) => s.status === "open");
   const filteredEvents = filterSessionId
     ? events.filter((e) => e.session_id === Number(filterSessionId))
     : events;
 
+  const selectedManualSession =
+    openSessions.find((s) => String(s.id) === manualSessionId) ?? null;
+  const manualPersonOptions =
+    selectedManualSession && selectedManualSession.group_id !== null
+      ? persons.filter((p) => p.group_ids.includes(selectedManualSession.group_id!))
+      : persons;
+
+  async function handleGenerateTodaySessions() {
+    setErrorMsg(null);
+    setStatusMsg(null);
+    try {
+      const now = new Date();
+      const todayIso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+        now.getDate()
+      ).padStart(2, "0")}`;
+      const res = isEducation
+        ? await api.generateAcademicSessions({
+            organization_id: organization.id,
+            target_date: todayIso,
+          })
+        : await api.generateEnterpriseSessions({
+            organization_id: organization.id,
+            target_date: todayIso,
+          });
+      setStatusMsg(
+        `${isEducation ? "Sesiones" : "Jornadas"} del ${res.target_date}: ${res.created_count} nuevas, ${res.existing_count} existentes.`
+      );
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudieron generar sesiones.");
+    }
+  }
+
   async function handleCreateGroup(e: FormEvent) {
     e.preventDefault();
     if (!groupName.trim() || !groupCode.trim()) return;
-    await api.createGroup({
-      organization_id: organization.id,
-      name: groupName.trim(),
-      code: groupCode.trim(),
-      schedule_start: scheduleStart,
-      schedule_end: scheduleEnd,
-    });
-    setGroupName("");
-    setGroupCode("");
-    await onRefreshAll();
+    setErrorMsg(null);
+    setStatusMsg(null);
+    try {
+      await api.createGroup({
+        organization_id: organization.id,
+        name: groupName.trim(),
+        code: groupCode.trim(),
+        ...(isEnterprise && groupDefaultShiftId
+          ? { default_work_shift_id: Number(groupDefaultShiftId) }
+          : {}),
+      });
+      setGroupName("");
+      setGroupCode("");
+      setGroupDefaultShiftId("");
+      setStatusMsg(isEnterprise ? "Área / departamento creado." : "Grupo creado.");
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo crear el registro.");
+    }
   }
 
   async function handleDeleteGroup(groupId: number) {
@@ -75,15 +170,24 @@ export function SessionsPage({
   async function handleCreateSession(e: FormEvent) {
     e.preventDefault();
     if (!sessionTitle.trim()) return;
-    await api.createSession({
-      organization_id: organization.id,
-      group_id: sessionGroupId ? Number(sessionGroupId) : null,
-      title: sessionTitle.trim(),
-      expected_start_time: expectedStart || null,
-    });
-    setSessionTitle("");
-    setExpectedStart("");
-    await onRefreshAll();
+    setErrorMsg(null);
+    try {
+      await api.createSession({
+        organization_id: organization.id,
+        group_id: !sessionCourseId && sessionGroupId ? Number(sessionGroupId) : null,
+        course_assignment_id: sessionCourseId ? Number(sessionCourseId) : null,
+        work_shift_id: isEnterprise && sessionShiftId ? Number(sessionShiftId) : null,
+        title: sessionTitle.trim(),
+        expected_start_time: expectedStart || null,
+      });
+      setSessionTitle("");
+      setSessionCourseId("");
+      setSessionShiftId("");
+      setExpectedStart("");
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo abrir la sesión.");
+    }
   }
 
   async function handleCloseSession(sessionId: number) {
@@ -94,121 +198,257 @@ export function SessionsPage({
   async function handleManualAttendance(e: FormEvent) {
     e.preventDefault();
     if (!manualSessionId || !manualPersonId) return;
-    await api.createManualAttendance({
-      session_id: Number(manualSessionId),
-      person_id: Number(manualPersonId),
-      event_type: manualEventType,
-      status: "manual",
-      notes: manualNotes.trim() || undefined,
-    });
-    setManualNotes("");
-    setStatusMsg("Asistencia manual registrada.");
-    await onRefreshAll();
+    setErrorMsg(null);
+    try {
+      await api.createManualAttendance({
+        session_id: Number(manualSessionId),
+        person_id: Number(manualPersonId),
+        event_type: manualEventType,
+        status: "manual",
+        notes: manualNotes.trim() || undefined,
+      });
+      setManualNotes("");
+      setStatusMsg("Asistencia manual registrada.");
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo registrar asistencia manual.");
+    }
   }
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Grupos, Sesiones e Historial</h2>
+          <h2 className="text-2xl font-bold tracking-tight">
+            {isTeacher ? "Mis Sesiones e Historial" : "Grupos, Sesiones e Historial"}
+          </h2>
           <p className="text-sm text-slate-400">
-            Administra materias/departamentos, sesiones de asistencia y respaldo manual
+            {isTeacher
+              ? "Sesiones y registros de tus asignaturas asignadas"
+              : "Administra materias/departamentos, sesiones de asistencia y respaldo manual"}
           </p>
         </div>
 
-        <a
-          href={api.exportCsvUrl(
-            organization.id,
-            filterSessionId ? Number(filterSessionId) : null
+        <div className="flex flex-wrap items-center gap-2">
+          {(canGenerateAcademic || (canGenerateEnterprise && workShifts.length > 0)) && (
+            <button
+              type="button"
+              onClick={() => void handleGenerateTodaySessions()}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white"
+            >
+              <CalendarCheck className="w-4 h-4" />
+              {isEducation ? "Generar sesiones de hoy" : "Generar jornadas de hoy"}
+            </button>
           )}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
-        >
-          <Download className="w-4 h-4" />
-          Descargar CSV
-        </a>
+          <button
+            type="button"
+            onClick={() =>
+              void api.downloadCsv(
+                organization.id,
+                filterSessionId ? Number(filterSessionId) : null
+              )
+            }
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
+          >
+            <Download className="w-4 h-4" />
+            Descargar CSV
+          </button>
+        </div>
       </div>
 
+      {statusMsg && (
+        <div className="rounded-xl bg-emerald-500/15 border border-emerald-500/40 px-4 py-2.5 text-xs text-emerald-200">
+          {statusMsg}
+        </div>
+      )}
+      {errorMsg && (
+        <div className="rounded-xl bg-red-500/15 border border-red-500/40 px-4 py-2.5 text-xs text-red-200">
+          {errorMsg}
+        </div>
+      )}
+
       {/* Grupos y Sesiones */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className={`grid grid-cols-1 ${isTeacher ? "" : "lg:grid-cols-2"} gap-6`}>
+        {!isTeacher && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           <h3 className="font-semibold text-base">
             {organization.mode === "education" ? "Grupos / Materias" : "Áreas / Departamentos"}
           </h3>
 
-          <form onSubmit={handleCreateGroup} className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-            <input
-              type="text"
-              required
-              value={groupName}
-              onChange={(e) => setGroupName(e.target.value)}
-              placeholder="Nombre"
-              className="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-            />
-            <input
-              type="text"
-              required
-              value={groupCode}
-              onChange={(e) => setGroupCode(e.target.value)}
-              placeholder="Código"
-              className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-            />
-            <button
-              type="submit"
-              className="inline-flex items-center justify-center gap-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg px-3 py-2 text-sm font-semibold"
-            >
-              <Plus className="w-4 h-4" />
-              Crear
-            </button>
-            <div className="col-span-2">
-              <label className="block text-[11px] text-slate-400 mb-1">Inicio horario</label>
+          {canManageGroups && (
+            <form onSubmit={handleCreateGroup} className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
               <input
-                type="time"
-                value={scheduleStart}
-                onChange={(e) => setScheduleStart(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                type="text"
+                required
+                value={groupName}
+                onChange={(e) => setGroupName(e.target.value)}
+                placeholder={isEnterprise ? "Nombre del área / departamento" : "Nombre"}
+                className="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
-            </div>
-            <div className="col-span-2">
-              <label className="block text-[11px] text-slate-400 mb-1">Fin horario</label>
               <input
-                type="time"
-                value={scheduleEnd}
-                onChange={(e) => setScheduleEnd(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                type="text"
+                required
+                value={groupCode}
+                onChange={(e) => setGroupCode(e.target.value)}
+                placeholder="Código"
+                className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
-            </div>
-          </form>
+              <button
+                type="submit"
+                className="inline-flex items-center justify-center gap-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg px-3 py-2 text-sm font-semibold"
+              >
+                <Plus className="w-4 h-4" />
+                Crear
+              </button>
+              {isEnterprise ? (
+                workShifts.some((sh) => sh.is_active) ? (
+                  <div className="col-span-2 sm:col-span-4">
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Turno laboral por defecto (opcional)
+                    </label>
+                    <select
+                      value={groupDefaultShiftId}
+                      onChange={(e) => setGroupDefaultShiftId(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                    >
+                      <option value="">Sin turno por defecto (definir por empleado)</option>
+                      {workShifts
+                        .filter((sh) => sh.is_active)
+                        .map((sh) => (
+                          <option key={sh.id} value={sh.id}>
+                            {sh.name} ({sh.start_time}–{sh.end_time}
+                            {sh.crosses_midnight ? " 🌙" : ""})
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                ) : (
+                  <p className="col-span-2 sm:col-span-4 text-[11px] text-slate-500">
+                    Los horarios laborales se configuran en Turnos y Jornadas.
+                  </p>
+                )
+              ) : (
+                <p className="col-span-2 sm:col-span-4 text-[11px] text-slate-500">
+                  Los horarios y materias se gestionan en Estructura Académica.
+                </p>
+              )}
+            </form>
+          )}
 
           <div className="space-y-2 max-h-56 overflow-y-auto">
-            {groups.map((g) => (
-              <div
-                key={g.id}
-                className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-800/50 border border-slate-800"
-              >
-                <div>
-                  <p className="text-sm font-medium">
-                    {g.name} <span className="text-xs text-slate-400">({g.code})</span>
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    {g.schedule_start} - {g.schedule_end} · {g.members_count} integrantes
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void handleDeleteGroup(g.id)}
-                  className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
+            {groups.map((g) => {
+              const linkedShift = isEnterprise
+                ? workShifts.find((sh) => sh.id === g.default_work_shift_id)
+                : null;
+              const periodLabel = isEducation
+                ? formatGroupPeriodLabel(g.period_type, g.semester)
+                : null;
+              return (
+                <div
+                  key={g.id}
+                  className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-800/50 border border-slate-800"
                 >
-                  <Trash2 className="w-4 h-4" />
-                </button>
-              </div>
-            ))}
+                  <div>
+                    <p className="text-sm font-medium">
+                      {g.name} <span className="text-xs text-slate-400">({g.code})</span>
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {isEnterprise ? (
+                        <>
+                          {g.members_count} integrantes ·{" "}
+                          {g.default_work_shift_name
+                            ? `Turno por defecto: ${g.default_work_shift_name}${
+                                linkedShift
+                                  ? ` (${linkedShift.start_time}–${linkedShift.end_time})`
+                                  : ""
+                              }`
+                            : "Sin turno por defecto"}
+                        </>
+                      ) : (
+                        <>
+                          {g.career_name ? `${g.career_name} · ` : ""}
+                          {periodLabel ? `${periodLabel} · ` : ""}
+                          {g.members_count} integrantes · {g.courses_count} materias
+                          {g.default_classroom ? ` · Aula ${g.default_classroom}` : ""}
+                        </>
+                      )}
+                    </p>
+                  </div>
+                  {canManageGroups && (
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteGroup(g.id)}
+                      className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
+        )}
 
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           <h3 className="font-semibold text-base">Sesiones de Asistencia</h3>
 
           <form onSubmit={handleCreateSession} className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            {isEducation && (
+              <select
+                required={isTeacher}
+                value={sessionCourseId}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSessionCourseId(val);
+                  if (val && !sessionTitle.trim()) {
+                    const matched = courses.find((c) => String(c.id) === val);
+                    if (matched) {
+                      setSessionTitle(`${matched.subject_name} — ${matched.group_name}`);
+                    }
+                  }
+                }}
+                className="sm:col-span-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">
+                  {isTeacher
+                    ? "Selecciona asignatura asignada..."
+                    : "Opcional: vincular a asignatura de curso"}
+                </option>
+                {courses.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.subject_name} ({c.subject_code}) · {c.group_name}
+                  </option>
+                ))}
+              </select>
+            )}
+            {isEnterprise && workShifts.length > 0 && (
+              <select
+                value={sessionShiftId}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSessionShiftId(val);
+                  const matched = workShifts.find((sh) => String(sh.id) === val);
+                  if (matched) {
+                    if (!sessionTitle.trim()) {
+                      setSessionTitle(`${matched.name} (${matched.start_time}-${matched.end_time})`);
+                    }
+                    if (!expectedStart) {
+                      setExpectedStart(matched.start_time);
+                    }
+                  }
+                }}
+                className="sm:col-span-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">Opcional: vincular a turno laboral</option>
+                {workShifts.map((sh) => (
+                  <option key={sh.id} value={sh.id}>
+                    {sh.name} ({sh.start_time}–{sh.end_time}
+                    {sh.crosses_midnight ? " 🌙" : ""})
+                  </option>
+                ))}
+              </select>
+            )}
             <input
               type="text"
               required
@@ -224,23 +464,26 @@ export function SessionsPage({
               <CalendarPlus className="w-4 h-4" />
               Abrir
             </button>
-            <select
-              value={sessionGroupId}
-              onChange={(e) => setSessionGroupId(e.target.value)}
-              className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-            >
-              <option value="">Sin grupo específico</option>
-              {groups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
+            {!isTeacher && (
+              <select
+                value={sessionGroupId}
+                disabled={Boolean(sessionCourseId)}
+                onChange={(e) => setSessionGroupId(e.target.value)}
+                className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
+              >
+                <option value="">Sin grupo específico</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            )}
             <input
               type="time"
               value={expectedStart}
               onChange={(e) => setExpectedStart(e.target.value)}
-              className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              className={`${isTeacher ? "sm:col-span-3" : ""} bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm`}
               title="Hora esperada de inicio"
             />
           </form>
@@ -253,6 +496,20 @@ export function SessionsPage({
               >
                 <div>
                   <p className="text-sm font-medium">{s.title}</p>
+                  {s.subject_name && (
+                    <p className="text-[11px] text-indigo-300 mt-0.5">
+                      {s.subject_name}
+                      {s.group_name ? ` · ${s.group_name}` : ""}
+                      {s.teacher_name ? ` · ${s.teacher_name}` : ""}
+                    </p>
+                  )}
+                  {s.work_shift_name && (
+                    <p className="text-[11px] text-indigo-300 mt-0.5">
+                      Turno: {s.work_shift_name}
+                      {s.work_shift_code ? ` (${s.work_shift_code})` : ""}
+                      {s.work_shift_crosses_midnight ? " 🌙" : ""}
+                    </p>
+                  )}
                   <p className="text-xs text-slate-500">
                     {s.session_date} · {s.events_count} eventos ·{" "}
                     <span className={s.status === "open" ? "text-emerald-400" : "text-slate-400"}>
@@ -289,7 +546,10 @@ export function SessionsPage({
           <select
             required
             value={manualSessionId}
-            onChange={(e) => setManualSessionId(e.target.value)}
+            onChange={(e) => {
+              setManualSessionId(e.target.value);
+              setManualPersonId("");
+            }}
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
             <option value="">Selecciona sesión abierta...</option>
@@ -307,7 +567,7 @@ export function SessionsPage({
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
             <option value="">Selecciona persona...</option>
-            {persons.map((p) => (
+            {manualPersonOptions.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.full_name} ({p.external_id})
               </option>
@@ -385,8 +645,54 @@ export function SessionsPage({
                     {ev.person_name}{" "}
                     <span className="text-xs text-slate-500">({ev.person_external_id})</span>
                   </td>
-                  <td className="py-2.5 px-3 text-xs">{ev.event_type}</td>
-                  <td className="py-2.5 px-3 text-xs">{ev.status}</td>
+                  <td className="py-2.5 px-3 text-xs">
+                    {ev.event_type === "check_in"
+                      ? "Entrada"
+                      : ev.event_type === "check_out"
+                        ? "Salida"
+                        : "Asistencia"}
+                    {ev.work_shift_name && (
+                      <span className="block text-[11px] text-slate-400">
+                        {ev.work_shift_name}
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-3 text-xs">
+                    <span
+                      className={
+                        ev.status === "on_time"
+                          ? "text-emerald-300"
+                          : ev.status === "late"
+                            ? "text-amber-300"
+                            : ev.status === "early_exit"
+                              ? "text-orange-300"
+                              : "text-sky-300"
+                      }
+                    >
+                      {ev.status === "on_time"
+                        ? "A tiempo"
+                        : ev.status === "late"
+                          ? "Retardo"
+                          : ev.status === "early_exit"
+                            ? "Salida anticipada"
+                            : "Manual"}
+                    </span>
+                    {ev.late_minutes !== null && ev.late_minutes > 0 && (
+                      <span className="block text-[11px] text-amber-400">
+                        +{ev.late_minutes} min
+                      </span>
+                    )}
+                    {ev.early_exit_minutes !== null && ev.early_exit_minutes > 0 && (
+                      <span className="block text-[11px] text-orange-400">
+                        -{ev.early_exit_minutes} min
+                      </span>
+                    )}
+                    {ev.worked_minutes !== null && (
+                      <span className="block text-[11px] text-slate-400">
+                        {ev.worked_minutes} min trabajados
+                      </span>
+                    )}
+                  </td>
                   <td className="py-2.5 px-3 text-xs text-slate-400">{ev.capture_mode}</td>
                   <td className="py-2.5 pl-3 text-right text-xs">
                     {ev.confidence_score !== null

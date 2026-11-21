@@ -6,16 +6,19 @@ import type {
   ActionMode,
   AttendanceEvent,
   AttendanceSession,
+  AuthUser,
   Group,
   Organization,
   RecognizeFrameResponse,
 } from "../types/api";
 
 interface KioskPageProps {
+  currentUser: AuthUser;
   organization: Organization;
   groups: Group[];
   sessions: AttendanceSession[];
   events: AttendanceEvent[];
+  initialSessionId?: number | null;
   onRefreshEvents: () => Promise<void>;
 }
 
@@ -40,20 +43,25 @@ function playSuccessBeep() {
 }
 
 export function KioskPage({
+  currentUser,
   organization,
   groups,
   sessions,
   events,
+  initialSessionId,
   onRefreshEvents,
 }: KioskPageProps) {
   const cameraRef = useRef<CameraViewHandle | null>(null);
   const inFlightRef = useRef(false);
+  const isTeacher = currentUser.role === "teacher";
 
   const [cameraReady, setCameraReady] = useState(false);
   const [kioskActive, setKioskActive] = useState(true);
   const [soundEnabled, setSoundEnabled] = useState(true);
 
-  const [selectedSessionId, setSelectedSessionId] = useState<string>("");
+  const [selectedSessionId, setSelectedSessionId] = useState<string>(
+    initialSessionId ? String(initialSessionId) : ""
+  );
   const [selectedGroupId, setSelectedGroupId] = useState<string>("");
   const [actionMode, setActionMode] = useState<ActionMode>(
     organization.mode === "education" ? "present" : "auto"
@@ -63,16 +71,32 @@ export function KioskPage({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const openSessions = sessions.filter((s) => s.status === "open");
+  const selectedSession =
+    openSessions.find((s) => String(s.id) === selectedSessionId) ?? null;
 
   useEffect(() => {
     setActionMode(organization.mode === "education" ? "present" : "auto");
-    setSelectedSessionId("");
+    setSelectedSessionId(initialSessionId ? String(initialSessionId) : "");
     setSelectedGroupId("");
     setLastResult(null);
   }, [organization.id, organization.mode]);
 
+  useEffect(() => {
+    if (initialSessionId) {
+      setSelectedSessionId(String(initialSessionId));
+      setErrorMsg(null);
+    }
+  }, [initialSessionId]);
+
+  useEffect(() => {
+    if (isTeacher && !selectedSessionId && openSessions.length > 0) {
+      setSelectedSessionId(String(openSessions[0].id));
+    }
+  }, [isTeacher, openSessions, selectedSessionId]);
+
   const runRecognitionStep = useCallback(async () => {
     if (!kioskActive || !cameraReady || inFlightRef.current) return;
+    if (isTeacher && !selectedSessionId) return;
     const cam = cameraRef.current;
     if (!cam) return;
 
@@ -103,6 +127,7 @@ export function KioskPage({
   }, [
     actionMode,
     cameraReady,
+    isTeacher,
     kioskActive,
     onRefreshEvents,
     organization.id,
@@ -131,8 +156,19 @@ export function KioskPage({
       boxLabel = "No reconocido";
     } else {
       boxStatus = "warning";
-      boxLabel =
-        lastResult.match_status === "ambiguous" ? "Coincidencia ambigua" : "Ajusta posición/luz";
+      if (lastResult.match_status === "ambiguous") {
+        boxLabel = "Coincidencia ambigua";
+      } else if (lastResult.message.includes("borrosa")) {
+        boxLabel = "Imagen borrosa";
+      } else if (lastResult.message.includes("Acércate")) {
+        boxLabel = "Acércate más";
+      } else if (lastResult.message.includes("Contraluz")) {
+        boxLabel = "Contraluz fuerte";
+      } else if (lastResult.message.includes("iluminación")) {
+        boxLabel = "Poca luz";
+      } else {
+        boxLabel = "Calidad baja";
+      }
     }
   }
 
@@ -189,7 +225,10 @@ export function KioskPage({
             onChange={(e) => setSelectedSessionId(e.target.value)}
             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
-            <option value="">Automática del día</option>
+            {!isTeacher && <option value="">Automática del día</option>}
+            {isTeacher && openSessions.length === 0 && (
+              <option value="">Sin sesiones abiertas</option>
+            )}
             {openSessions.map((s) => (
               <option key={s.id} value={s.id}>
                 {s.title}
@@ -202,7 +241,7 @@ export function KioskPage({
           <label className="block text-xs text-slate-400 mb-1">Alcance por grupo</label>
           <select
             value={selectedGroupId}
-            disabled={Boolean(selectedSessionId)}
+            disabled={isTeacher || Boolean(selectedSessionId)}
             onChange={(e) => setSelectedGroupId(e.target.value)}
             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
           >
@@ -237,6 +276,52 @@ export function KioskPage({
           </select>
         </div>
       </div>
+
+      {isTeacher && !selectedSession && (
+        <div className="rounded-xl bg-amber-500/15 border border-amber-500/40 px-4 py-3 text-sm text-amber-200">
+          Para tomar asistencia como docente, primero abre una de tus materias desde{" "}
+          <strong>Mi Agenda Docente</strong> (o selecciona una sesión abierta arriba).
+        </div>
+      )}
+
+      {selectedSession && selectedSession.subject_name && (
+        <div className="rounded-xl bg-indigo-500/15 border border-indigo-500/40 px-4 py-2.5 text-xs text-indigo-200 flex flex-wrap items-center gap-3">
+          <span>
+            Materia: <strong>{selectedSession.subject_name}</strong>
+            {selectedSession.subject_code ? ` (${selectedSession.subject_code})` : ""}
+          </span>
+          {selectedSession.group_name && (
+            <span>
+              · Grupo: <strong>{selectedSession.group_name}</strong>
+            </span>
+          )}
+          {selectedSession.career_name && <span>· {selectedSession.career_name}</span>}
+          {selectedSession.teacher_name && (
+            <span>
+              · Docente: <strong>{selectedSession.teacher_name}</strong>
+            </span>
+          )}
+        </div>
+      )}
+
+      {selectedSession && selectedSession.work_shift_name && (
+        <div className="rounded-xl bg-indigo-500/15 border border-indigo-500/40 px-4 py-2.5 text-xs text-indigo-200 flex flex-wrap items-center gap-3">
+          <span>
+            Turno laboral: <strong>{selectedSession.work_shift_name}</strong>
+            {selectedSession.work_shift_code ? ` (${selectedSession.work_shift_code})` : ""}
+          </span>
+          {selectedSession.expected_start_time && (
+            <span>
+              · Entrada esperada: <strong>{selectedSession.expected_start_time}</strong>
+            </span>
+          )}
+          {selectedSession.work_shift_crosses_midnight && (
+            <span className="px-2 py-0.5 rounded-full bg-indigo-600/30 border border-indigo-400/30">
+              🌙 Turno nocturno (cruza medianoche)
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {/* Cámara + banner de respuesta */}
@@ -282,10 +367,35 @@ export function KioskPage({
                     {lastResult.confidence > 0 && (
                       <> · Similitud: {(lastResult.confidence * 100).toFixed(1)}%</>
                     )}
+                    {lastResult.shift_name && <> · Turno: {lastResult.shift_name}</>}
+                    {lastResult.late_minutes !== null && lastResult.late_minutes > 0 && (
+                      <span className="text-amber-300">
+                        {" "}
+                        · Retardo: +{lastResult.late_minutes} min
+                      </span>
+                    )}
+                    {lastResult.early_exit_minutes !== null && lastResult.early_exit_minutes > 0 && (
+                      <span className="text-orange-300">
+                        {" "}
+                        · Salida anticipada: -{lastResult.early_exit_minutes} min
+                      </span>
+                    )}
                     {lastResult.worked_minutes !== null && (
                       <> · Jornada: {lastResult.worked_minutes} min</>
                     )}
+                    {lastResult.match_status === "low_quality" && lastResult.quality && (
+                      <>
+                        {" "}
+                        · Nitidez: {lastResult.quality.blur_score} · Brillo:{" "}
+                        {lastResult.quality.brightness}
+                      </>
+                    )}
                   </p>
+                  {lastResult.quality?.backlight_detected && (
+                    <span className="inline-block mt-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                      Contraluz detectado · compensación activa
+                    </span>
+                  )}
                 </div>
               </div>
               <span className="text-xs font-mono text-slate-400 shrink-0">
@@ -336,7 +446,11 @@ export function KioskPage({
                           ? "A tiempo"
                           : ev.status === "late"
                             ? "Retardo"
-                            : "Manual"}
+                            : ev.status === "early_exit"
+                              ? "Salida anticipada"
+                              : "Manual"}
+                        {ev.work_shift_name ? ` · ${ev.work_shift_name}` : ""}
+                        {ev.worked_minutes !== null ? ` · ${ev.worked_minutes} min` : ""}
                       </p>
                     </div>
                   </div>

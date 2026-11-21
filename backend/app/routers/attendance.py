@@ -2,62 +2,65 @@ from datetime import date, datetime
 import time
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
 from app.db import get_db
 from app.models import (
     AttendanceEvent,
     AttendanceSession,
+    ClassSchedule,
+    CourseAssignment,
     FaceEmbedding,
     Group,
     Organization,
     Person,
     PersonGroup,
+    User,
+    WorkShift,
 )
+from app.routers import to_face_box_schema, to_quality_schema
 from app.schemas import (
     ActionMode,
     AttendanceEventRead,
-    FaceBoxSchema,
     ManualAttendanceRequest,
     PersonSummaryBrief,
-    QualityReportSchema,
     RecognizeFrameResponse,
     SessionCreate,
     SessionRead,
+)
+from app.security import assert_org_access, get_current_user, resolve_org_scope
+from app.services.academic_service import (
+    assert_session_teacher_access,
+    get_teacher_course_ids,
+    serialize_sessions_batch,
 )
 from app.services.attendance_service import (
     export_events_csv,
     get_or_create_active_session,
     record_recognized_attendance,
 )
+from app.services.enterprise_service import resolve_attendance_work_shift
 from app.vision.engine import bytes_to_embedding, decode_image_bytes, match_embedding
-from app.vision.quality import FaceBox, evaluate_face_quality
+from app.vision.quality import evaluate_face_quality
 
 router = APIRouter(prefix="/api", tags=["attendance"])
-
-
-def _to_face_box_schema(box: FaceBox, img_w: int, img_h: int) -> FaceBoxSchema:
-    return FaceBoxSchema(
-        x=box.x,
-        y=box.y,
-        w=box.w,
-        h=box.h,
-        confidence=round(box.confidence, 4),
-        image_width=img_w,
-        image_height=img_h,
-        nx=round(max(0.0, box.x) / max(img_w, 1), 4),
-        ny=round(max(0.0, box.y) / max(img_h, 1), 4),
-        nw=round(max(0.0, box.w) / max(img_w, 1), 4),
-        nh=round(max(0.0, box.h) / max(img_h, 1), 4),
-    )
 
 
 def _serialize_event(
     event: AttendanceEvent,
     person: Person,
     session: AttendanceSession,
+    shift_names: dict[int, str] | None = None,
 ) -> AttendanceEventRead:
+    resolved_shift_id = event.work_shift_id if event.work_shift_id is not None else session.work_shift_id
+    shift_name = (
+        shift_names.get(resolved_shift_id)
+        if shift_names is not None and resolved_shift_id is not None
+        else None
+    )
+    if shift_name is None and event.work_shift is not None:
+        shift_name = event.work_shift.name
     return AttendanceEventRead(
         id=event.id,
         session_id=event.session_id,
@@ -66,95 +69,115 @@ def _serialize_event(
         person_name=person.full_name,
         person_external_id=person.external_id,
         person_avatar_base64=person.avatar_base64,
+        work_shift_id=event.work_shift_id,
+        work_shift_name=shift_name,
         event_type=event.event_type,
         status=event.status,
         confidence_score=event.confidence_score,
+        worked_minutes=event.worked_minutes,
+        late_minutes=event.late_minutes,
+        early_exit_minutes=event.early_exit_minutes,
         capture_mode=event.capture_mode,
         timestamp=event.timestamp,
         notes=event.notes,
     )
 
 
-def _serialize_session(
-    session: AttendanceSession,
-    group_name: str | None,
-    events_count: int,
-) -> SessionRead:
-    return SessionRead(
-        id=session.id,
-        organization_id=session.organization_id,
-        group_id=session.group_id,
-        group_name=group_name,
-        title=session.title,
-        session_date=session.session_date,
-        session_type=session.session_type,
-        expected_start_time=session.expected_start_time,
-        status=session.status,
-        created_at=session.created_at,
-        closed_at=session.closed_at,
-        events_count=events_count,
-    )
-
-
 @router.get("/sessions", response_model=list[SessionRead])
 def list_sessions(
-    organization_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[SessionRead]:
+    scoped_org_id = resolve_org_scope(current_user, organization_id)
     stmt = (
         select(AttendanceSession)
-        .where(AttendanceSession.organization_id == organization_id)
+        .where(AttendanceSession.organization_id == scoped_org_id)
         .order_by(AttendanceSession.id.desc())
     )
+    if current_user.role == "teacher":
+        teacher_courses = get_teacher_course_ids(db, current_user.id)
+        if not teacher_courses:
+            return []
+        stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
     if status_filter:
         stmt = stmt.where(AttendanceSession.status == status_filter)
-    sessions = db.scalars(stmt).all()
-
-    group_names = {
-        g.id: g.name
-        for g in db.scalars(
-            select(Group).where(Group.organization_id == organization_id)
-        ).all()
-    }
-    event_counts = {
-        sid: cnt
-        for sid, cnt in db.execute(
-            select(AttendanceEvent.session_id, func.count(AttendanceEvent.id))
-            .group_by(AttendanceEvent.session_id)
-        ).all()
-    }
-
-    return [
-        _serialize_session(
-            s,
-            group_names.get(s.group_id) if s.group_id else None,
-            event_counts.get(s.id, 0),
-        )
-        for s in sessions
-    ]
+    sessions = list(db.scalars(stmt).all())
+    return serialize_sessions_batch(db, sessions, scoped_org_id)
 
 
 @router.post("/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED)
-def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> SessionRead:
+def create_session(
+    payload: SessionCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SessionRead:
+    assert_org_access(current_user, payload.organization_id)
     org = db.get(Organization, payload.organization_id)
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    group_name: str | None = None
+    if current_user.role == "teacher" and payload.course_assignment_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Un docente debe abrir sesiones vinculadas a una de sus asignaturas.",
+        )
+
+    resolved_group_id = payload.group_id
     expected_start = payload.expected_start_time
-    if payload.group_id is not None:
-        group = db.get(Group, payload.group_id)
+    session_type = payload.session_type or ("class" if org.mode == "education" else "workday")
+
+    if payload.course_assignment_id is not None:
+        assignment = db.scalars(
+            select(CourseAssignment)
+            .options(selectinload(CourseAssignment.group))
+            .where(CourseAssignment.id == payload.course_assignment_id)
+        ).first()
+        if assignment is None or assignment.organization_id != org.id:
+            raise HTTPException(status_code=404, detail="Asignación de materia no encontrada.")
+        if current_user.role == "teacher" and assignment.teacher_user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No puedes crear sesiones para una materia de otro profesor.",
+            )
+        resolved_group_id = assignment.group_id
+        session_type = "class"
+        if payload.schedule_id is not None:
+            schedule = db.get(ClassSchedule, payload.schedule_id)
+            if schedule is None or schedule.course_assignment_id != assignment.id:
+                raise HTTPException(status_code=404, detail="Horario no encontrado para la materia.")
+            if expected_start is None:
+                expected_start = schedule.start_time
+        elif expected_start is None and assignment.group is not None:
+            expected_start = assignment.group.schedule_start
+    elif payload.work_shift_id is not None:
+        work_shift = db.get(WorkShift, payload.work_shift_id)
+        if work_shift is None or work_shift.organization_id != org.id:
+            raise HTTPException(
+                status_code=404,
+                detail="Turno laboral no encontrado en la organización.",
+            )
+        session_type = "workday"
+        if expected_start is None:
+            expected_start = work_shift.start_time
+        if resolved_group_id is not None:
+            group = db.get(Group, resolved_group_id)
+            if group is None or group.organization_id != org.id:
+                raise HTTPException(status_code=404, detail="Grupo no encontrado en la organización.")
+    elif resolved_group_id is not None:
+        group = db.get(Group, resolved_group_id)
         if group is None or group.organization_id != org.id:
             raise HTTPException(status_code=404, detail="Grupo no encontrado en la organización.")
-        group_name = group.name
         if expected_start is None:
             expected_start = group.schedule_start
 
-    session_type = payload.session_type or ("class" if org.mode == "education" else "workday")
     session = AttendanceSession(
         organization_id=org.id,
-        group_id=payload.group_id,
+        group_id=resolved_group_id,
+        course_assignment_id=payload.course_assignment_id,
+        schedule_id=payload.schedule_id,
+        work_shift_id=payload.work_shift_id,
         title=payload.title.strip(),
         session_date=payload.session_date or date.today(),
         session_type=session_type,
@@ -164,14 +187,20 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> Ses
     db.add(session)
     db.commit()
     db.refresh(session)
-    return _serialize_session(session, group_name, 0)
+    return serialize_sessions_batch(db, [session], org.id)[0]
 
 
 @router.post("/sessions/{session_id}/close", response_model=SessionRead)
-def close_session(session_id: int, db: Session = Depends(get_db)) -> SessionRead:
+def close_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SessionRead:
     session = db.get(AttendanceSession, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+    assert_org_access(current_user, session.organization_id)
+    assert_session_teacher_access(db, current_user, session)
 
     if session.status != "closed":
         session.status = "closed"
@@ -179,11 +208,7 @@ def close_session(session_id: int, db: Session = Depends(get_db)) -> SessionRead
         db.commit()
         db.refresh(session)
 
-    group = db.get(Group, session.group_id) if session.group_id else None
-    count = db.scalar(
-        select(func.count(AttendanceEvent.id)).where(AttendanceEvent.session_id == session.id)
-    ) or 0
-    return _serialize_session(session, group.name if group else None, count)
+    return serialize_sessions_batch(db, [session], session.organization_id)[0]
 
 
 @router.post("/attendance/recognize-frame", response_model=RecognizeFrameResponse)
@@ -194,11 +219,13 @@ async def recognize_frame(
     session_id: int | None = Form(default=None),
     group_id: int | None = Form(default=None),
     action_mode: ActionMode = Form(default="auto"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> RecognizeFrameResponse:
     t0 = time.perf_counter()
     settings = get_settings()
 
+    assert_org_access(current_user, organization_id)
     org = db.get(Organization, organization_id)
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
@@ -214,9 +241,15 @@ async def recognize_frame(
         session = db.get(AttendanceSession, session_id)
         if session is None or session.organization_id != org.id:
             raise HTTPException(status_code=404, detail="Sesión no encontrada en la organización.")
+        assert_session_teacher_access(db, current_user, session)
         if session.status != "open":
             raise HTTPException(status_code=400, detail="La sesión seleccionada ya está cerrada.")
     else:
+        if current_user.role == "teacher":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes seleccionar una sesión de tu asignatura para tomar asistencia.",
+            )
         try:
             session = get_or_create_active_session(db, org, group_id=group_id)
         except ValueError as exc:
@@ -241,24 +274,19 @@ async def recognize_frame(
         )
 
     primary_box, primary_row = detections[0]
-    face_box_schema = _to_face_box_schema(primary_box, img_w, img_h)
+    face_box_schema = to_face_box_schema(primary_box, img_w, img_h)
     quality = evaluate_face_quality(
         image_bgr,
         primary_box,
         min_size_px=settings.kiosk_min_face_size_px,
-        min_blur=settings.min_blur_variance,
-        min_brightness=settings.min_brightness,
+        min_blur=settings.kiosk_min_blur_variance,
+        min_brightness=settings.kiosk_min_brightness,
         max_brightness=settings.max_brightness,
+        max_shadow_asymmetry=settings.kiosk_max_shadow_asymmetry,
+        backlight_delta_threshold=settings.backlight_delta_threshold,
+        strict_lighting=False,
     )
-    quality_schema = QualityReportSchema(
-        ok=quality.ok,
-        reason=quality.reason,
-        blur_score=round(quality.blur_score, 2),
-        brightness=round(quality.brightness, 2),
-        face_width=quality.face_width,
-        face_height=quality.face_height,
-        pose_hint=quality.pose_hint,
-    )
+    quality_schema = to_quality_schema(quality)
 
     if not quality.ok:
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -305,11 +333,15 @@ async def recognize_frame(
 
     if decision.status == "unknown":
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        msg = (
-            "No hay personas con biometría registrada en este alcance."
-            if not gallery
-            else "Rostro no reconocido en el padrón activo."
-        )
+        if not gallery:
+            msg = "No hay personas con biometría registrada en este alcance."
+        elif quality.backlight_detected:
+            msg = (
+                "Rostro no reconocido. Se detectó contraluz fuerte; intenta mirar más de frente "
+                "o mejorar la luz frontal."
+            )
+        else:
+            msg = "Rostro no reconocido en el padrón activo."
         return RecognizeFrameResponse(
             faces_detected=len(detections),
             match_status="unknown",
@@ -359,6 +391,16 @@ async def recognize_frame(
     )
     latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
+    serialized_event = None
+    if rec.event is not None:
+        event_session = db.get(AttendanceSession, rec.event.session_id) or session
+        ev_shift_names = (
+            {rec.event.work_shift_id: rec.shift_name}
+            if rec.event.work_shift_id is not None and rec.shift_name is not None
+            else None
+        )
+        serialized_event = _serialize_event(rec.event, person, event_session, ev_shift_names)
+
     return RecognizeFrameResponse(
         faces_detected=len(detections),
         match_status="matched",
@@ -378,9 +420,12 @@ async def recognize_frame(
             else None
         ),
         attendance_action=rec.action,
-        event=_serialize_event(rec.event, person, session) if rec.event else None,
+        event=serialized_event,
         worked_minutes=rec.worked_minutes,
-        session_id=session.id,
+        shift_name=rec.shift_name,
+        late_minutes=rec.late_minutes,
+        early_exit_minutes=rec.early_exit_minutes,
+        session_id=rec.event.session_id if rec.event else session.id,
         message=rec.message,
         latency_ms=latency_ms,
     )
@@ -388,37 +433,62 @@ async def recognize_frame(
 
 @router.get("/attendance/events", response_model=list[AttendanceEventRead])
 def list_events(
-    organization_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
     session_id: int | None = Query(default=None),
     person_id: int | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[AttendanceEventRead]:
+    scoped_org_id = resolve_org_scope(current_user, organization_id)
+    teacher_courses: set[int] | None = None
+    if current_user.role == "teacher":
+        if session_id is not None:
+            target_sess = db.get(AttendanceSession, session_id)
+            if target_sess is None or target_sess.organization_id != scoped_org_id:
+                raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+            assert_session_teacher_access(db, current_user, target_sess)
+        teacher_courses = get_teacher_course_ids(db, current_user.id)
+        if not teacher_courses:
+            return []
+
     stmt = (
         select(AttendanceEvent, Person, AttendanceSession)
         .join(Person, Person.id == AttendanceEvent.person_id)
         .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
-        .where(AttendanceSession.organization_id == organization_id)
+        .where(AttendanceSession.organization_id == scoped_org_id)
         .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
         .limit(limit)
     )
+    if teacher_courses is not None:
+        stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
     if session_id is not None:
         stmt = stmt.where(AttendanceEvent.session_id == session_id)
     if person_id is not None:
         stmt = stmt.where(AttendanceEvent.person_id == person_id)
 
     rows = db.execute(stmt).all()
-    return [_serialize_event(ev, per, ses) for ev, per, ses in rows]
+    shift_names = {
+        sh.id: sh.name
+        for sh in db.scalars(
+            select(WorkShift).where(WorkShift.organization_id == scoped_org_id)
+        ).all()
+    }
+    return [_serialize_event(ev, per, ses, shift_names) for ev, per, ses in rows]
 
 
 @router.post("/attendance/manual", response_model=AttendanceEventRead, status_code=status.HTTP_201_CREATED)
 def create_manual_attendance(
     payload: ManualAttendanceRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AttendanceEventRead:
     session = db.get(AttendanceSession, payload.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+    assert_org_access(current_user, session.organization_id)
+    assert_session_teacher_access(db, current_user, session)
+
     person = db.get(Person, payload.person_id)
     if person is None or person.organization_id != session.organization_id:
         raise HTTPException(
@@ -426,9 +496,28 @@ def create_manual_attendance(
             detail="Persona no encontrada en la organización de la sesión.",
         )
 
+    if current_user.role == "teacher" and session.group_id is not None:
+        in_group = db.scalars(
+            select(PersonGroup).where(
+                PersonGroup.person_id == person.id,
+                PersonGroup.group_id == session.group_id,
+            )
+        ).first()
+        if in_group is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El alumno no pertenece al grupo de esta sesión.",
+            )
+
+    resolved_shift = (
+        resolve_attendance_work_shift(db, person, session)
+        if session.session_type == "workday"
+        else None
+    )
     event = AttendanceEvent(
         session_id=session.id,
         person_id=person.id,
+        work_shift_id=resolved_shift.id if resolved_shift else None,
         event_type=payload.event_type,
         status=payload.status,
         confidence_score=None,
@@ -439,27 +528,54 @@ def create_manual_attendance(
     db.add(event)
     db.commit()
     db.refresh(event)
-    return _serialize_event(event, person, session)
+    shift_names = {resolved_shift.id: resolved_shift.name} if resolved_shift else None
+    return _serialize_event(event, person, session, shift_names)
 
 
 @router.get("/attendance/export.csv")
 def export_attendance_csv(
-    organization_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
     session_id: int | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    stmt = (
-        select(AttendanceEvent, Person, AttendanceSession)
-        .join(Person, Person.id == AttendanceEvent.person_id)
-        .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
-        .where(AttendanceSession.organization_id == organization_id)
-        .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
-    )
-    if session_id is not None:
-        stmt = stmt.where(AttendanceEvent.session_id == session_id)
+    scoped_org_id = resolve_org_scope(current_user, organization_id)
+    teacher_courses: set[int] | None = None
+    if current_user.role == "teacher":
+        if session_id is not None:
+            target_sess = db.get(AttendanceSession, session_id)
+            if target_sess is None or target_sess.organization_id != scoped_org_id:
+                raise HTTPException(status_code=404, detail="Sesión no encontrada.")
+            assert_session_teacher_access(db, current_user, target_sess)
+        teacher_courses = get_teacher_course_ids(db, current_user.id)
 
-    rows = db.execute(stmt).all()
-    csv_content = export_events_csv([(ev, per, ses) for ev, per, ses in rows])
+    if teacher_courses is not None and not teacher_courses:
+        rows = []
+    else:
+        stmt = (
+            select(AttendanceEvent, Person, AttendanceSession)
+            .join(Person, Person.id == AttendanceEvent.person_id)
+            .join(AttendanceSession, AttendanceSession.id == AttendanceEvent.session_id)
+            .where(AttendanceSession.organization_id == scoped_org_id)
+            .order_by(AttendanceEvent.timestamp.desc(), AttendanceEvent.id.desc())
+        )
+        if teacher_courses is not None:
+            stmt = stmt.where(AttendanceSession.course_assignment_id.in_(teacher_courses))
+        if session_id is not None:
+            stmt = stmt.where(AttendanceEvent.session_id == session_id)
+
+        rows = db.execute(stmt).all()
+
+    shift_names = {
+        sh.id: sh.name
+        for sh in db.scalars(
+            select(WorkShift).where(WorkShift.organization_id == scoped_org_id)
+        ).all()
+    }
+    csv_content = export_events_csv(
+        [(ev, per, ses) for ev, per, ses in rows],
+        shift_names=shift_names,
+    )
     return Response(
         content=csv_content.encode("utf-8"),
         media_type="text/csv; charset=utf-8",

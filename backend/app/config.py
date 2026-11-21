@@ -33,16 +33,33 @@ class Settings(BaseSettings):
     ambiguous_margin: float = 0.05
     self_consistency_threshold: float = 0.25
 
-    # Parámetros de control de calidad en captura
+    # Parámetros de control de calidad en captura e iluminación
     min_face_size_px: int = 64
     kiosk_min_face_size_px: int = 56
-    min_blur_variance: float = 35.0
+    min_blur_variance: float = 18.0
+    enroll_min_blur_variance: float = 18.0
+    kiosk_min_blur_variance: float = 10.0
     min_brightness: float = 35.0
+    enroll_min_brightness: float = 32.0
+    kiosk_min_brightness: float = 18.0
     max_brightness: float = 235.0
+    enroll_max_shadow_asymmetry: float = 68.0
+    kiosk_max_shadow_asymmetry: float = 95.0
+    backlight_delta_threshold: float = 70.0
 
     # Trazabilidad del modelo biométrico
     model_name: str = "sface"
-    model_version: str = "sface_2021dec"
+    model_version: str = "sface_2021dec_v2"
+
+    # Autenticación JWT y usuarios iniciales (bootstrap)
+    jwt_secret_key: str = "identia-dev-secret-change-in-production-32bytes-min"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 480
+    bootstrap_superadmin_email: str = "admin@identia.local"
+    bootstrap_superadmin_password: str = "IdentIA2026!"
+    bootstrap_superadmin_name: str = "Superadmin IdentIA"
+    bootstrap_org_admin_email: str = "empresa@identia.local"
+    bootstrap_org_admin_password: str = "Empresa2026!"
 
     @property
     def resolved_database_url(self) -> str:
