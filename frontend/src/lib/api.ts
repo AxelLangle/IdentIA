@@ -13,6 +13,7 @@ import type {
   DelegatedCredential,
   DelegatedCredentialCreated,
   EnrollFrameResponse,
+  EnterpriseStatsResponse,
   GenerateSessionsResponse,
   Group,
   HealthResponse,
@@ -23,9 +24,11 @@ import type {
   PersonRole,
   PoseLabel,
   RecognizeFrameResponse,
+  ShiftBulkAssignResponse,
   Subject,
   TeacherAgendaResponse,
   UserRole,
+  WorkShift,
 } from "../types/api";
 
 const TOKEN_STORAGE_KEY = "identia_token";
@@ -208,6 +211,7 @@ export const api = {
     career_id?: number | null;
     semester?: string | null;
     default_classroom?: string | null;
+    default_work_shift_id?: number | null;
   }) =>
     requestJson<Group>("/api/groups", {
       method: "POST",
@@ -224,6 +228,7 @@ export const api = {
       career_id: number | null;
       semester: string | null;
       default_classroom: string | null;
+      default_work_shift_id: number | null;
     }>
   ) =>
     requestJson<Group>(`/api/groups/${groupId}`, {
@@ -234,10 +239,18 @@ export const api = {
   deleteGroup: (groupId: number) =>
     requestJson<void>(`/api/groups/${groupId}`, { method: "DELETE" }),
 
-  listPersons: (organizationId: number, search?: string, groupId?: number | null) => {
+  listPersons: (
+    organizationId: number,
+    search?: string,
+    groupId?: number | null,
+    workShiftId?: number | null
+  ) => {
     const params = new URLSearchParams({ organization_id: String(organizationId) });
     if (search && search.trim()) params.set("search", search.trim());
     if (groupId !== undefined && groupId !== null) params.set("group_id", String(groupId));
+    if (workShiftId !== undefined && workShiftId !== null) {
+      params.set("work_shift_id", String(workShiftId));
+    }
     return requestJson<Person[]>(`/api/persons?${params.toString()}`);
   },
   createPerson: (data: {
@@ -248,6 +261,7 @@ export const api = {
     role: PersonRole;
     biometric_consent: boolean;
     group_ids: number[];
+    work_shift_id?: number | null;
   }) =>
     requestJson<Person>("/api/persons", {
       method: "POST",
@@ -263,6 +277,7 @@ export const api = {
       biometric_consent: boolean;
       is_active: boolean;
       group_ids: number[];
+      work_shift_id: number | null;
     }>
   ) =>
     requestJson<Person>(`/api/persons/${personId}`, {
@@ -315,6 +330,7 @@ export const api = {
     group_id?: number | null;
     course_assignment_id?: number | null;
     schedule_id?: number | null;
+    work_shift_id?: number | null;
     title: string;
     expected_start_time?: string | null;
   }) =>
@@ -364,7 +380,7 @@ export const api = {
     session_id: number;
     person_id: number;
     event_type: "check_in" | "check_out" | "present";
-    status?: "on_time" | "late" | "manual";
+    status?: "on_time" | "late" | "early_exit" | "manual";
     notes?: string;
   }) =>
     requestJson<AttendanceEvent>("/api/attendance/manual", {
@@ -559,5 +575,91 @@ export const api = {
       qs.set("group_id", String(params.group_id));
     }
     return requestJson<AcademicStatsResponse>(`/api/academic/stats?${qs.toString()}`);
+  },
+
+  // --- Turnos Empresariales y Reglas de Jornada (Bloque D) ---
+  listWorkShifts: (organizationId: number, isActive?: boolean) => {
+    const qs = new URLSearchParams({ organization_id: String(organizationId) });
+    if (isActive !== undefined) qs.set("is_active", String(isActive));
+    return requestJson<WorkShift[]>(`/api/enterprise/shifts?${qs.toString()}`);
+  },
+  createWorkShift: (data: {
+    organization_id: number;
+    name: string;
+    code: string;
+    start_time: string;
+    end_time: string;
+    days_of_week: number[];
+    late_tolerance_minutes?: number | null;
+    early_exit_tolerance_minutes?: number;
+    is_active?: boolean;
+  }) =>
+    requestJson<WorkShift>("/api/enterprise/shifts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  updateWorkShift: (
+    shiftId: number,
+    data: Partial<{
+      name: string;
+      code: string;
+      start_time: string;
+      end_time: string;
+      days_of_week: number[];
+      late_tolerance_minutes: number | null;
+      early_exit_tolerance_minutes: number;
+      is_active: boolean;
+    }>
+  ) =>
+    requestJson<WorkShift>(`/api/enterprise/shifts/${shiftId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  deleteWorkShift: (shiftId: number) =>
+    requestJson<void>(`/api/enterprise/shifts/${shiftId}`, { method: "DELETE" }),
+  assignWorkShiftPersons: (
+    shiftId: number,
+    data: { person_ids?: number[]; group_id?: number | null; clear_shift?: boolean }
+  ) =>
+    requestJson<ShiftBulkAssignResponse>(`/api/enterprise/shifts/${shiftId}/assign-persons`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  startWorkShiftSession: (shiftId: number, data?: { session_date?: string | null }) =>
+    requestJson<AttendanceSession>(`/api/enterprise/shifts/${shiftId}/start-session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data ?? {}),
+    }),
+  generateEnterpriseSessions: (data: {
+    organization_id: number;
+    target_date?: string | null;
+    work_shift_id?: number | null;
+  }) =>
+    requestJson<GenerateSessionsResponse>("/api/enterprise/sessions/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  getEnterpriseStats: (params: {
+    organization_id: number;
+    date_from?: string | null;
+    date_to?: string | null;
+    work_shift_id?: number | null;
+    group_id?: number | null;
+  }) => {
+    const qs = new URLSearchParams({ organization_id: String(params.organization_id) });
+    if (params.date_from) qs.set("date_from", params.date_from);
+    if (params.date_to) qs.set("date_to", params.date_to);
+    if (params.work_shift_id !== undefined && params.work_shift_id !== null) {
+      qs.set("work_shift_id", String(params.work_shift_id));
+    }
+    if (params.group_id !== undefined && params.group_id !== null) {
+      qs.set("group_id", String(params.group_id));
+    }
+    return requestJson<EnterpriseStatsResponse>(`/api/enterprise/stats?${qs.toString()}`);
   },
 };
