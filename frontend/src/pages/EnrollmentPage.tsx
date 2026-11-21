@@ -140,7 +140,9 @@ export function EnrollmentPage({
   const [listGroupFilter, setListGroupFilter] = useState<string>("");
   const [listShiftFilter, setListShiftFilter] = useState<string>("");
 
-  const canManagePersons = ["superadmin", "org_admin", "operator"].includes(currentUser.role);
+  const canManagePersons = ["superadmin", "org_admin", "supervisor", "operator"].includes(
+    currentUser.role
+  );
   const canDeletePersons = ["superadmin", "org_admin"].includes(currentUser.role);
 
   const activePerson = persons.find((p) => p.id === activePersonId) ?? null;
