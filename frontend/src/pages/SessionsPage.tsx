@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { CalendarCheck, CalendarPlus, Download, Lock, Plus, Trash2 } from "lucide-react";
+import { formatGroupPeriodLabel } from "../lib/academicPeriods";
 import { api } from "../lib/api";
 import type {
   AttendanceEvent,
@@ -38,15 +39,14 @@ export function SessionsPage({
   const canGenerateAcademic =
     isEducation && ["superadmin", "org_admin", "teacher"].includes(currentUser.role);
   const canGenerateEnterprise =
-    isEnterprise && ["superadmin", "org_admin", "operator"].includes(currentUser.role);
+    isEnterprise && ["superadmin", "org_admin", "supervisor", "operator"].includes(currentUser.role);
 
   const [courses, setCourses] = useState<CourseAssignment[]>([]);
   const [workShifts, setWorkShifts] = useState<WorkShift[]>([]);
-  // Crear grupo
+  // Crear grupo / departamento
   const [groupName, setGroupName] = useState("");
   const [groupCode, setGroupCode] = useState("");
-  const [scheduleStart, setScheduleStart] = useState("08:00");
-  const [scheduleEnd, setScheduleEnd] = useState("17:00");
+  const [groupDefaultShiftId, setGroupDefaultShiftId] = useState<string>("");
 
   // Crear sesión
   const [sessionTitle, setSessionTitle] = useState("");
@@ -67,6 +67,7 @@ export function SessionsPage({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
+    setGroupDefaultShiftId("");
     setSessionCourseId("");
     setSessionShiftId("");
     setSessionGroupId("");
@@ -140,16 +141,25 @@ export function SessionsPage({
   async function handleCreateGroup(e: FormEvent) {
     e.preventDefault();
     if (!groupName.trim() || !groupCode.trim()) return;
-    await api.createGroup({
-      organization_id: organization.id,
-      name: groupName.trim(),
-      code: groupCode.trim(),
-      schedule_start: scheduleStart,
-      schedule_end: scheduleEnd,
-    });
-    setGroupName("");
-    setGroupCode("");
-    await onRefreshAll();
+    setErrorMsg(null);
+    setStatusMsg(null);
+    try {
+      await api.createGroup({
+        organization_id: organization.id,
+        name: groupName.trim(),
+        code: groupCode.trim(),
+        ...(isEnterprise && groupDefaultShiftId
+          ? { default_work_shift_id: Number(groupDefaultShiftId) }
+          : {}),
+      });
+      setGroupName("");
+      setGroupCode("");
+      setGroupDefaultShiftId("");
+      setStatusMsg(isEnterprise ? "Área / departamento creado." : "Grupo creado.");
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo crear el registro.");
+    }
   }
 
   async function handleDeleteGroup(groupId: number) {
@@ -272,7 +282,7 @@ export function SessionsPage({
                 required
                 value={groupName}
                 onChange={(e) => setGroupName(e.target.value)}
-                placeholder="Nombre"
+                placeholder={isEnterprise ? "Nombre del área / departamento" : "Nombre"}
                 className="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
               <input
@@ -290,53 +300,92 @@ export function SessionsPage({
                 <Plus className="w-4 h-4" />
                 Crear
               </button>
-              <div className="col-span-2">
-                <label className="block text-[11px] text-slate-400 mb-1">Inicio horario</label>
-                <input
-                  type="time"
-                  value={scheduleStart}
-                  onChange={(e) => setScheduleStart(e.target.value)}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
-                />
-              </div>
-              <div className="col-span-2">
-                <label className="block text-[11px] text-slate-400 mb-1">Fin horario</label>
-                <input
-                  type="time"
-                  value={scheduleEnd}
-                  onChange={(e) => setScheduleEnd(e.target.value)}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
-                />
-              </div>
+              {isEnterprise ? (
+                workShifts.some((sh) => sh.is_active) ? (
+                  <div className="col-span-2 sm:col-span-4">
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Turno laboral por defecto (opcional)
+                    </label>
+                    <select
+                      value={groupDefaultShiftId}
+                      onChange={(e) => setGroupDefaultShiftId(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                    >
+                      <option value="">Sin turno por defecto (definir por empleado)</option>
+                      {workShifts
+                        .filter((sh) => sh.is_active)
+                        .map((sh) => (
+                          <option key={sh.id} value={sh.id}>
+                            {sh.name} ({sh.start_time}–{sh.end_time}
+                            {sh.crosses_midnight ? " 🌙" : ""})
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                ) : (
+                  <p className="col-span-2 sm:col-span-4 text-[11px] text-slate-500">
+                    Los horarios laborales se configuran en Turnos y Jornadas.
+                  </p>
+                )
+              ) : (
+                <p className="col-span-2 sm:col-span-4 text-[11px] text-slate-500">
+                  Los horarios y materias se gestionan en Estructura Académica.
+                </p>
+              )}
             </form>
           )}
 
           <div className="space-y-2 max-h-56 overflow-y-auto">
-            {groups.map((g) => (
-              <div
-                key={g.id}
-                className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-800/50 border border-slate-800"
-              >
-                <div>
-                  <p className="text-sm font-medium">
-                    {g.name} <span className="text-xs text-slate-400">({g.code})</span>
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    {g.schedule_start} - {g.schedule_end} · {g.members_count} integrantes
-                    {g.default_work_shift_name ? ` · Turno: ${g.default_work_shift_name}` : ""}
-                  </p>
+            {groups.map((g) => {
+              const linkedShift = isEnterprise
+                ? workShifts.find((sh) => sh.id === g.default_work_shift_id)
+                : null;
+              const periodLabel = isEducation
+                ? formatGroupPeriodLabel(g.period_type, g.semester)
+                : null;
+              return (
+                <div
+                  key={g.id}
+                  className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-800/50 border border-slate-800"
+                >
+                  <div>
+                    <p className="text-sm font-medium">
+                      {g.name} <span className="text-xs text-slate-400">({g.code})</span>
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {isEnterprise ? (
+                        <>
+                          {g.members_count} integrantes ·{" "}
+                          {g.default_work_shift_name
+                            ? `Turno por defecto: ${g.default_work_shift_name}${
+                                linkedShift
+                                  ? ` (${linkedShift.start_time}–${linkedShift.end_time})`
+                                  : ""
+                              }`
+                            : "Sin turno por defecto"}
+                        </>
+                      ) : (
+                        <>
+                          {g.career_name ? `${g.career_name} · ` : ""}
+                          {periodLabel ? `${periodLabel} · ` : ""}
+                          {g.members_count} integrantes · {g.courses_count} materias
+                          {g.default_classroom ? ` · Aula ${g.default_classroom}` : ""}
+                        </>
+                      )}
+                    </p>
+                  </div>
+                  {canManageGroups && (
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteGroup(g.id)}
+                      className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
-                {canManageGroups && (
-                  <button
-                    type="button"
-                    onClick={() => void handleDeleteGroup(g.id)}
-                    className="p-1.5 rounded-md text-slate-400 hover:text-red-400 hover:bg-red-500/10"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
         )}
