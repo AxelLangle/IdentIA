@@ -1,788 +1,858 @@
+"""Pruebas de integración del modelo educativo, portal docente y migraciones Alembic 0002/0003/0005."""
+
 from datetime import date
 from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
-from app.config import BACKEND_DIR, get_settings
-from app.db import Base, create_db_engine
-from app.vision.quality import FaceBox
+
+from app.config import DIRECTORIO_BACKEND, obtener_configuracion
+from app.db import BaseDeclarativa, crear_motor_bd
+from app.vision.quality import CuadroRostro
 from tests.conftest import (
-    encode_jpeg_bytes,
-    make_pose_landmarks,
-    make_sharp_face_image,
-    make_unit_vector,
+    codificar_bytes_jpeg,
+    crear_imagen_rostro_nitida,
+    crear_puntos_pose,
+    crear_vector_unitario,
 )
 
 
-def _auth_header(client, email: str, password: str) -> dict[str, str]:
-    res = client.post("/api/auth/login", json={"email": email, "password": password})
-    assert res.status_code == 200, res.text
-    return {"Authorization": f"Bearer {res.json()['access_token']}"}
+def _encabezado_autorizacion(cliente, correo: str, contrasena: str) -> dict[str, str]:
+    """Obtiene el encabezado HTTP Bearer autenticando al usuario en `/api/auth/login`."""
+    respuesta = cliente.post(
+        "/api/auth/login",
+        json={"correo": correo, "contrasena": contrasena},
+    )
+    assert respuesta.status_code == 200, respuesta.text
+    return {"Authorization": f"Bearer {respuesta.json()['token_acceso']}"}
 
 
-def _setup_school_fixture(client) -> dict:
-    """Crea una institución educativa con admin, 2 profesores, carrera, grupo 21026 IS, materias y alumnos."""
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+def _configurar_escuela_base(cliente) -> dict:
+    """Construye una escuela de prueba con director, 2 docentes, carrera, grupo, 2 materias y 2 alumnos."""
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    school = client.post(
+    escuela = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": "Universidad Tecnológica IdentIA",
-            "mode": "education",
-            "late_tolerance_minutes": 15,
-            "cooldown_seconds": 60,
-            "admin_user": {
-                "full_name": "Director Escolar",
-                "email": "director@uni.edu",
-                "password": "DirectorPass123!",
+            "nombre": "Universidad Tecnológica IdentIA",
+            "modo": "education",
+            "minutos_tolerancia_retardo": 15,
+            "segundos_enfriamiento": 60,
+            "usuario_administrador": {
+                "nombre_completo": "Director Escolar",
+                "correo": "director@uni.edu",
+                "contrasena": "DirectorPass123!",
             },
         },
     )
-    assert school.status_code == 201, school.text
-    org_id = school.json()["id"]
-    admin_headers = _auth_header(client, "director@uni.edu", "DirectorPass123!")
+    assert escuela.status_code == 201, escuela.text
+    id_organizacion = escuela.json()["id"]
+    encabezados_admin = _encabezado_autorizacion(cliente, "director@uni.edu", "DirectorPass123!")
 
-    prof_1 = client.post(
+    prof_1 = cliente.post(
         "/api/users",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "email": "profe.arq@uni.edu",
-            "full_name": "Prof. Arquitectura",
-            "password": "ProfePass1!",
-            "role": "teacher",
-            "organization_id": org_id,
+            "correo": "profe.arq@uni.edu",
+            "nombre_completo": "Prof. Arquitectura",
+            "contrasena": "ProfePass1!",
+            "rol": "teacher",
+            "id_organizacion": id_organizacion,
         },
     )
     assert prof_1.status_code == 201, prof_1.text
-    prof_1_id = prof_1.json()["id"]
+    id_prof_1 = prof_1.json()["id"]
 
-    prof_2 = client.post(
+    prof_2 = cliente.post(
         "/api/users",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "email": "profe.bd@uni.edu",
-            "full_name": "Prof. Bases Datos",
-            "password": "ProfePass2!",
-            "role": "teacher",
-            "organization_id": org_id,
+            "correo": "profe.bd@uni.edu",
+            "nombre_completo": "Prof. Bases Datos",
+            "contrasena": "ProfePass2!",
+            "rol": "teacher",
+            "id_organizacion": id_organizacion,
         },
     )
     assert prof_2.status_code == 201, prof_2.text
-    prof_2_id = prof_2.json()["id"]
+    id_prof_2 = prof_2.json()["id"]
 
-    career = client.post(
+    carrera = cliente.post(
         "/api/academic/careers",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Ingeniería en Software",
-            "code": "ISW",
-            "description": "Carrera de desarrollo y arquitectura",
+            "id_organizacion": id_organizacion,
+            "nombre": "Ingeniería en Software",
+            "codigo": "ISW",
+            "descripcion": "Carrera de desarrollo y arquitectura",
         },
     )
-    assert career.status_code == 201, career.text
-    career_id = career.json()["id"]
+    assert carrera.status_code == 201, carrera.text
+    id_carrera = carrera.json()["id"]
 
-    group = client.post(
+    grupo = cliente.post(
         "/api/groups",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "21026 IS",
-            "code": "21026-IS",
-            "career_id": career_id,
-            "semester": "6to Cuatrimestre",
-            "schedule_start": "08:00",
-            "schedule_end": "14:00",
+            "id_organizacion": id_organizacion,
+            "nombre": "21026 IS",
+            "codigo": "21026-IS",
+            "id_carrera": id_carrera,
+            "semestre": "6to Cuatrimestre",
+            "hora_inicio_horario": "08:00",
+            "hora_fin_horario": "14:00",
         },
     )
-    assert group.status_code == 201, group.text
-    group_id = group.json()["id"]
+    assert grupo.status_code == 201, grupo.text
+    id_grupo = grupo.json()["id"]
 
-    subj_arq = client.post(
+    materia_arq = cliente.post(
         "/api/academic/subjects",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "career_id": career_id,
-            "name": "Arquitectura de Software",
-            "code": "ARQ-101",
+            "id_organizacion": id_organizacion,
+            "id_carrera": id_carrera,
+            "nombre": "Arquitectura de Software",
+            "codigo": "ARQ-101",
         },
     )
-    assert subj_arq.status_code == 201, subj_arq.text
+    assert materia_arq.status_code == 201, materia_arq.text
 
-    subj_bd = client.post(
+    materia_bd = cliente.post(
         "/api/academic/subjects",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "career_id": career_id,
-            "name": "Bases de Datos",
-            "code": "BDD-102",
+            "id_organizacion": id_organizacion,
+            "id_carrera": id_carrera,
+            "nombre": "Bases de Datos",
+            "codigo": "BDD-102",
         },
     )
-    assert subj_bd.status_code == 201, subj_bd.text
+    assert materia_bd.status_code == 201, materia_bd.text
 
-    # Horarios en martes (day_of_week = 1)
-    course_1 = client.post(
+    # Horarios en martes (`dia_semana = 1`)
+    curso_1 = cliente.post(
         "/api/academic/courses",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "group_id": group_id,
-            "subject_id": subj_arq.json()["id"],
-            "teacher_user_id": prof_1_id,
-            "term": "2026-3",
-            "schedules": [
+            "id_organizacion": id_organizacion,
+            "id_grupo": id_grupo,
+            "id_materia": materia_arq.json()["id"],
+            "id_usuario_docente": id_prof_1,
+            "periodo_lectivo": "2026-3",
+            "horarios": [
                 {
-                    "day_of_week": 1,
-                    "start_time": "10:00",
-                    "end_time": "11:00",
-                    "classroom": "Lab 3",
+                    "dia_semana": 1,
+                    "hora_inicio": "10:00",
+                    "hora_fin": "11:00",
+                    "aula": "Lab 3",
                 }
             ],
         },
     )
-    assert course_1.status_code == 201, course_1.text
+    assert curso_1.status_code == 201, curso_1.text
 
-    course_2 = client.post(
+    curso_2 = cliente.post(
         "/api/academic/courses",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "group_id": group_id,
-            "subject_id": subj_bd.json()["id"],
-            "teacher_user_id": prof_2_id,
-            "term": "2026-3",
-            "schedules": [
+            "id_organizacion": id_organizacion,
+            "id_grupo": id_grupo,
+            "id_materia": materia_bd.json()["id"],
+            "id_usuario_docente": id_prof_2,
+            "periodo_lectivo": "2026-3",
+            "horarios": [
                 {
-                    "day_of_week": 1,
-                    "start_time": "11:00",
-                    "end_time": "12:00",
-                    "classroom": "Aula 12",
+                    "dia_semana": 1,
+                    "hora_inicio": "11:00",
+                    "hora_fin": "12:00",
+                    "aula": "Aula 12",
                 }
             ],
         },
     )
-    assert course_2.status_code == 201, course_2.text
+    assert curso_2.status_code == 201, curso_2.text
 
-    stu_1 = client.post(
+    alumno_1 = cliente.post(
         "/api/persons",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "external_id": "MAT-001",
-            "full_name": "Ana López",
-            "role": "student",
-            "biometric_consent": True,
-            "group_ids": [group_id],
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "MAT-001",
+            "nombre_completo": "Ana López",
+            "rol": "student",
+            "consentimiento_biometrico": True,
+            "ids_grupos": [id_grupo],
         },
     )
-    assert stu_1.status_code == 201, stu_1.text
+    assert alumno_1.status_code == 201, alumno_1.text
 
-    stu_2 = client.post(
+    alumno_2 = cliente.post(
         "/api/persons",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "external_id": "MAT-002",
-            "full_name": "Carlos Ruiz",
-            "role": "student",
-            "biometric_consent": True,
-            "group_ids": [group_id],
+            "id_organizacion": id_organizacion,
+            "identificador_externo": "MAT-002",
+            "nombre_completo": "Carlos Ruiz",
+            "rol": "student",
+            "consentimiento_biometrico": True,
+            "ids_grupos": [id_grupo],
         },
     )
-    assert stu_2.status_code == 201, stu_2.text
+    assert alumno_2.status_code == 201, alumno_2.text
 
     return {
-        "org_id": org_id,
-        "admin_headers": admin_headers,
-        "prof1_headers": _auth_header(client, "profe.arq@uni.edu", "ProfePass1!"),
-        "prof2_headers": _auth_header(client, "profe.bd@uni.edu", "ProfePass2!"),
-        "prof_1_id": prof_1_id,
-        "prof_2_id": prof_2_id,
-        "career_id": career_id,
-        "group_id": group_id,
-        "course_1": course_1.json(),
-        "course_2": course_2.json(),
-        "student_1": stu_1.json(),
-        "student_2": stu_2.json(),
+        "id_organizacion": id_organizacion,
+        "encabezados_admin": encabezados_admin,
+        "encabezados_prof1": _encabezado_autorizacion(cliente, "profe.arq@uni.edu", "ProfePass1!"),
+        "encabezados_prof2": _encabezado_autorizacion(cliente, "profe.bd@uni.edu", "ProfePass2!"),
+        "id_prof_1": id_prof_1,
+        "id_prof_2": id_prof_2,
+        "id_carrera": id_carrera,
+        "id_grupo": id_grupo,
+        "curso_1": curso_1.json(),
+        "curso_2": curso_2.json(),
+        "alumno_1": alumno_1.json(),
+        "alumno_2": alumno_2.json(),
     }
 
 
-def test_academic_hierarchy_inheritance_and_schedule_generation(raw_api_client) -> None:
-    client, _, _, _ = raw_api_client
-    ctx = _setup_school_fixture(client)
+def test_jerarquia_academica_herencia_y_generacion_sesiones(cliente_api_sin_autenticar) -> None:
+    """Valida herencia automática de materias por grupo y generación idempotente de sesiones."""
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    contexto = _configurar_escuela_base(cliente)
 
-    # Los alumnos heredan automáticamente ambas asignaturas de 21026 IS
-    inherited_1 = client.get(
-        f"/api/academic/students/{ctx['student_1']['id']}/courses",
-        headers=ctx["admin_headers"],
+    # Los alumnos heredan automáticamente las materias del grupo 21026 IS
+    heredadas = cliente.get(
+        f"/api/academic/students/{contexto['alumno_1']['id']}/courses",
+        headers=contexto["encabezados_admin"],
     )
-    assert inherited_1.status_code == 200
-    codes = {c["subject_code"] for c in inherited_1.json()}
-    assert codes == {"ARQ-101", "BDD-102"}
+    assert heredadas.status_code == 200
+    codigos = {curso["codigo_materia"] for curso in heredadas.json()}
+    assert codigos == {"ARQ-101", "BDD-102"}
 
-    # Generación automática idempotente para el martes 2026-11-17
-    tuesday = "2026-11-17"
-    gen_1 = client.post(
+    # Generación idempotente para martes 2026-11-17
+    martes = "2026-11-17"
+    gen_1 = cliente.post(
         "/api/academic/sessions/generate",
-        headers=ctx["admin_headers"],
-        json={"organization_id": ctx["org_id"], "target_date": tuesday},
+        headers=contexto["encabezados_admin"],
+        json={"id_organizacion": contexto["id_organizacion"], "fecha_objetivo": martes},
     )
     assert gen_1.status_code == 200, gen_1.text
-    assert gen_1.json()["created_count"] == 2
-    assert gen_1.json()["existing_count"] == 0
-    assert {s["subject_code"] for s in gen_1.json()["sessions"]} == {"ARQ-101", "BDD-102"}
+    assert gen_1.json()["cantidad_creadas"] == 2
+    assert gen_1.json()["cantidad_existentes"] == 0
+    assert {s["codigo_materia"] for s in gen_1.json()["sesiones"]} == {"ARQ-101", "BDD-102"}
 
-    # Re-ejecutar en la misma fecha no duplica sesiones
-    gen_2 = client.post(
+    # Re-ejecutar en la misma fecha no duplica las sesiones ya abiertas
+    gen_2 = cliente.post(
         "/api/academic/sessions/generate",
-        headers=ctx["admin_headers"],
-        json={"organization_id": ctx["org_id"], "target_date": tuesday},
+        headers=contexto["encabezados_admin"],
+        json={"id_organizacion": contexto["id_organizacion"], "fecha_objetivo": martes},
     )
     assert gen_2.status_code == 200
-    assert gen_2.json()["created_count"] == 0
-    assert gen_2.json()["existing_count"] == 2
+    assert gen_2.json()["cantidad_creadas"] == 0
+    assert gen_2.json()["cantidad_existentes"] == 2
 
 
-def test_teacher_strict_isolation_and_kiosk_attendance(raw_api_client) -> None:
-    client, _, engine, _ = raw_api_client
-    ctx = _setup_school_fixture(client)
-    tuesday = "2026-11-17"
+def test_aislamiento_docente_y_pase_lista_kiosco(cliente_api_sin_autenticar) -> None:
+    """Valida aislamiento estricto de docentes sobre su agenda, sesiones y pase de lista."""
+    cliente, _, motor, _ = cliente_api_sin_autenticar
+    contexto = _configurar_escuela_base(cliente)
+    martes = "2026-11-17"
 
-    # Enrolar a Ana López desde admin (docente no puede administrar ni modificar biometría)
-    engine.next_boxes = [FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))]
-    engine.next_embedding = make_unit_vector(41)
-    img_bytes = encode_jpeg_bytes(make_sharp_face_image(400, 400, (100, 80, 180, 200), 140, False))
-    enroll_res = client.post(
-        f"/api/persons/{ctx['student_1']['id']}/enroll-frame",
-        headers=ctx["admin_headers"],
-        data={"pose_label": "frontal", "store_avatar": "false"},
-        files={"image": ("f.jpg", img_bytes, "image/jpeg")},
+    # Enrola a Ana López desde cuenta administrativa
+    motor.siguientes_cuadros = [CuadroRostro(100, 80, 180, 200, 0.98, crear_puntos_pose("frontal"))]
+    motor.siguiente_vector = crear_vector_unitario(41)
+    bytes_img = codificar_bytes_jpeg(
+        crear_imagen_rostro_nitida(400, 400, (100, 80, 180, 200), 140, False)
     )
-    assert enroll_res.status_code == 200 and enroll_res.json()["accepted"] is True
+    res_enrolamiento = cliente.post(
+        f"/api/persons/{contexto['alumno_1']['id']}/enroll-frame",
+        headers=contexto["encabezados_admin"],
+        data={"etiqueta_pose": "frontal", "guardar_avatar": "false"},
+        files={"imagen": ("f.jpg", bytes_img, "image/jpeg")},
+    )
+    assert res_enrolamiento.status_code == 200 and res_enrolamiento.json()["aceptado"] is True
 
-    # Prof 1 no puede modificar estructura académica ni consultar estadísticas globales
+    # Prof 1 no puede modificar catálogo ni ver estadísticas administrativas
     assert (
-        client.post(
+        cliente.post(
             "/api/academic/careers",
-            headers=ctx["prof1_headers"],
-            json={"organization_id": ctx["org_id"], "name": "Otra", "code": "OTR"},
+            headers=contexto["encabezados_prof1"],
+            json={"id_organizacion": contexto["id_organizacion"], "nombre": "Otra", "codigo": "OTR"},
         ).status_code
         == 403
     )
-    assert client.get("/api/academic/stats", headers=ctx["prof1_headers"]).status_code == 403
-
-    # Prof 1 ve solo su materia ARQ-101 y no puede consultar la de Prof 2
-    p1_courses = client.get("/api/academic/courses", headers=ctx["prof1_headers"])
-    assert p1_courses.status_code == 200
-    assert [c["subject_code"] for c in p1_courses.json()] == ["ARQ-101"]
     assert (
-        client.get(
-            f"/api/academic/courses?teacher_user_id={ctx['prof_2_id']}",
-            headers=ctx["prof1_headers"],
+        cliente.get("/api/academic/stats", headers=contexto["encabezados_prof1"]).status_code
+        == 403
+    )
+
+    # Prof 1 únicamente ve ARQ-101 y recibe 403 si consulta las de Prof 2
+    cursos_prof1 = cliente.get("/api/academic/courses", headers=contexto["encabezados_prof1"])
+    assert cursos_prof1.status_code == 200
+    assert [c["codigo_materia"] for c in cursos_prof1.json()] == ["ARQ-101"]
+    assert (
+        cliente.get(
+            f"/api/academic/courses?id_usuario_docente={contexto['id_prof_2']}",
+            headers=contexto["encabezados_prof1"],
         ).status_code
         == 403
     )
 
-    # Agenda docente de Prof 1 el martes a las 10:15 muestra ARQ-101 en curso
-    agenda = client.get(
-        f"/api/academic/teacher/agenda?target_date={tuesday}&current_time=10:15",
-        headers=ctx["prof1_headers"],
+    # Agenda diaria de Prof 1 el martes a las 10:15 muestra ARQ-101 en curso
+    agenda = cliente.get(
+        f"/api/academic/teacher/agenda?fecha_objetivo={martes}&hora_actual=10:15",
+        headers=contexto["encabezados_prof1"],
     )
     assert agenda.status_code == 200, agenda.text
-    agenda_data = agenda.json()
-    assert agenda_data["current_slot"] is not None
-    assert agenda_data["current_slot"]["subject_code"] == "ARQ-101"
-    assert agenda_data["current_slot"]["slot_status"] == "in_progress"
+    datos_agenda = agenda.json()
+    assert datos_agenda["bloque_actual"] is not None
+    assert datos_agenda["bloque_actual"]["codigo_materia"] == "ARQ-101"
+    assert datos_agenda["bloque_actual"]["estado_bloque"] == "in_progress"
 
-    # Inicia su sesión en 1 clic
-    start_p1 = client.post(
-        f"/api/academic/courses/{ctx['course_1']['id']}/start-session",
-        headers=ctx["prof1_headers"],
+    # Inicia sesión de ARQ-101 en 1 clic
+    inicio_p1 = cliente.post(
+        f"/api/academic/courses/{contexto['curso_1']['id']}/start-session",
+        headers=contexto["encabezados_prof1"],
         json={
-            "schedule_id": ctx["course_1"]["schedules"][0]["id"],
-            "session_date": tuesday,
+            "id_horario": contexto["curso_1"]["horarios"][0]["id"],
+            "fecha_sesion": martes,
         },
     )
-    assert start_p1.status_code == 200, start_p1.text
-    sess_p1_id = start_p1.json()["id"]
+    assert inicio_p1.status_code == 200, inicio_p1.text
+    id_sesion_p1 = inicio_p1.json()["id"]
 
-    # Prof 2 inicia su sesión propia; Prof 1 recibe 403 al intentar tocar la de Prof 2
-    start_p2 = client.post(
-        f"/api/academic/courses/{ctx['course_2']['id']}/start-session",
-        headers=ctx["prof2_headers"],
+    # Prof 2 inicia su sesión; Prof 1 recibe 403 al intentar interactuar con ella
+    inicio_p2 = cliente.post(
+        f"/api/academic/courses/{contexto['curso_2']['id']}/start-session",
+        headers=contexto["encabezados_prof2"],
         json={
-            "schedule_id": ctx["course_2"]["schedules"][0]["id"],
-            "session_date": tuesday,
+            "id_horario": contexto["curso_2"]["horarios"][0]["id"],
+            "fecha_sesion": martes,
         },
     )
-    assert start_p2.status_code == 200, start_p2.text
-    sess_p2_id = start_p2.json()["id"]
+    assert inicio_p2.status_code == 200, inicio_p2.text
+    id_sesion_p2 = inicio_p2.json()["id"]
 
     assert (
-        client.post(
-            f"/api/academic/courses/{ctx['course_2']['id']}/start-session",
-            headers=ctx["prof1_headers"],
-            json={"session_date": tuesday},
-        ).status_code
-        == 403
-    )
-    assert client.post(f"/api/sessions/{sess_p2_id}/close", headers=ctx["prof1_headers"]).status_code == 403
-    assert (
-        client.get(
-            f"/api/attendance/events?session_id={sess_p2_id}",
-            headers=ctx["prof1_headers"],
+        cliente.post(
+            f"/api/academic/courses/{contexto['curso_2']['id']}/start-session",
+            headers=contexto["encabezados_prof1"],
+            json={"fecha_sesion": martes},
         ).status_code
         == 403
     )
     assert (
-        client.get(
-            f"/api/attendance/export.csv?session_id={sess_p2_id}",
-            headers=ctx["prof1_headers"],
+        cliente.post(
+            f"/api/sessions/{id_sesion_p2}/close", headers=contexto["encabezados_prof1"]
         ).status_code
         == 403
     )
     assert (
-        client.post(
+        cliente.get(
+            f"/api/attendance/events?id_sesion={id_sesion_p2}",
+            headers=contexto["encabezados_prof1"],
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.get(
+            f"/api/attendance/export.csv?id_sesion={id_sesion_p2}",
+            headers=contexto["encabezados_prof1"],
+        ).status_code
+        == 403
+    )
+    assert (
+        cliente.post(
             "/api/attendance/manual",
-            headers=ctx["prof1_headers"],
-            json={"session_id": sess_p2_id, "person_id": ctx["student_1"]["id"], "event_type": "present"},
+            headers=contexto["encabezados_prof1"],
+            json={
+                "id_sesion": id_sesion_p2,
+                "id_persona": contexto["alumno_1"]["id"],
+                "tipo_evento": "present",
+            },
         ).status_code
         == 403
     )
 
-    # Prof 1 reconoce biométricamente a Ana López en su propia sesión
-    engine.next_boxes = [FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))]
-    engine.next_embedding = make_unit_vector(41)
-    rec = client.post(
+    # Prof 1 toma asistencia biométrica a Ana López dentro de su propia sesión
+    motor.siguientes_cuadros = [CuadroRostro(100, 80, 180, 200, 0.98, crear_puntos_pose("frontal"))]
+    motor.siguiente_vector = crear_vector_unitario(41)
+    reconocimiento = cliente.post(
         "/api/attendance/recognize-frame",
-        headers=ctx["prof1_headers"],
+        headers=contexto["encabezados_prof1"],
         data={
-            "organization_id": str(ctx["org_id"]),
-            "session_id": str(sess_p1_id),
-            "action_mode": "present",
+            "id_organizacion": str(contexto["id_organizacion"]),
+            "id_sesion": str(id_sesion_p1),
+            "modo_accion": "present",
         },
-        files={"image": ("kiosk.jpg", img_bytes, "image/jpeg")},
+        files={"imagen": ("kiosk.jpg", bytes_img, "image/jpeg")},
     )
-    assert rec.status_code == 200, rec.text
-    assert rec.json()["match_status"] == "matched"
-    assert rec.json()["attendance_action"] == "recorded"
+    assert reconocimiento.status_code == 200, reconocimiento.text
+    assert reconocimiento.json()["estado_coincidencia"] == "matched"
+    assert reconocimiento.json()["accion_asistencia"] == "recorded"
 
-    # Y Prof 1 no puede mandar frame al kiosco sobre sesión de Prof 2
-    rec_forbidden = client.post(
+    # Y Prof 1 no puede enviar frames al kiosco usando la sesión de Prof 2
+    rec_prohibido = cliente.post(
         "/api/attendance/recognize-frame",
-        headers=ctx["prof1_headers"],
+        headers=contexto["encabezados_prof1"],
         data={
-            "organization_id": str(ctx["org_id"]),
-            "session_id": str(sess_p2_id),
-            "action_mode": "present",
+            "id_organizacion": str(contexto["id_organizacion"]),
+            "id_sesion": str(id_sesion_p2),
+            "modo_accion": "present",
         },
-        files={"image": ("kiosk.jpg", img_bytes, "image/jpeg")},
+        files={"imagen": ("kiosk.jpg", bytes_img, "image/jpeg")},
     )
-    assert rec_forbidden.status_code == 403
+    assert rec_prohibido.status_code == 403
 
-    # Listado de sesiones para Prof 1 solo muestra la suya
-    sess_list_p1 = client.get("/api/sessions", headers=ctx["prof1_headers"])
-    assert sess_list_p1.status_code == 200
-    assert [s["id"] for s in sess_list_p1.json()] == [sess_p1_id]
+    # El listado de sesiones para Prof 1 únicamente incluye la suya
+    lista_sesiones_p1 = cliente.get("/api/sessions", headers=contexto["encabezados_prof1"])
+    assert lista_sesiones_p1.status_code == 200
+    assert [s["id"] for s in lista_sesiones_p1.json()] == [id_sesion_p1]
 
 
-def test_admin_consolidated_stats_by_subject_and_group(raw_api_client) -> None:
-    client, _, _, _ = raw_api_client
-    ctx = _setup_school_fixture(client)
-    tuesday = date(2026, 11, 17).isoformat()
+def test_estadisticas_consolidadas_por_materia_y_grupo(cliente_api_sin_autenticar) -> None:
+    """Verifica el cálculo consolidado por asignatura, grupo y desglose por estudiante."""
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    contexto = _configurar_escuela_base(cliente)
+    martes = date(2026, 11, 17).isoformat()
 
-    gen = client.post(
+    generadas = cliente.post(
         "/api/academic/sessions/generate",
-        headers=ctx["admin_headers"],
-        json={"organization_id": ctx["org_id"], "target_date": tuesday},
+        headers=contexto["encabezados_admin"],
+        json={"id_organizacion": contexto["id_organizacion"], "fecha_objetivo": martes},
     )
-    assert gen.status_code == 200
-    sessions_by_code = {s["subject_code"]: s["id"] for s in gen.json()["sessions"]}
-    sess_arq = sessions_by_code["ARQ-101"]
-    sess_bd = sessions_by_code["BDD-102"]
+    assert generadas.status_code == 200
+    sesiones_por_codigo = {s["codigo_materia"]: s["id"] for s in generadas.json()["sesiones"]}
+    sesion_arq = sesiones_por_codigo["ARQ-101"]
+    sesion_bd = sesiones_por_codigo["BDD-102"]
 
     # ARQ-101: asiste 1 de 2 alumnos (50%)
-    r1 = client.post(
+    reg_1 = cliente.post(
         "/api/attendance/manual",
-        headers=ctx["admin_headers"],
-        json={"session_id": sess_arq, "person_id": ctx["student_1"]["id"], "event_type": "present", "status": "on_time"},
+        headers=contexto["encabezados_admin"],
+        json={
+            "id_sesion": sesion_arq,
+            "id_persona": contexto["alumno_1"]["id"],
+            "tipo_evento": "present",
+            "estado": "on_time",
+        },
     )
-    assert r1.status_code == 201
+    assert reg_1.status_code == 201
 
     # BDD-102: asisten 2 de 2 alumnos (100%)
-    for sid in (ctx["student_1"]["id"], ctx["student_2"]["id"]):
-        r = client.post(
+    for id_alumno in (contexto["alumno_1"]["id"], contexto["alumno_2"]["id"]):
+        reg = cliente.post(
             "/api/attendance/manual",
-            headers=ctx["admin_headers"],
-            json={"session_id": sess_bd, "person_id": sid, "event_type": "present", "status": "on_time"},
+            headers=contexto["encabezados_admin"],
+            json={
+                "id_sesion": sesion_bd,
+                "id_persona": id_alumno,
+                "tipo_evento": "present",
+                "estado": "on_time",
+            },
         )
-        assert r.status_code == 201
+        assert reg.status_code == 201
 
-    stats_res = client.get("/api/academic/stats", headers=ctx["admin_headers"])
-    assert stats_res.status_code == 200, stats_res.text
-    stats = stats_res.json()
-
-    assert stats["summary"]["total_careers"] == 1
-    assert stats["summary"]["total_groups"] == 2  # Incluye GEN-01 inicial + 21026 IS
-    assert stats["summary"]["total_subjects"] == 2
-    assert stats["summary"]["total_courses"] == 2
-    assert stats["summary"]["total_sessions"] == 2
-    assert stats["summary"]["overall_attendance_rate"] == 75.0
-
-    by_subj = {item["subject_code"]: item for item in stats["by_subject"]}
-    assert by_subj["ARQ-101"]["present_count"] == 1
-    assert by_subj["ARQ-101"]["absent_count"] == 1
-    assert by_subj["ARQ-101"]["attendance_rate"] == 50.0
-    assert by_subj["BDD-102"]["present_count"] == 2
-    assert by_subj["BDD-102"]["absent_count"] == 0
-    assert by_subj["BDD-102"]["attendance_rate"] == 100.0
-
-    filtered_res = client.get(
-        f"/api/academic/stats?career_id={ctx['career_id']}",
-        headers=ctx["admin_headers"],
+    res_estadisticas = cliente.get(
+        "/api/academic/stats", headers=contexto["encabezados_admin"]
     )
-    assert filtered_res.status_code == 200, filtered_res.text
-    filtered = filtered_res.json()
-    assert filtered["summary"]["total_groups"] == 1
-    assert len(filtered["by_group"]) == 1
-    g_stat = filtered["by_group"][0]
-    assert g_stat["group_name"] == "21026 IS"
-    assert g_stat["subjects_count"] == 2
-    assert g_stat["total_expected"] == 4
-    assert g_stat["total_present"] == 3
-    assert g_stat["total_absent"] == 1
-    assert g_stat["overall_attendance_rate"] == 75.0
+    assert res_estadisticas.status_code == 200, res_estadisticas.text
+    estadisticas = res_estadisticas.json()
 
-    breakdown = {st["external_id"]: st for st in g_stat["students_breakdown"]}
-    assert breakdown["MAT-001"]["attendance_rate"] == 100.0
-    assert breakdown["MAT-002"]["attendance_rate"] == 50.0
+    assert estadisticas["resumen"]["total_carreras"] == 1
+    assert estadisticas["resumen"]["total_grupos"] == 2  # Incluye GEN-01 inicial + 21026 IS
+    assert estadisticas["resumen"]["total_materias"] == 2
+    assert estadisticas["resumen"]["total_cursos"] == 2
+    assert estadisticas["resumen"]["total_sesiones"] == 2
+    assert estadisticas["resumen"]["tasa_asistencia_general"] == 75.0
+
+    por_materia = {item["codigo_materia"]: item for item in estadisticas["por_materia"]}
+    assert por_materia["ARQ-101"]["cantidad_asistencias"] == 1
+    assert por_materia["ARQ-101"]["cantidad_faltas"] == 1
+    assert por_materia["ARQ-101"]["tasa_asistencia"] == 50.0
+    assert por_materia["BDD-102"]["cantidad_asistencias"] == 2
+    assert por_materia["BDD-102"]["cantidad_faltas"] == 0
+    assert por_materia["BDD-102"]["tasa_asistencia"] == 100.0
+
+    res_filtradas = cliente.get(
+        f"/api/academic/stats?id_carrera={contexto['id_carrera']}",
+        headers=contexto["encabezados_admin"],
+    )
+    assert res_filtradas.status_code == 200, res_filtradas.text
+    filtradas = res_filtradas.json()
+    assert filtradas["resumen"]["total_grupos"] == 1
+    assert len(filtradas["por_grupo"]) == 1
+    estadistica_grupo = filtradas["por_grupo"][0]
+    assert estadistica_grupo["nombre_grupo"] == "21026 IS"
+    assert estadistica_grupo["cantidad_materias"] == 2
+    assert estadistica_grupo["total_esperados"] == 4
+    assert estadistica_grupo["total_asistencias"] == 3
+    assert estadistica_grupo["total_faltas"] == 1
+    assert estadistica_grupo["tasa_asistencia_general"] == 75.0
+
+    desglose = {
+        al["identificador_externo"]: al for al in estadistica_grupo["desglose_estudiantes"]
+    }
+    assert desglose["MAT-001"]["tasa_asistencia"] == 100.0
+    assert desglose["MAT-002"]["tasa_asistencia"] == 50.0
 
 
-def test_alembic_0002_recovers_from_partial_create_all(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Verifica que alembic upgrade head completa columnas aunque create_all haya creado tablas nuevas antes."""
-    db_file = tmp_path / "partial_alembic.db"
-    db_url = f"sqlite:///{db_file.as_posix()}"
-    monkeypatch.setenv("IDENTIA_DATABASE_URL", db_url)
-    get_settings.cache_clear()
+def test_alembic_0002_recupera_create_all_parcial(tmp_path: Path, monkeypatch) -> None:
+    """Verifica que `alembic upgrade head` completa columnas aunque `create_all` haya corrido antes."""
+    archivo_bd = tmp_path / "alembic_parcial.db"
+    url_bd = f"sqlite:///{archivo_bd.as_posix()}"
+    monkeypatch.setenv("IDENTIA_URL_BASE_DATOS", url_bd)
+    obtener_configuracion.cache_clear()
 
-    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
-    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    config_alembic = Config(str(DIRECTORIO_BACKEND / "alembic.ini"))
+    config_alembic.set_main_option("script_location", str(DIRECTORIO_BACKEND / "migrations"))
 
     try:
-        # Simula BD creada en Bloque B (0001) y posterior arranque de uvicorn que ejecuta create_all
-        command.upgrade(cfg, "0001_initial_rbac_and_biometrics")
-        engine = create_db_engine(db_url)
-        Base.metadata.create_all(bind=engine)
-        engine.dispose()
+        # Simula BD en revisión 0001 y posterior arranque automático con create_all
+        command.upgrade(config_alembic, "0001_initial_rbac_and_biometrics")
+        motor = crear_motor_bd(url_bd)
+        BaseDeclarativa.metadata.create_all(bind=motor)
+        motor.dispose()
 
-        # Ahora alembic upgrade head no debe fallar por "table careers already exists"
-        command.upgrade(cfg, "head")
+        # Ahora upgrade head debe completar índices/FKs/columnas idempotente sin fallar
+        command.upgrade(config_alembic, "head")
 
-        verify_engine = create_db_engine(db_url)
-        insp = inspect(verify_engine)
-        table_names = set(insp.get_table_names())
-        group_cols = {c["name"] for c in insp.get_columns("groups")}
-        person_cols = {c["name"] for c in insp.get_columns("persons")}
-        session_cols = {c["name"] for c in insp.get_columns("attendance_sessions")}
-        with verify_engine.connect() as conn:
-            rev = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-        verify_engine.dispose()
+        motor_verificacion = crear_motor_bd(url_bd)
+        inspector = inspect(motor_verificacion)
+        nombres_tablas = set(inspector.get_table_names())
+        cols_grupos = {c["name"] for c in inspector.get_columns("groups")}
+        cols_personas = {c["name"] for c in inspector.get_columns("persons")}
+        cols_sesiones = {c["name"] for c in inspector.get_columns("attendance_sessions")}
+        with motor_verificacion.connect() as conexion:
+            revision_actual = conexion.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one()
+        motor_verificacion.dispose()
 
-        assert rev == "0005_group_period_type"
-        assert "work_shifts" in table_names
-        assert {"career_id", "semester", "period_type", "default_classroom", "default_work_shift_id"}.issubset(group_cols)
-        assert "work_shift_id" in person_cols
-        assert {"course_assignment_id", "schedule_id", "work_shift_id"}.issubset(session_cols)
+        assert revision_actual == "0005_group_period_type"
+        assert "work_shifts" in nombres_tablas
+        assert {
+            "career_id",
+            "semester",
+            "period_type",
+            "default_classroom",
+            "default_work_shift_id",
+        }.issubset(cols_grupos)
+        assert "work_shift_id" in cols_personas
+        assert {"course_assignment_id", "schedule_id", "work_shift_id"}.issubset(cols_sesiones)
     finally:
-        get_settings.cache_clear()
+        obtener_configuracion.cache_clear()
 
 
-def test_academic_periods_default_classroom_and_multi_day_schedules(raw_api_client) -> None:
-    """Valida periodos académicos (institución/carrera), aula fija en grupo y múltiples días por materia."""
-    client, _, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+def test_periodos_academicos_aula_fija_y_horarios_multidia(cliente_api_sin_autenticar) -> None:
+    """Valida herencia de periodos (institución/carrera), aula fija y varios días por curso."""
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    school = client.post(
+    escuela = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": "Politécnica IdentIA",
-            "mode": "education",
-            "academic_period_type": "cuatrimestral",
-            "admin_user": {
-                "full_name": "Admin Poli",
-                "email": "admin.poli@uni.edu",
-                "password": "PoliPass123!",
+            "nombre": "Politécnica IdentIA",
+            "modo": "education",
+            "tipo_periodo_academico": "cuatrimestral",
+            "usuario_administrador": {
+                "nombre_completo": "Admin Poli",
+                "correo": "admin.poli@uni.edu",
+                "contrasena": "PoliPass123!",
             },
         },
     )
-    assert school.status_code == 201, school.text
-    assert school.json()["academic_period_type"] == "cuatrimestral"
-    org_id = school.json()["id"]
-    admin_headers = _auth_header(client, "admin.poli@uni.edu", "PoliPass123!")
+    assert escuela.status_code == 201, escuela.text
+    assert escuela.json()["tipo_periodo_academico"] == "cuatrimestral"
+    id_organizacion = escuela.json()["id"]
+    encabezados_admin = _encabezado_autorizacion(cliente, "admin.poli@uni.edu", "PoliPass123!")
 
     # Carrera A hereda cuatrimestral; Carrera B sobrescribe a semestral
-    career_a = client.post(
+    carrera_a = cliente.post(
         "/api/academic/careers",
-        headers=admin_headers,
-        json={"organization_id": org_id, "name": "Ingeniería en Software", "code": "ISW"},
-    )
-    assert career_a.status_code == 201, career_a.text
-    assert career_a.json()["period_type"] is None
-    assert career_a.json()["effective_period_type"] == "cuatrimestral"
-
-    career_b = client.post(
-        "/api/academic/careers",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "Derecho",
-            "code": "DER",
-            "period_type": "semestral",
+            "id_organizacion": id_organizacion,
+            "nombre": "Ingeniería en Software",
+            "codigo": "ISW",
         },
     )
-    assert career_b.status_code == 201, career_b.text
-    assert career_b.json()["period_type"] == "semestral"
-    assert career_b.json()["effective_period_type"] == "semestral"
+    assert carrera_a.status_code == 201, carrera_a.text
+    assert carrera_a.json()["tipo_periodo"] is None
+    assert carrera_a.json()["tipo_periodo_efectivo"] == "cuatrimestral"
 
-    group = client.post(
+    carrera_b = cliente.post(
+        "/api/academic/careers",
+        headers=encabezados_admin,
+        json={
+            "id_organizacion": id_organizacion,
+            "nombre": "Derecho",
+            "codigo": "DER",
+            "tipo_periodo": "semestral",
+        },
+    )
+    assert carrera_b.status_code == 201, carrera_b.text
+    assert carrera_b.json()["tipo_periodo"] == "semestral"
+    assert carrera_b.json()["tipo_periodo_efectivo"] == "semestral"
+
+    grupo = cliente.post(
         "/api/groups",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "21026 IS",
-            "code": "21026-IS",
-            "career_id": career_a.json()["id"],
-            "semester": "6to Cuatrimestre",
-            "default_classroom": "Aula 33",
+            "id_organizacion": id_organizacion,
+            "nombre": "21026 IS",
+            "codigo": "21026-IS",
+            "id_carrera": carrera_a.json()["id"],
+            "semestre": "6to Cuatrimestre",
+            "aula_defecto": "Aula 33",
         },
     )
-    assert group.status_code == 201, group.text
-    assert group.json()["default_classroom"] == "Aula 33"
-    assert group.json()["period_type"] == "cuatrimestral"
+    assert grupo.status_code == 201, grupo.text
+    assert grupo.json()["aula_defecto"] == "Aula 33"
+    assert grupo.json()["tipo_periodo"] == "cuatrimestral"
 
-    subj = client.post(
+    materia = cliente.post(
         "/api/academic/subjects",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "career_id": career_a.json()["id"],
-            "name": "Computación",
-            "code": "CMP-301",
+            "id_organizacion": id_organizacion,
+            "id_carrera": carrera_a.json()["id"],
+            "nombre": "Computación",
+            "codigo": "CMP-301",
         },
     )
-    assert subj.status_code == 201, subj.text
+    assert materia.status_code == 201, materia.text
 
-    # Múltiples días en una sola asignación: Lunes y Miércoles en Aula 33, Viernes en Aula 12
-    course = client.post(
+    # Múltiples bloques horarios en una asignación: Lunes/Miércoles en Aula 33, Viernes en Aula 12
+    curso = cliente.post(
         "/api/academic/courses",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "group_id": group.json()["id"],
-            "subject_id": subj.json()["id"],
-            "term": "2026-3",
-            "schedules": [
-                {"day_of_week": 0, "start_time": "08:00", "end_time": "09:00", "classroom": "Aula 33"},
-                {"day_of_week": 2, "start_time": "08:00", "end_time": "09:00", "classroom": "Aula 33"},
-                {"day_of_week": 4, "start_time": "08:00", "end_time": "09:00", "classroom": "Aula 12"},
+            "id_organizacion": id_organizacion,
+            "id_grupo": grupo.json()["id"],
+            "id_materia": materia.json()["id"],
+            "periodo_lectivo": "2026-3",
+            "horarios": [
+                {
+                    "dia_semana": 0,
+                    "hora_inicio": "08:00",
+                    "hora_fin": "09:00",
+                    "aula": "Aula 33",
+                },
+                {
+                    "dia_semana": 2,
+                    "hora_inicio": "08:00",
+                    "hora_fin": "09:00",
+                    "aula": "Aula 33",
+                },
+                {
+                    "dia_semana": 4,
+                    "hora_inicio": "08:00",
+                    "hora_fin": "09:00",
+                    "aula": "Aula 12",
+                },
             ],
         },
     )
-    assert course.status_code == 201, course.text
-    c_data = course.json()
-    assert c_data["group_default_classroom"] == "Aula 33"
-    assert c_data["semester"] == "6to Cuatrimestre"
-    assert c_data["period_type"] == "cuatrimestral"
-    assert len(c_data["schedules"]) == 3
-    classrooms_by_day = {sl["day_of_week"]: sl["classroom"] for sl in c_data["schedules"]}
-    assert classrooms_by_day == {0: "Aula 33", 2: "Aula 33", 4: "Aula 12"}
+    assert curso.status_code == 201, curso.text
+    datos_curso = curso.json()
+    assert datos_curso["aula_defecto_grupo"] == "Aula 33"
+    assert datos_curso["semestre"] == "6to Cuatrimestre"
+    assert datos_curso["tipo_periodo"] == "cuatrimestral"
+    assert len(datos_curso["horarios"]) == 3
+    aulas_por_dia = {h["dia_semana"]: h["aula"] for h in datos_curso["horarios"]}
+    assert aulas_por_dia == {0: "Aula 33", 2: "Aula 33", 4: "Aula 12"}
 
-    stats = client.get("/api/academic/stats", headers=admin_headers)
-    assert stats.status_code == 200, stats.text
-    s_data = stats.json()
-    assert s_data["by_subject"][0]["career_id"] == career_a.json()["id"]
-    assert s_data["by_subject"][0]["semester"] == "6to Cuatrimestre"
-    assert s_data["by_subject"][0]["period_type"] == "cuatrimestral"
-    g_match = next(item for item in s_data["by_group"] if item["group_id"] == group.json()["id"])
-    assert g_match["period_type"] == "cuatrimestral"
+    estadisticas = cliente.get("/api/academic/stats", headers=encabezados_admin)
+    assert estadisticas.status_code == 200, estadisticas.text
+    datos_est = estadisticas.json()
+    assert datos_est["por_materia"][0]["id_carrera"] == carrera_a.json()["id"]
+    assert datos_est["por_materia"][0]["semestre"] == "6to Cuatrimestre"
+    assert datos_est["por_materia"][0]["tipo_periodo"] == "cuatrimestral"
+    coincidencia_grupo = next(
+        item for item in datos_est["por_grupo"] if item["id_grupo"] == grupo.json()["id"]
+    )
+    assert coincidencia_grupo["tipo_periodo"] == "cuatrimestral"
 
 
-def test_period_type_change_requires_admin_password_and_group_override(
-    raw_api_client, tmp_path: Path, monkeypatch
+def test_cambio_tipo_periodo_exige_clave_admin_y_migracion_0005(
+    cliente_api_sin_autenticar, tmp_path: Path, monkeypatch
 ) -> None:
-    """Valida tipo de periodo propio por grupo, autorización con clave admin y migración 0005."""
-    client, _, _, _ = raw_api_client
-    settings = get_settings()
-    sa_headers = _auth_header(
-        client,
-        settings.bootstrap_superadmin_email,
-        settings.bootstrap_superadmin_password,
+    """Valida periodo propio por grupo, protección con contraseña admin y ciclo Alembic 0005."""
+    cliente, _, _, _ = cliente_api_sin_autenticar
+    configuracion = obtener_configuracion()
+    encabezados_sa = _encabezado_autorizacion(
+        cliente,
+        configuracion.correo_superadmin_inicial,
+        configuracion.contrasena_superadmin_inicial,
     )
 
-    school = client.post(
+    escuela = cliente.post(
         "/api/organizations",
-        headers=sa_headers,
+        headers=encabezados_sa,
         json={
-            "name": "Instituto Norte",
-            "mode": "education",
-            "academic_period_type": "semestral",
-            "admin_user": {
-                "full_name": "Admin Norte",
-                "email": "admin@norte.edu",
-                "password": "NorteAdmin99!",
+            "nombre": "Instituto Norte",
+            "modo": "education",
+            "tipo_periodo_academico": "semestral",
+            "usuario_administrador": {
+                "nombre_completo": "Admin Norte",
+                "correo": "admin@norte.edu",
+                "contrasena": "NorteAdmin99!",
             },
         },
     ).json()
-    org_id = school["id"]
-    admin_headers = _auth_header(client, "admin@norte.edu", "NorteAdmin99!")
+    id_organizacion = escuela["id"]
+    encabezados_admin = _encabezado_autorizacion(cliente, "admin@norte.edu", "NorteAdmin99!")
 
-    career = client.post(
+    carrera = cliente.post(
         "/api/academic/careers",
-        headers=admin_headers,
-        json={"organization_id": org_id, "name": "Sistemas", "code": "SIS"},
+        headers=encabezados_admin,
+        json={"id_organizacion": id_organizacion, "nombre": "Sistemas", "codigo": "SIS"},
     ).json()
 
-    grp = client.post(
+    grupo = cliente.post(
         "/api/groups",
-        headers=admin_headers,
+        headers=encabezados_admin,
         json={
-            "organization_id": org_id,
-            "name": "301 SIS",
-            "code": "301-SIS",
-            "career_id": career["id"],
-            "semester": "3",
-            "default_classroom": "B-12",
+            "id_organizacion": id_organizacion,
+            "nombre": "301 SIS",
+            "codigo": "301-SIS",
+            "id_carrera": carrera["id"],
+            "semestre": "3",
+            "aula_defecto": "B-12",
         },
     ).json()
-    assert grp["period_type"] == "semestral"
-    assert grp["custom_period_type"] is None
+    assert grupo["tipo_periodo"] == "semestral"
+    assert grupo["tipo_periodo_personalizado"] is None
 
-    # Editar aula fija o número sin cambiar tipo de periodo NO exige contraseña
-    edit_no_period = client.patch(
-        f"/api/groups/{grp['id']}",
-        headers=admin_headers,
-        json={"semester": "6", "default_classroom": "B-14"},
+    # Editar aula o número sin cambiar tipo_periodo NO solicita contraseña
+    editar_sin_periodo = cliente.patch(
+        f"/api/groups/{grupo['id']}",
+        headers=encabezados_admin,
+        json={"semestre": "6", "aula_defecto": "B-14"},
     )
-    assert edit_no_period.status_code == 200, edit_no_period.text
-    assert edit_no_period.json()["default_classroom"] == "B-14"
+    assert editar_sin_periodo.status_code == 200, editar_sin_periodo.text
+    assert editar_sin_periodo.json()["aula_defecto"] == "B-14"
 
-    # Cambiar tipo de periodo de grupo sin contraseña -> 400
-    grp_no_pass = client.patch(
-        f"/api/groups/{grp['id']}",
-        headers=admin_headers,
-        json={"period_type": "cuatrimestral"},
+    # Cambiar tipo de periodo sin contraseña -> 400
+    grupo_sin_clave = cliente.patch(
+        f"/api/groups/{grupo['id']}",
+        headers=encabezados_admin,
+        json={"tipo_periodo": "cuatrimestral"},
     )
-    assert grp_no_pass.status_code == 400
+    assert grupo_sin_clave.status_code == 400
 
     # Contraseña incorrecta -> 403
-    grp_bad_pass = client.patch(
-        f"/api/groups/{grp['id']}",
-        headers=admin_headers,
-        json={"period_type": "cuatrimestral", "authorization_secret": "WrongPass!"},
+    grupo_clave_mala = cliente.patch(
+        f"/api/groups/{grupo['id']}",
+        headers=encabezados_admin,
+        json={"tipo_periodo": "cuatrimestral", "secreto_autorizacion": "WrongPass!"},
     )
-    assert grp_bad_pass.status_code == 403
+    assert grupo_clave_mala.status_code == 403
 
     # Contraseña válida de admin -> 200 y prioridad grupo > carrera > institución
-    grp_ok = client.patch(
-        f"/api/groups/{grp['id']}",
-        headers=admin_headers,
-        json={"period_type": "cuatrimestral", "authorization_secret": "NorteAdmin99!"},
+    grupo_ok = cliente.patch(
+        f"/api/groups/{grupo['id']}",
+        headers=encabezados_admin,
+        json={"tipo_periodo": "cuatrimestral", "secreto_autorizacion": "NorteAdmin99!"},
     )
-    assert grp_ok.status_code == 200, grp_ok.text
-    assert grp_ok.json()["custom_period_type"] == "cuatrimestral"
-    assert grp_ok.json()["period_type"] == "cuatrimestral"
+    assert grupo_ok.status_code == 200, grupo_ok.text
+    assert grupo_ok.json()["tipo_periodo_personalizado"] == "cuatrimestral"
+    assert grupo_ok.json()["tipo_periodo"] == "cuatrimestral"
 
-    # Carrera y organización también exigen contraseña admin al cambiar tipo de periodo
+    # Carrera y organización también exigen clave admin al modificar su periodo
     assert (
-        client.patch(
-            f"/api/academic/careers/{career['id']}",
-            headers=admin_headers,
-            json={"period_type": "trimestral"},
+        cliente.patch(
+            f"/api/academic/careers/{carrera['id']}",
+            headers=encabezados_admin,
+            json={"tipo_periodo": "trimestral"},
         ).status_code
         == 400
     )
     assert (
-        client.patch(
-            f"/api/academic/careers/{career['id']}",
-            headers=admin_headers,
-            json={"period_type": "trimestral", "authorization_secret": "WrongPass"},
+        cliente.patch(
+            f"/api/academic/careers/{carrera['id']}",
+            headers=encabezados_admin,
+            json={"tipo_periodo": "trimestral", "secreto_autorizacion": "WrongPass"},
         ).status_code
         == 403
     )
-    career_ok = client.patch(
-        f"/api/academic/careers/{career['id']}",
-        headers=admin_headers,
-        json={"period_type": "trimestral", "authorization_secret": "NorteAdmin99!"},
+    carrera_ok = cliente.patch(
+        f"/api/academic/careers/{carrera['id']}",
+        headers=encabezados_admin,
+        json={"tipo_periodo": "trimestral", "secreto_autorizacion": "NorteAdmin99!"},
     )
-    assert career_ok.status_code == 200
-    assert career_ok.json()["effective_period_type"] == "trimestral"
+    assert carrera_ok.status_code == 200
+    assert carrera_ok.json()["tipo_periodo_efectivo"] == "trimestral"
 
     assert (
-        client.patch(
-            f"/api/organizations/{org_id}",
-            headers=admin_headers,
-            json={"academic_period_type": "bimestral"},
+        cliente.patch(
+            f"/api/organizations/{id_organizacion}",
+            headers=encabezados_admin,
+            json={"tipo_periodo_academico": "bimestral"},
         ).status_code
         == 400
     )
-    org_ok = client.patch(
-        f"/api/organizations/{org_id}",
-        headers=admin_headers,
-        json={"academic_period_type": "bimestral", "authorization_secret": "NorteAdmin99!"},
+    org_ok = cliente.patch(
+        f"/api/organizations/{id_organizacion}",
+        headers=encabezados_admin,
+        json={"tipo_periodo_academico": "bimestral", "secreto_autorizacion": "NorteAdmin99!"},
     )
     assert org_ok.status_code == 200
-    assert org_ok.json()["academic_period_type"] == "bimestral"
+    assert org_ok.json()["tipo_periodo_academico"] == "bimestral"
 
-    # Estadísticas reflejan el override propio del grupo ("cuatrimestral")
-    stats = client.get("/api/academic/stats", headers=admin_headers).json()
-    grp_stat = next(g for g in stats["by_group"] if g["group_id"] == grp["id"])
-    assert grp_stat["period_type"] == "cuatrimestral"
+    # Las estadísticas reflejan la sobrescritura propia del grupo ("cuatrimestral")
+    estadisticas = cliente.get("/api/academic/stats", headers=encabezados_admin).json()
+    estadistica_grupo = next(
+        g for g in estadisticas["por_grupo"] if g["id_grupo"] == grupo["id"]
+    )
+    assert estadistica_grupo["tipo_periodo"] == "cuatrimestral"
 
-    # Bitácora de auditoría registró los tres cambios de periodo
-    logs = client.get(f"/api/security/audit-logs?organization_id={org_id}", headers=admin_headers).json()
-    actions = {entry["action"] for entry in logs}
+    # Auditoría registró los tres cambios de periodo
+    registros = cliente.get(
+        f"/api/security/audit-logs?id_organizacion={id_organizacion}",
+        headers=encabezados_admin,
+    ).json()
+    acciones = {entrada["accion"] for entrada in registros}
     assert {
         "change_group_period_type",
         "change_career_period_type",
         "change_org_period_type",
-    }.issubset(actions)
+    }.issubset(acciones)
 
     # Ciclo Alembic 0005 -> downgrade 0004 -> upgrade head
-    db_file = tmp_path / "alembic_0005.db"
-    db_url = f"sqlite:///{db_file.as_posix()}"
-    monkeypatch.setenv("IDENTIA_DATABASE_URL", db_url)
-    get_settings.cache_clear()
-    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
-    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    archivo_bd = tmp_path / "alembic_0005.db"
+    url_bd = f"sqlite:///{archivo_bd.as_posix()}"
+    monkeypatch.setenv("IDENTIA_URL_BASE_DATOS", url_bd)
+    obtener_configuracion.cache_clear()
+    config_alembic = Config(str(DIRECTORIO_BACKEND / "alembic.ini"))
+    config_alembic.set_main_option("script_location", str(DIRECTORIO_BACKEND / "migrations"))
     try:
-        command.upgrade(cfg, "head")
-        command.downgrade(cfg, "0004_enterprise_work_shifts")
-        eng_down = create_db_engine(db_url)
-        cols_down = {c["name"] for c in inspect(eng_down).get_columns("groups")}
-        eng_down.dispose()
-        assert "period_type" not in cols_down
+        command.upgrade(config_alembic, "head")
+        command.downgrade(config_alembic, "0004_enterprise_work_shifts")
+        motor_bajada = crear_motor_bd(url_bd)
+        cols_bajada = {c["name"] for c in inspect(motor_bajada).get_columns("groups")}
+        motor_bajada.dispose()
+        assert "period_type" not in cols_bajada
 
-        command.upgrade(cfg, "head")
-        eng_up = create_db_engine(db_url)
-        cols_up = {c["name"] for c in inspect(eng_up).get_columns("groups")}
-        eng_up.dispose()
-        assert "period_type" in cols_up
+        command.upgrade(config_alembic, "head")
+        motor_subida = crear_motor_bd(url_bd)
+        cols_subida = {c["name"] for c in inspect(motor_subida).get_columns("groups")}
+        motor_subida.dispose()
+        assert "period_type" in cols_subida
     finally:
-        get_settings.cache_clear()
+        obtener_configuracion.cache_clear()
