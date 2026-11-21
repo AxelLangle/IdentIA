@@ -52,6 +52,8 @@ router = APIRouter(prefix="/api/academic", tags=["academic"])
 def _serialize_careers(db: Session, careers: list[Career], organization_id: int) -> list[CareerRead]:
     if not careers:
         return []
+    org = db.get(Organization, organization_id)
+    org_period_type = org.academic_period_type if org else "semestral"
     group_counts = {
         cid: int(cnt)
         for cid, cnt in db.execute(
@@ -75,6 +77,8 @@ def _serialize_careers(db: Session, careers: list[Career], organization_id: int)
             name=c.name,
             code=c.code,
             description=c.description,
+            period_type=c.period_type,
+            effective_period_type=c.period_type or org_period_type,
             created_at=c.created_at,
             groups_count=group_counts.get(c.id, 0),
             subjects_count=subject_counts.get(c.id, 0),
@@ -171,6 +175,7 @@ def create_career(
         name=payload.name.strip(),
         code=payload.code.strip().upper(),
         description=payload.description.strip() if payload.description else None,
+        period_type=payload.period_type,
     )
     db.add(career)
     try:
@@ -216,6 +221,8 @@ def update_career(
         career.code = data["code"].strip().upper()
     if "description" in data:
         career.description = data["description"].strip() if data["description"] else None
+    if "period_type" in data:
+        career.period_type = data["period_type"]
 
     try:
         db.commit()
