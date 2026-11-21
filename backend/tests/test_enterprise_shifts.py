@@ -656,7 +656,7 @@ def test_bulk_assign_generate_sessions_enterprise_stats_and_csv(raw_api_client) 
 
 
 def test_alembic_0004_upgrade_and_downgrade(tmp_path: Path, monkeypatch) -> None:
-    """Verifica el ciclo completo upgrade -> downgrade 0003 -> upgrade head sobre SQLite."""
+    """Verifica el ciclo completo upgrade 0004 -> downgrade 0003 -> upgrade 0004 sobre SQLite."""
     db_file = tmp_path / "alembic_0004.db"
     db_url = f"sqlite:///{db_file.as_posix()}"
     monkeypatch.setenv("IDENTIA_DATABASE_URL", db_url)
@@ -666,7 +666,7 @@ def test_alembic_0004_upgrade_and_downgrade(tmp_path: Path, monkeypatch) -> None
     cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
 
     try:
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0004_enterprise_work_shifts")
         eng = create_db_engine(db_url)
         insp = inspect(eng)
         assert "work_shifts" in insp.get_table_names()
@@ -691,8 +691,8 @@ def test_alembic_0004_upgrade_and_downgrade(tmp_path: Path, monkeypatch) -> None
         assert "early_exit_minutes" not in ev_cols2
         eng2.dispose()
 
-        # Re-upgrade a head
-        command.upgrade(cfg, "head")
+        # Re-upgrade a 0004
+        command.upgrade(cfg, "0004_enterprise_work_shifts")
         eng3 = create_db_engine(db_url)
         with eng3.connect() as conn:
             rev3 = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
