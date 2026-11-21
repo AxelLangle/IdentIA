@@ -301,3 +301,104 @@ def test_delegated_credential_revocation_batch_and_audit(raw_api_client) -> None
         json={"person_ids": [p1["id"]], "authorization_secret": plain_secret},
     )
     assert after_revoke.status_code == 403
+
+
+def test_dynamic_role_validation_by_organization_mode(raw_api_client) -> None:
+    """Valida que 'supervisor' sea exclusivo de empresa y 'teacher' exclusivo de escuela."""
+    client, _, _, _ = raw_api_client
+    settings = get_settings()
+    sa_headers = _auth_header(
+        client,
+        settings.bootstrap_superadmin_email,
+        settings.bootstrap_superadmin_password,
+    )
+
+    ent_org = client.post(
+        "/api/organizations",
+        headers=sa_headers,
+        json={
+            "name": "Empresa Logística Norte",
+            "mode": "enterprise",
+            "admin_user": {
+                "full_name": "Admin Empresa",
+                "email": "admin.ent@identia.local",
+                "password": "AdminEnt2026!",
+            },
+        },
+    ).json()
+    edu_org = client.post(
+        "/api/organizations",
+        headers=sa_headers,
+        json={
+            "name": "Escuela Técnica Sur",
+            "mode": "education",
+            "admin_user": {
+                "full_name": "Admin Escuela",
+                "email": "admin.edu@identia.local",
+                "password": "AdminEdu2026!",
+            },
+        },
+    ).json()
+
+    ent_admin_headers = _auth_header(client, "admin.ent@identia.local", "AdminEnt2026!")
+    edu_admin_headers = _auth_header(client, "admin.edu@identia.local", "AdminEdu2026!")
+
+    # Empresa: rechaza 'teacher' (400), acepta 'supervisor' (201)
+    bad_ent_teacher = client.post(
+        "/api/users",
+        headers=ent_admin_headers,
+        json={
+            "email": "no.profe@identia.local",
+            "full_name": "Intento Profe",
+            "password": "Password123!",
+            "role": "teacher",
+        },
+    )
+    assert bad_ent_teacher.status_code == 400
+
+    ok_ent_supervisor = client.post(
+        "/api/users",
+        headers=ent_admin_headers,
+        json={
+            "email": "sup@identia.local",
+            "full_name": "Supervisor Planta",
+            "password": "Password123!",
+            "role": "supervisor",
+        },
+    )
+    assert ok_ent_supervisor.status_code == 201
+    sup_id = ok_ent_supervisor.json()["id"]
+
+    # Actualizar usuario existente de empresa a 'teacher' también debe fallar (400)
+    bad_ent_patch = client.patch(
+        f"/api/users/{sup_id}",
+        headers=ent_admin_headers,
+        json={"role": "teacher"},
+    )
+    assert bad_ent_patch.status_code == 400
+
+    # Escuela: rechaza 'supervisor' (400), acepta 'teacher' (201)
+    bad_edu_supervisor = client.post(
+        "/api/users",
+        headers=edu_admin_headers,
+        json={
+            "email": "no.sup@identia.local",
+            "full_name": "Intento Supervisor",
+            "password": "Password123!",
+            "role": "supervisor",
+        },
+    )
+    assert bad_edu_supervisor.status_code == 400
+
+    ok_edu_teacher = client.post(
+        "/api/users",
+        headers=edu_admin_headers,
+        json={
+            "email": "profe@identia.local",
+            "full_name": "Profesor Titular",
+            "password": "Password123!",
+            "role": "teacher",
+        },
+    )
+    assert ok_edu_teacher.status_code == 201
+    assert ent_org["mode"] == "enterprise" and edu_org["mode"] == "education"
