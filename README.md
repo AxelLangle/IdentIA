@@ -12,10 +12,12 @@ Surgió como una reconstrucción completa desde cero del proyecto académico ant
 - **Frontend (`frontend/`):** React + Vite + TypeScript + Tailwind CSS + WebRTC (`getUserMedia`).
 - **Motor Biométrico:**
   1. Decodificación de frame en memoria RAM (sin guardar fotografías crudas en disco).
-  2. Detección multi-rostro con **YuNet (`face_detection_yunet_2023mar.onnx`)**.
-  3. Validación de calidad (tamaño mínimo, nitidez por varianza Laplaciana e iluminación).
-  4. Alineación facial por landmarks y extracción de embedding L2-normalizado de 128 dimensiones con **SFace (`face_recognition_sface_2021dec.onnx`)**.
+  2. Detección multi-rostro con **YuNet (`face_detection_yunet_2023mar.onnx`)** con fallback LAB/CLAHE en contraluz.
+  3. Validación de calidad (tamaño mínimo, nitidez, iluminación, sombra lateral, contraluz y validación geométrica de 6 poses: `frontal`, `left`, `right`, `up`, `down`, `smile`).
+  4. Alineación facial, normalización selectiva de iluminación extrema LAB y extracción de embedding L2-normalizado de 128 dimensiones con **SFace (`sface_2021dec_v2`)**.
   5. Búsqueda 1:N por similitud coseno con umbral calibrado (`0.42`) y verificación de margen contra el segundo candidato (`0.05`).
+
+> Consulta también el [Manual de Uso y Operación](docs/USER_MANUAL.md) y la [Arquitectura Técnica](docs/ARCHITECTURE.md).
 
 ---
 
@@ -49,6 +51,7 @@ cd backend
 python -m venv .venv
 source .venv/Scripts/activate
 pip install -r requirements.txt
+alembic upgrade head
 python -m app.vision.models_loader
 uvicorn app.main:app --reload --port 8000
 ```
@@ -59,11 +62,17 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+alembic upgrade head
 python -m app.vision.models_loader
 uvicorn app.main:app --reload --port 8000
 ```
 
 > Al arrancar `models_loader` (o automáticamente al iniciar la API), se descargan en `backend/models/` los modelos oficiales ONNX de OpenCV Zoo (`face_detection_yunet_2023mar.onnx` y `face_recognition_sface_2021dec.onnx`).
+
+#### Credenciales Demo Iniciales (entorno local)
+
+- **Superadmin Global:** `admin@identia.local` / `IdentIA2026!`
+- **Admin Organización Demo:** `empresa@identia.local` / `Empresa2026!`
 
 ### 2. Frontend (React + Vite)
 
@@ -116,6 +125,17 @@ npm run build
 ## Hoja de Ruta
 
 - **Fase 0–1 (Completa):** Arquitectura unificada, repositorio limpio y motor biométrico ONNX YuNet + SFace con control de calidad.
-- **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, registro guiado de 5 poses, grupos, sesiones y exportación CSV).
-- **Fase 3 (Siguiente):** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
-- **Fase 4 (Futura):** Liveness activo (detección de parpadeo/micro-movimientos en navegador), autenticación de roles (Admin/Docente/RRHH) y migración opcional a PostgreSQL/pgvector.
+- **Fase 2 (Completa):** MVP Individual (Kiosco check-in/check-out empresarial + pase de lista individual escolar, grupos, sesiones y exportación CSV).
+- **Bloque A (Completa):** Compensación de contraluz/sombras LAB, bloqueo de contraluz en registro, asistente guiado de 6 poses con validación geométrica y manual de uso.
+- **Bloque B (Completa):** Autenticación JWT, aislamiento multi-organización (`superadmin`, `org_admin`, `teacher`, `operator`), revocación individual/lote con contraseñas delegadas hasheadas (`scrypt`), bitácora de auditoría y migraciones Alembic.
+- **Bloque C (Completa):** Modelo educativo completo (`Career`, `Group` académico con periodo/aula fija, `Subject`, `CourseAssignment`, `ClassSchedule`), periodos configurables, herencia automática de materias, portal docente con aislamiento estricto ("Tu clase ahora" en 1 clic), estadísticas por asignatura/grupo y migraciones `0002`/`0003`.
+- **Bloque D (Completa en `feat/bloque-d-turnos-empresa`):** Turnos empresariales (`WorkShift` diurno y nocturno con cruce de medianoche), asignación individual/lote y herencia por departamento, reglas de puntualidad/salida anticipada/inasistencias, estadísticas por turno/empleado y migración `0004_enterprise_work_shifts`.
+- **Fase 3 (Siguiente desde `develop`):** Modo Grupal de Alta Velocidad (captura panorámica / foto HD de aula o cuadrilla con detección simultánea multi-rostro y validación rápida de casos dudosos).
+
+---
+
+## Flujo de Ramas Git
+
+- `main`: Rama estable.
+- `staging`: Preproducción.
+- `develop`: Integración principal; cada nueva funcionalidad parte en una rama `feat/*` desde `develop`.

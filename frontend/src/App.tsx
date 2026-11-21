@@ -1,21 +1,37 @@
 import { useCallback, useEffect, useState } from "react";
 import { Layout, type NavTab } from "./components/Layout";
-import { api } from "./lib/api";
+import {
+  api,
+  getStoredToken,
+  setOnUnauthorizedHandler,
+  setStoredToken,
+} from "./lib/api";
+import { AcademicPage } from "./pages/AcademicPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { EnrollmentPage } from "./pages/EnrollmentPage";
+import { EnterpriseShiftsPage } from "./pages/EnterpriseShiftsPage";
 import { KioskPage } from "./pages/KioskPage";
+import { LoginPage } from "./pages/LoginPage";
+import { SecurityPage } from "./pages/SecurityPage";
 import { SessionsPage } from "./pages/SessionsPage";
+import { TeacherPortalPage } from "./pages/TeacherPortalPage";
 import type {
   AttendanceEvent,
   AttendanceSession,
+  AuthUser,
   Group,
   HealthResponse,
+  LoginResponse,
   Organization,
   Person,
 } from "./types/api";
 
 export function App() {
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+
   const [activeTab, setActiveTab] = useState<NavTab>("dashboard");
+  const [kioskTargetSessionId, setKioskTargetSessionId] = useState<number | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState<number | null>(null);
@@ -24,8 +40,26 @@ export function App() {
   const [persons, setPersons] = useState<Person[]>([]);
   const [sessions, setSessions] = useState<AttendanceSession[]>([]);
   const [events, setEvents] = useState<AttendanceEvent[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  const handleLogout = useCallback(() => {
+    setStoredToken(null);
+    setCurrentUser(null);
+    setOrganizations([]);
+    setSelectedOrgId(null);
+    setGroups([]);
+    setPersons([]);
+    setSessions([]);
+    setEvents([]);
+    setKioskTargetSessionId(null);
+    setActiveTab("dashboard");
+  }, []);
+
+  const handleOpenSessionInKiosk = useCallback((sessionId: number) => {
+    setKioskTargetSessionId(sessionId);
+    setActiveTab("kiosk");
+  }, []);
 
   const loadOrgData = useCallback(async (orgId: number) => {
     const [grps, pers, sess, evs, hlt] = await Promise.all([
@@ -42,37 +76,89 @@ export function App() {
     setHealth(hlt);
   }, []);
 
-  const bootstrap = useCallback(
-    async (preferredOrgId?: number) => {
+  const bootstrapWorkspace = useCallback(
+    async (preferredOrgId?: number, userForRouting?: AuthUser | null) => {
+      setLoading(true);
       try {
         setLoadError(null);
         const [hlt, orgs] = await Promise.all([api.getHealth(), api.listOrganizations()]);
         setHealth(hlt);
         setOrganizations(orgs);
-        const targetId = preferredOrgId ?? selectedOrgId ?? orgs[0]?.id ?? null;
+        const targetId = preferredOrgId ?? orgs[0]?.id ?? null;
         setSelectedOrgId(targetId);
+        const targetOrg = orgs.find((o) => o.id === targetId) ?? null;
+        if (userForRouting?.role === "teacher" && targetOrg?.mode === "education") {
+          setActiveTab("teacher_portal");
+        } else if (targetOrg?.mode === "enterprise") {
+          setActiveTab((prev) =>
+            prev === "academic" || prev === "teacher_portal" ? "dashboard" : prev
+          );
+        } else if (targetOrg?.mode === "education") {
+          setActiveTab((prev) => (prev === "enterprise_shifts" ? "dashboard" : prev));
+        }
         if (targetId !== null) {
           await loadOrgData(targetId);
         }
       } catch (err) {
         setLoadError(
           err instanceof Error
-            ? `No se pudo conectar al backend de IdentIA: ${err.message}`
-            : "Error al iniciar la aplicación."
+            ? `No se pudo cargar la información de IdentIA: ${err.message}`
+            : "Error al iniciar el espacio de trabajo."
         );
       } finally {
         setLoading(false);
       }
     },
-    [loadOrgData, selectedOrgId]
+    [loadOrgData]
   );
 
   useEffect(() => {
-    void bootstrap();
-  }, [bootstrap]);
+    setOnUnauthorizedHandler(() => {
+      handleLogout();
+    });
+    return () => setOnUnauthorizedHandler(null);
+  }, [handleLogout]);
+
+  useEffect(() => {
+    async function restoreSession() {
+      const token = getStoredToken();
+      if (!token) {
+        setCheckingAuth(false);
+        return;
+      }
+      try {
+        const user = await api.getMe();
+        setCurrentUser(user);
+        await bootstrapWorkspace(user.organization_id ?? undefined, user);
+      } catch {
+        setStoredToken(null);
+        setCurrentUser(null);
+      } finally {
+        setCheckingAuth(false);
+      }
+    }
+    void restoreSession();
+  }, [bootstrapWorkspace]);
+
+  const handleLoginSuccess = async (loginData: LoginResponse) => {
+    setCurrentUser(loginData.user);
+    setActiveTab("dashboard");
+    await bootstrapWorkspace(loginData.user.organization_id ?? undefined, loginData.user);
+  };
 
   const handleSelectOrg = async (orgId: number) => {
     setSelectedOrgId(orgId);
+    setKioskTargetSessionId(null);
+    const targetOrg = organizations.find((o) => o.id === orgId) ?? null;
+    if (targetOrg?.mode === "enterprise") {
+      setActiveTab((prev) =>
+        prev === "academic" || prev === "teacher_portal" ? "dashboard" : prev
+      );
+    } else if (currentUser?.role === "teacher" && targetOrg?.mode === "education") {
+      setActiveTab("teacher_portal");
+    } else if (targetOrg?.mode === "education") {
+      setActiveTab((prev) => (prev === "enterprise_shifts" ? "dashboard" : prev));
+    }
     await loadOrgData(orgId);
   };
 
@@ -83,12 +169,26 @@ export function App() {
     await loadOrgData(selectedOrgId);
   }, [loadOrgData, selectedOrgId]);
 
+  if (checkingAuth) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-400 flex items-center justify-center text-sm">
+        Verificando sesión...
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return <LoginPage onSuccess={(res) => void handleLoginSuccess(res)} />;
+  }
+
   const selectedOrg = organizations.find((o) => o.id === selectedOrgId) ?? null;
 
   return (
     <Layout
       activeTab={activeTab}
       onChangeTab={setActiveTab}
+      currentUser={currentUser}
+      onLogout={handleLogout}
       organizations={organizations}
       selectedOrg={selectedOrg}
       onSelectOrg={(id) => void handleSelectOrg(id)}
@@ -104,7 +204,7 @@ export function App() {
           <p>{loadError}</p>
           <button
             type="button"
-            onClick={() => void bootstrap()}
+            onClick={() => void bootstrapWorkspace(selectedOrgId ?? undefined)}
             className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-semibold"
           >
             Reintentar
@@ -112,37 +212,49 @@ export function App() {
         </div>
       ) : !selectedOrg ? (
         <div className="text-center text-slate-400 py-16 text-sm">
-          No hay organizaciones disponibles.
+          No hay organizaciones asignadas a tu usuario.
         </div>
       ) : (
         <>
-          {activeTab === "dashboard" && (
+          {activeTab === "teacher_portal" && selectedOrg.mode === "education" && (
+            <TeacherPortalPage
+              currentUser={currentUser}
+              organization={selectedOrg}
+              onRefreshAll={refreshCurrentOrg}
+              onOpenSessionInKiosk={handleOpenSessionInKiosk}
+            />
+          )}
+          {activeTab === "dashboard" && currentUser.role !== "teacher" && (
             <DashboardPage
+              currentUser={currentUser}
               organization={selectedOrg}
               health={health}
               persons={persons}
               events={events}
               onRefreshAll={refreshCurrentOrg}
               onOrganizationCreated={async (id) => {
-                await bootstrap(id);
+                await bootstrapWorkspace(id);
               }}
               onNavigateTab={setActiveTab}
             />
           )}
           {activeTab === "kiosk" && (
             <KioskPage
+              currentUser={currentUser}
               organization={selectedOrg}
               groups={groups}
               sessions={sessions}
               events={events}
+              initialSessionId={kioskTargetSessionId}
               onRefreshEvents={async () => {
                 const evs = await api.listEvents(selectedOrg.id);
                 setEvents(evs);
               }}
             />
           )}
-          {activeTab === "enrollment" && (
+          {activeTab === "enrollment" && currentUser.role !== "teacher" && (
             <EnrollmentPage
+              currentUser={currentUser}
               organization={selectedOrg}
               groups={groups}
               persons={persons}
@@ -156,8 +268,32 @@ export function App() {
               }}
             />
           )}
+          {activeTab === "academic" &&
+            selectedOrg.mode === "education" &&
+            (currentUser.role === "superadmin" || currentUser.role === "org_admin") && (
+              <AcademicPage
+                currentUser={currentUser}
+                organization={selectedOrg}
+                groups={groups}
+                onRefreshOrg={refreshCurrentOrg}
+                onOpenSessionInKiosk={handleOpenSessionInKiosk}
+              />
+            )}
+          {activeTab === "enterprise_shifts" &&
+            selectedOrg.mode === "enterprise" &&
+            ["superadmin", "org_admin", "supervisor"].includes(currentUser.role) && (
+              <EnterpriseShiftsPage
+                currentUser={currentUser}
+                organization={selectedOrg}
+                groups={groups}
+                persons={persons}
+                onRefreshOrg={refreshCurrentOrg}
+                onOpenSessionInKiosk={handleOpenSessionInKiosk}
+              />
+            )}
           {activeTab === "sessions" && (
             <SessionsPage
+              currentUser={currentUser}
               organization={selectedOrg}
               groups={groups}
               sessions={sessions}
@@ -166,6 +302,10 @@ export function App() {
               onRefreshAll={refreshCurrentOrg}
             />
           )}
+          {activeTab === "security" &&
+            (currentUser.role === "superadmin" || currentUser.role === "org_admin") && (
+              <SecurityPage currentUser={currentUser} organization={selectedOrg} />
+            )}
         </>
       )}
     </Layout>

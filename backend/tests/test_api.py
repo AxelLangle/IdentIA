@@ -1,10 +1,18 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from app.models import AttendanceEvent
+from sqlalchemy import select
+
+from app.config import get_settings
+from app.models import AttendanceEvent, FaceEmbedding
 from app.vision.engine import normalize_embedding
 from app.vision.quality import FaceBox
-from tests.conftest import encode_jpeg_bytes, make_sharp_face_image, make_unit_vector
+from tests.conftest import (
+    encode_jpeg_bytes,
+    make_pose_landmarks,
+    make_sharp_face_image,
+    make_unit_vector,
+)
 
 
 def _good_image_bytes() -> bytes:
@@ -26,7 +34,7 @@ def test_health_and_seeded_organization(api_client) -> None:
 
 
 def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
-    client, _, engine, tmp_path = api_client
+    client, SessionLocal, engine, tmp_path = api_client
     org_id = client.get("/api/organizations").json()[0]["id"]
 
     # Persona sin consentimiento biométrico
@@ -79,8 +87,8 @@ def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
     assert no_face.json()["accepted"] is False
 
     # 2 rostros -> rechazado
-    box1 = FaceBox(100, 80, 180, 200, 0.98, [])
-    box2 = FaceBox(10, 10, 90, 90, 0.91, [])
+    box1 = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("frontal"))
+    box2 = FaceBox(10, 10, 90, 90, 0.91, make_pose_landmarks("frontal"))
     engine.next_boxes = [box1, box2]
     two_faces = client.post(
         f"/api/persons/{person_id}/enroll-frame",
@@ -101,8 +109,31 @@ def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
     assert ok_frontal.status_code == 200
     data_frontal = ok_frontal.json()
     assert data_frontal["accepted"] is True
+    assert data_frontal["pose_valid"] is True
     assert data_frontal["embeddings_count"] == 1
     assert data_frontal["avatar_saved"] is True
+
+    # Pose incorrecta: rostro frontal enviado como pose "left" -> rechazado
+    wrong_pose = client.post(
+        f"/api/persons/{person_id}/enroll-frame",
+        data={"pose_label": "left"},
+        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    )
+    assert wrong_pose.json()["accepted"] is False
+    assert wrong_pose.json()["pose_valid"] is False
+
+    # Pose "left" válida con dry_run=true -> pose_valid=True pero no persiste vector
+    left_box = FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks("left"))
+    engine.next_boxes = [left_box]
+    dry = client.post(
+        f"/api/persons/{person_id}/enroll-frame",
+        data={"pose_label": "left", "dry_run": "true"},
+        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+    )
+    assert dry.status_code == 200
+    assert dry.json()["pose_valid"] is True
+    assert dry.json()["accepted"] is False
+    assert dry.json()["embeddings_count"] == 1
 
     # Pose inconsistente (otra persona) -> rechazada
     engine.next_embedding = -make_unit_vector(42)
@@ -114,24 +145,53 @@ def test_enrollment_validation_privacy_and_revocation(api_client) -> None:
     assert inconsistent.json()["accepted"] is False
     assert "no coincide" in inconsistent.json()["message"]
 
-    # Pose consistente -> aceptada
+    # Completa las 5 poses restantes válidas hasta llegar a 6/6
     engine.next_embedding = make_unit_vector(42)
-    ok_left = client.post(
-        f"/api/persons/{person_id}/enroll-frame",
-        data={"pose_label": "left"},
-        files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
-    )
-    assert ok_left.json()["accepted"] is True
-    assert ok_left.json()["embeddings_count"] == 2
+    last_pose_res = None
+    for pose in ("left", "right", "up", "down", "smile"):
+        engine.next_boxes = [FaceBox(100, 80, 180, 200, 0.98, make_pose_landmarks(pose))]
+        res_pose = client.post(
+            f"/api/persons/{person_id}/enroll-frame",
+            data={"pose_label": pose},
+            files={"image": ("frame.jpg", _good_image_bytes(), "image/jpeg")},
+        )
+        assert res_pose.status_code == 200
+        last_pose_res = res_pose.json()
+        assert last_pose_res["accepted"] is True
+
+    assert last_pose_res is not None
+    assert last_pose_res["is_complete"] is True
+    assert last_pose_res["required_poses_count"] == 6
+
+    final_person = [p for p in client.get(f"/api/persons?organization_id={org_id}").json() if p["id"] == person_id][0]
+    assert final_person["embeddings_count"] == 6
+
+    with SessionLocal() as db:
+        frontal_emb = db.scalars(
+            select(FaceEmbedding).where(
+                FaceEmbedding.person_id == person_id,
+                FaceEmbedding.pose_label == "frontal",
+            )
+        ).one()
+        assert frontal_emb.pitch_ratio is not None
+        assert frontal_emb.mouth_ratio is not None
 
     # Privacidad: ninguna foto cruda .jpg/.png persistida en el directorio temporal de datos
     saved_images = list(Path(tmp_path).rglob("*.jpg")) + list(Path(tmp_path).rglob("*.png"))
     assert saved_images == []
 
-    # Revocación de biometría
-    revoked = client.delete(f"/api/persons/{person_id}/biometrics")
+    # Revocación de biometría protegida con contraseña de autorización
+    settings = get_settings()
+    revoked = client.request(
+        "DELETE",
+        f"/api/persons/{person_id}/biometrics",
+        json={
+            "authorization_secret": settings.bootstrap_superadmin_password,
+            "reason": "Prueba de revocación individual",
+        },
+    )
     assert revoked.status_code == 200
-    assert revoked.json()["deleted_embeddings"] == 2
+    assert revoked.json()["deleted_embeddings"] == 6
     assert revoked.json()["avatar_cleared"] is True
 
 

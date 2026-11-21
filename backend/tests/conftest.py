@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.config import get_settings
 from app.db import create_db_engine, get_db
 from app.main import create_app
 from app.vision.engine import normalize_embedding
@@ -57,6 +58,29 @@ def make_unit_vector(seed: int, dim: int = 128) -> np.ndarray:
     return normalize_embedding(vec)
 
 
+def make_pose_landmarks(pose: str) -> list[tuple[float, float]]:
+    """Genera los 5 landmarks de YuNet calibrados para cada una de las 6 poses."""
+    right_eye = (150.0, 145.0)
+    left_eye = (230.0, 145.0)
+    right_mouth = (162.0, 225.0)
+    left_mouth = (218.0, 225.0)
+    nose = (190.0, 188.0)
+
+    if pose == "left":
+        nose = (210.0, 188.0)
+    elif pose == "right":
+        nose = (170.0, 188.0)
+    elif pose == "up":
+        nose = (190.0, 173.0)
+    elif pose == "down":
+        nose = (190.0, 203.0)
+    elif pose == "smile":
+        right_mouth = (152.0, 225.0)
+        left_mouth = (228.0, 225.0)
+
+    return [right_eye, left_eye, nose, right_mouth, left_mouth]
+
+
 class FakeBiometricEngine:
     """Motor biométrico determinista para pruebas rápidas de integración HTTP."""
 
@@ -68,18 +92,16 @@ class FakeBiometricEngine:
                 w=180,
                 h=200,
                 confidence=0.98,
-                landmarks=[
-                    (150.0, 145.0),
-                    (230.0, 145.0),
-                    (190.0, 185.0),
-                    (160.0, 225.0),
-                    (220.0, 225.0),
-                ],
+                landmarks=make_pose_landmarks("frontal"),
             )
         ]
         self.next_embedding: np.ndarray = make_unit_vector(1)
 
-    def detect(self, image_bgr: np.ndarray) -> list[tuple[FaceBox, np.ndarray]]:
+    def detect(
+        self,
+        image_bgr: np.ndarray,
+        allow_backlight_fallback: bool = True,
+    ) -> list[tuple[FaceBox, np.ndarray]]:
         results: list[tuple[FaceBox, np.ndarray]] = []
         for idx, box in enumerate(self.next_boxes):
             row = np.zeros(15, dtype=np.float32)
@@ -102,7 +124,7 @@ def fake_engine() -> FakeBiometricEngine:
 
 
 @pytest.fixture()
-def api_client(
+def raw_api_client(
     tmp_path: Path, fake_engine: FakeBiometricEngine
 ) -> Generator[tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path], None, None]:
     db_file = tmp_path / "test_identia.db"
@@ -131,3 +153,22 @@ def api_client(
         yield client, TestingSessionLocal, fake_engine, tmp_path
 
     test_engine.dispose()
+
+
+@pytest.fixture()
+def api_client(
+    raw_api_client: tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path],
+) -> tuple[TestClient, sessionmaker[Session], FakeBiometricEngine, Path]:
+    client, TestingSessionLocal, fake_engine, tmp_path = raw_api_client
+    settings = get_settings()
+    login_res = client.post(
+        "/api/auth/login",
+        json={
+            "email": settings.bootstrap_superadmin_email,
+            "password": settings.bootstrap_superadmin_password,
+        },
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+    client.headers.update({"Authorization": f"Bearer {token}"})
+    return client, TestingSessionLocal, fake_engine, tmp_path
