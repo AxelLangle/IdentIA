@@ -10,6 +10,7 @@ export type UserRole = "superadmin" | "org_admin" | "teacher" | "operator";
 export type PoseLabel = "frontal" | "left" | "right" | "up" | "down" | "smile";
 export type ActionMode = "auto" | "check_in" | "check_out" | "present";
 export type SessionStatus = "open" | "closed";
+export type ShiftSource = "direct" | "group" | "none";
 
 export interface Organization {
   id: number;
@@ -31,6 +32,9 @@ export interface Group {
   code: string;
   semester: string | null;
   default_classroom: string | null;
+  default_work_shift_id: number | null;
+  default_work_shift_name: string | null;
+  default_work_shift_code: string | null;
   period_type: string;
   schedule_start: string;
   schedule_end: string;
@@ -52,6 +56,12 @@ export interface Person {
   is_active: boolean;
   created_at: string;
   group_ids: number[];
+  work_shift_id: number | null;
+  work_shift_name: string | null;
+  effective_work_shift_id: number | null;
+  effective_work_shift_name: string | null;
+  effective_work_shift_code: string | null;
+  shift_source: ShiftSource;
   embeddings_count: number;
   poses_completed: PoseLabel[];
   needs_reenroll: boolean;
@@ -109,6 +119,10 @@ export interface AttendanceSession {
   group_name: string | null;
   course_assignment_id: number | null;
   schedule_id: number | null;
+  work_shift_id: number | null;
+  work_shift_name: string | null;
+  work_shift_code: string | null;
+  work_shift_crosses_midnight: boolean;
   subject_name: string | null;
   subject_code: string | null;
   career_name: string | null;
@@ -131,9 +145,14 @@ export interface AttendanceEvent {
   person_name: string;
   person_external_id: string;
   person_avatar_base64: string | null;
+  work_shift_id: number | null;
+  work_shift_name: string | null;
   event_type: "check_in" | "check_out" | "present";
-  status: "on_time" | "late" | "manual";
+  status: "on_time" | "late" | "early_exit" | "manual";
   confidence_score: number | null;
+  worked_minutes: number | null;
+  late_minutes: number | null;
+  early_exit_minutes: number | null;
   capture_mode: "kiosk_individual" | "group_scan" | "manual";
   timestamp: string;
   notes: string | null;
@@ -158,6 +177,9 @@ export interface RecognizeFrameResponse {
   attendance_action: "recorded" | "cooldown" | "already_present" | "invalid_sequence" | null;
   event: AttendanceEvent | null;
   worked_minutes: number | null;
+  shift_name: string | null;
+  late_minutes: number | null;
+  early_exit_minutes: number | null;
   session_id: number | null;
   message: string;
   latency_ms: number;
@@ -401,4 +423,102 @@ export interface AcademicStatsResponse {
   summary: AcademicStatsSummary;
   by_subject: SubjectAttendanceStat[];
   by_group: GroupAttendanceStat[];
+}
+
+// --- Turnos Empresariales y Reglas de Jornada (Bloque D) ---
+export interface WorkShift {
+  id: number;
+  organization_id: number;
+  name: string;
+  code: string;
+  start_time: string;
+  end_time: string;
+  crosses_midnight: boolean;
+  expected_duration_minutes: number;
+  days_of_week: number[];
+  late_tolerance_minutes: number | null;
+  effective_late_tolerance_minutes: number;
+  early_exit_tolerance_minutes: number;
+  is_active: boolean;
+  assigned_employees_count: number;
+  default_groups_count: number;
+  created_at: string;
+}
+
+export interface ShiftBulkAssignResponse {
+  work_shift_id: number | null;
+  work_shift_name: string | null;
+  updated_count: number;
+}
+
+export interface ShiftAttendanceStat {
+  work_shift_id: number | null;
+  shift_name: string;
+  shift_code: string | null;
+  start_time: string | null;
+  end_time: string | null;
+  crosses_midnight: boolean;
+  days_of_week: number[];
+  employees_count: number;
+  scheduled_days: number;
+  present_days: number;
+  on_time_days: number;
+  late_days: number;
+  early_exit_days: number;
+  absent_days: number;
+  missing_checkout_days: number;
+  total_worked_minutes: number;
+  avg_worked_minutes: number;
+  attendance_rate: number;
+  punctuality_rate: number;
+}
+
+export interface EmployeeAttendanceStat {
+  person_id: number;
+  external_id: string;
+  full_name: string;
+  group_names: string[];
+  work_shift_id: number | null;
+  shift_name: string | null;
+  shift_code: string | null;
+  shift_source: ShiftSource;
+  scheduled_days: number;
+  present_days: number;
+  on_time_days: number;
+  late_days: number;
+  early_exit_days: number;
+  absent_days: number;
+  missing_checkout_days: number;
+  total_late_minutes: number;
+  total_early_exit_minutes: number;
+  total_worked_minutes: number;
+  attendance_rate: number;
+  punctuality_rate: number;
+}
+
+export interface EnterpriseStatsSummary {
+  total_shifts: number;
+  active_shifts: number;
+  total_employees: number;
+  assigned_employees: number;
+  unassigned_employees: number;
+  scheduled_employee_days: number;
+  present_days: number;
+  on_time_days: number;
+  late_days: number;
+  early_exit_days: number;
+  absent_days: number;
+  missing_checkout_days: number;
+  total_worked_minutes: number;
+  attendance_rate: number;
+  punctuality_rate: number;
+}
+
+export interface EnterpriseStatsResponse {
+  organization_id: number;
+  date_from: string;
+  date_to: string;
+  summary: EnterpriseStatsSummary;
+  by_shift: ShiftAttendanceStat[];
+  by_employee: EmployeeAttendanceStat[];
 }
