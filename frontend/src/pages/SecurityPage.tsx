@@ -9,6 +9,7 @@ import {
   UserPlus,
   Users,
 } from "lucide-react";
+import { PasswordInput } from "../components/PasswordInput";
 import { api } from "../lib/api";
 import type {
   AuditLogEntry,
@@ -250,8 +251,7 @@ export function SecurityPage({ currentUser, organization }: SecurityPageProps) {
 
             <div>
               <label className="block text-xs text-slate-400 mb-1">Contraseña</label>
-              <input
-                type="password"
+              <PasswordInput
                 required
                 minLength={6}
                 value={newPassword}

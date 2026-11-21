@@ -8,9 +8,12 @@ import {
   ShieldCheck,
   Users,
 } from "lucide-react";
+import { PasswordInput } from "../components/PasswordInput";
+import { ACADEMIC_PERIOD_OPTIONS } from "../lib/academicPeriods";
 import { api } from "../lib/api";
 import type { NavTab } from "../components/Layout";
 import type {
+  AcademicPeriodType,
   AttendanceEvent,
   AuthUser,
   HealthResponse,
@@ -41,6 +44,9 @@ export function DashboardPage({
   onNavigateTab,
 }: DashboardPageProps) {
   const [mode, setMode] = useState<OrgMode>(organization.mode);
+  const [academicPeriodType, setAcademicPeriodType] = useState<AcademicPeriodType>(
+    organization.academic_period_type
+  );
   const [tolerance, setTolerance] = useState<number>(organization.late_tolerance_minutes);
   const [cooldown, setCooldown] = useState<number>(organization.cooldown_seconds);
   const [storeAvatar, setStoreAvatar] = useState<boolean>(organization.store_avatar_by_default);
@@ -50,6 +56,7 @@ export function DashboardPage({
   const [showNewOrg, setShowNewOrg] = useState(false);
   const [newOrgName, setNewOrgName] = useState("");
   const [newOrgMode, setNewOrgMode] = useState<OrgMode>("education");
+  const [newOrgPeriodType, setNewOrgPeriodType] = useState<AcademicPeriodType>("semestral");
   const [createInitialAdmin, setCreateInitialAdmin] = useState(true);
   const [adminFullName, setAdminFullName] = useState("");
   const [adminEmail, setAdminEmail] = useState("");
@@ -62,6 +69,7 @@ export function DashboardPage({
 
   useEffect(() => {
     setMode(organization.mode);
+    setAcademicPeriodType(organization.academic_period_type ?? "semestral");
     setTolerance(organization.late_tolerance_minutes);
     setCooldown(organization.cooldown_seconds);
     setStoreAvatar(organization.store_avatar_by_default);
@@ -82,6 +90,7 @@ export function DashboardPage({
     try {
       await api.updateOrganization(organization.id, {
         mode,
+        academic_period_type: academicPeriodType,
         late_tolerance_minutes: Number(tolerance),
         cooldown_seconds: Number(cooldown),
         store_avatar_by_default: storeAvatar,
@@ -104,6 +113,7 @@ export function DashboardPage({
       const created = await api.createOrganization({
         name: newOrgName.trim(),
         mode: newOrgMode,
+        academic_period_type: newOrgMode === "education" ? newOrgPeriodType : "semestral",
         admin_user: createInitialAdmin
           ? {
               full_name: adminFullName.trim(),
@@ -197,6 +207,25 @@ export function DashboardPage({
             </div>
           </div>
 
+          {newOrgMode === "education" && (
+            <div className="sm:max-w-xs">
+              <label className="block text-xs text-slate-400 mb-1">
+                Periodo académico general
+              </label>
+              <select
+                value={newOrgPeriodType}
+                onChange={(e) => setNewOrgPeriodType(e.target.value as AcademicPeriodType)}
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              >
+                {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
           <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
             <input
               type="checkbox"
@@ -225,14 +254,13 @@ export function DashboardPage({
                 placeholder="admin@nuevaorg.com"
                 className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
-              <input
-                type="password"
+              <PasswordInput
                 required
                 minLength={6}
                 value={adminPassword}
                 onChange={(e) => setAdminPassword(e.target.value)}
                 placeholder="Contraseña (mín. 6)"
-                className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
               />
             </div>
           )}
@@ -326,6 +354,26 @@ export function DashboardPage({
               <option value="education">Escuela (Pase de lista único)</option>
             </select>
           </div>
+
+          {mode === "education" && (
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Periodo académico general
+              </label>
+              <select
+                value={academicPeriodType}
+                disabled={!canEditOrg}
+                onChange={(e) => setAcademicPeriodType(e.target.value as AcademicPeriodType)}
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-60"
+              >
+                {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <div>

@@ -32,6 +32,7 @@ from app.schemas import (
     PoseLabel,
 )
 from app.security import assert_org_access, get_current_user, require_roles, resolve_org_scope
+from app.services.academic_service import get_teacher_group_ids
 from app.services.security_service import (
     AuthorizationResult,
     record_audit_log,
@@ -121,6 +122,15 @@ def list_persons(
         .where(Person.organization_id == scoped_org_id)
         .order_by(Person.id.desc())
     )
+    if current_user.role == "teacher":
+        teacher_gids = get_teacher_group_ids(db, current_user.id)
+        if not teacher_gids:
+            return []
+        stmt = stmt.where(
+            Person.id.in_(
+                select(PersonGroup.person_id).where(PersonGroup.group_id.in_(teacher_gids))
+            )
+        )
     if group_id is not None:
         stmt = stmt.join(PersonGroup, PersonGroup.person_id == Person.id).where(
             PersonGroup.group_id == group_id

@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { Lock, ScanFace } from "lucide-react";
+import { PasswordInput } from "../components/PasswordInput";
 import { api } from "../lib/api";
 import type { LoginResponse } from "../types/api";
 
@@ -67,9 +68,8 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
             <label htmlFor="login-password" className="block text-xs text-slate-400 mb-1.5">
               Contraseña
             </label>
-            <input
+            <PasswordInput
               id="login-password"
-              type="password"
               required
               autoComplete="current-password"
               value={password}

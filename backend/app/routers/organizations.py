@@ -3,10 +3,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import Group, Organization, PersonGroup, User
+from app.models import Career, CourseAssignment, Group, Organization, PersonGroup, User
 from app.schemas import (
     GroupCreate,
     GroupRead,
+    GroupUpdate,
     OrganizationCreate,
     OrganizationRead,
     OrganizationUpdate,
@@ -18,6 +19,7 @@ from app.security import (
     require_roles,
     resolve_org_scope,
 )
+from app.services.academic_service import get_teacher_group_ids
 from app.services.security_service import record_audit_log
 
 router = APIRouter(prefix="/api", tags=["organizations"])
@@ -120,6 +122,58 @@ def update_organization(
     return org
 
 
+def _serialize_groups(db: Session, groups: list[Group], organization_id: int) -> list[GroupRead]:
+    if not groups:
+        return []
+
+    org = db.get(Organization, organization_id)
+    org_period_type = org.academic_period_type if org else "semestral"
+    career_map = {
+        c.id: c
+        for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
+    }
+    counts_rows = db.execute(
+        select(PersonGroup.group_id, func.count(PersonGroup.person_id)).group_by(PersonGroup.group_id)
+    ).all()
+    counts_map = {gid: cnt for gid, cnt in counts_rows}
+
+    courses_rows = db.execute(
+        select(CourseAssignment.group_id, func.count(CourseAssignment.id))
+        .where(
+            CourseAssignment.organization_id == organization_id,
+            CourseAssignment.is_active.is_(True),
+        )
+        .group_by(CourseAssignment.group_id)
+    ).all()
+    courses_map = {gid: cnt for gid, cnt in courses_rows}
+
+    result: list[GroupRead] = []
+    for g in groups:
+        career = career_map.get(g.career_id) if g.career_id else None
+        effective_period = (
+            career.period_type if career and career.period_type else org_period_type
+        )
+        result.append(
+            GroupRead(
+                id=g.id,
+                organization_id=g.organization_id,
+                career_id=g.career_id,
+                career_name=career.name if career else None,
+                name=g.name,
+                code=g.code,
+                semester=g.semester,
+                default_classroom=g.default_classroom,
+                period_type=effective_period,
+                schedule_start=g.schedule_start,
+                schedule_end=g.schedule_end,
+                created_at=g.created_at,
+                members_count=counts_map.get(g.id, 0),
+                courses_count=courses_map.get(g.id, 0),
+            )
+        )
+    return result
+
+
 @router.get("/groups", response_model=list[GroupRead])
 def list_groups(
     organization_id: int | None = Query(default=None),
@@ -127,33 +181,19 @@ def list_groups(
     db: Session = Depends(get_db),
 ) -> list[GroupRead]:
     scoped_org_id = resolve_org_scope(current_user, organization_id)
-    groups = db.scalars(
+    stmt = (
         select(Group)
         .where(Group.organization_id == scoped_org_id)
         .order_by(Group.id.asc())
-    ).all()
+    )
+    if current_user.role == "teacher":
+        teacher_gids = get_teacher_group_ids(db, current_user.id)
+        if not teacher_gids:
+            return []
+        stmt = stmt.where(Group.id.in_(teacher_gids))
 
-    counts_rows = db.execute(
-        select(PersonGroup.group_id, func.count(PersonGroup.person_id))
-        .group_by(PersonGroup.group_id)
-    ).all()
-    counts_map = {gid: cnt for gid, cnt in counts_rows}
-
-    result: list[GroupRead] = []
-    for g in groups:
-        result.append(
-            GroupRead(
-                id=g.id,
-                organization_id=g.organization_id,
-                name=g.name,
-                code=g.code,
-                schedule_start=g.schedule_start,
-                schedule_end=g.schedule_end,
-                created_at=g.created_at,
-                members_count=counts_map.get(g.id, 0),
-            )
-        )
-    return result
+    groups = list(db.scalars(stmt).all())
+    return _serialize_groups(db, groups, scoped_org_id)
 
 
 @router.post("/groups", response_model=GroupRead, status_code=status.HTTP_201_CREATED)
@@ -167,20 +207,57 @@ def create_group(
     if org is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    group = Group(**payload.model_dump())
+    if payload.career_id is not None:
+        career = db.get(Career, payload.career_id)
+        if career is None or career.organization_id != org.id:
+            raise HTTPException(
+                status_code=404,
+                detail="Carrera no encontrada en la organización.",
+            )
+
+    data = payload.model_dump()
+    if data.get("semester") is not None:
+        data["semester"] = data["semester"].strip() or None
+    if data.get("default_classroom") is not None:
+        data["default_classroom"] = data["default_classroom"].strip() or None
+
+    group = Group(**data)
     db.add(group)
     db.commit()
     db.refresh(group)
-    return GroupRead(
-        id=group.id,
-        organization_id=group.organization_id,
-        name=group.name,
-        code=group.code,
-        schedule_start=group.schedule_start,
-        schedule_end=group.schedule_end,
-        created_at=group.created_at,
-        members_count=0,
-    )
+    return _serialize_groups(db, [group], org.id)[0]
+
+
+@router.patch("/groups/{group_id}", response_model=GroupRead)
+def update_group(
+    group_id: int,
+    payload: GroupUpdate,
+    current_user: User = Depends(require_roles("superadmin", "org_admin")),
+    db: Session = Depends(get_db),
+) -> GroupRead:
+    group = db.get(Group, group_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail="Grupo no encontrado.")
+    assert_org_access(current_user, group.organization_id)
+
+    data = payload.model_dump(exclude_unset=True)
+    if "career_id" in data and data["career_id"] is not None:
+        career = db.get(Career, data["career_id"])
+        if career is None or career.organization_id != group.organization_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Carrera no encontrada en la organización.",
+            )
+
+    for field, value in data.items():
+        if field in ("semester", "default_classroom") and isinstance(value, str):
+            setattr(group, field, value.strip() or None)
+        else:
+            setattr(group, field, value)
+
+    db.commit()
+    db.refresh(group)
+    return _serialize_groups(db, [group], group.organization_id)[0]
 
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)

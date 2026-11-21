@@ -1,13 +1,13 @@
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import Base, SessionLocal, engine as default_engine, get_db
 from app.models import FaceEmbedding, Group, Organization, Person, User
-from app.routers import attendance, auth, organizations, persons, security
+from app.routers import academic, attendance, auth, organizations, persons, security
 from app.schemas import HealthResponse
 from app.security import hash_secret
 from app.vision.engine import BiometricEngine
@@ -81,7 +81,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        Base.metadata.create_all(bind=active_engine)
+        if not inspect(active_engine).has_table("alembic_version"):
+            Base.metadata.create_all(bind=active_engine)
         with active_session_factory() as db:
             seed_initial_data(db)
 
@@ -101,7 +102,7 @@ def create_app(
 
     application = FastAPI(
         title=settings.app_name,
-        version="0.3.0",
+        version="0.4.0",
         description="Motor biométrico y plataforma de asistencia multi-organización IdentIA.",
         lifespan=lifespan,
     )
@@ -119,6 +120,7 @@ def create_app(
     application.include_router(organizations.router)
     application.include_router(persons.router)
     application.include_router(attendance.router)
+    application.include_router(academic.router)
 
     @application.get("/api/health", response_model=HealthResponse, tags=["system"])
     def health(db: Session = Depends(get_db)) -> HealthResponse:

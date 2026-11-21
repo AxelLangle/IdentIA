@@ -39,15 +39,27 @@ El mismo motor soporta ambos casos de uso mediante configuración organizacional
 
 | Entidad | Rol en Empresas | Rol en Instituciones Educativas |
 |---|---|---|
-| `Organization` | Empresa (`mode = "enterprise"`), define tolerancia de retardo y cooldown anti-duplicado | Escuela/Facultad (`mode = "education"`), define tolerancia de asistencia |
-| `Group` | Departamento, área o turno con horario (`schedule_start`, `schedule_end`) | Materia o grupo escolar con horario de clase |
+| `Organization` | Empresa (`mode = "enterprise"`), define tolerancia de retardo y cooldown anti-duplicado | Escuela/Facultad (`mode = "education"`), define tolerancia y `academic_period_type` (`bimestral`, `trimestral`, `cuatrimestral`, `semestral`, `ciclo`) |
+| `Career` | N/A | Carrera o programa académico; puede sobrescribir el tipo de periodo (`period_type`) |
+| `Group` | Departamento, área o turno con horario (`schedule_start`, `schedule_end`) | Grupo académico vinculado a carrera (`career_id`), periodo (`semester`) y aula fija (`default_classroom`) |
+| `Subject` / `CourseAssignment` | N/A | Catálogo de asignaturas vinculadas a grupo y profesor (`CourseAssignment`) con herencia automática para alumnos |
+| `ClassSchedule` | N/A | Bloques de horario semanal por asignatura/grupo (`day_of_week`, `start_time`, `end_time`, `classroom`) |
 | `Person` | Empleado (`external_id` = núm. de empleado) | Alumno o docente (`external_id` = matrícula) |
 | `FaceEmbedding` | 6 vectores validados por pose (`frontal`, `left`, `right`, `up`, `down`, `smile`) | Mismo esquema de 6 poses |
-| `AttendanceSession` | Jornada diaria (`session_type = "workday"`) | Sesión de clase (`session_type = "class"`) |
+| `AttendanceSession` | Jornada diaria (`session_type = "workday"`) | Sesión de clase ligada a `course_assignment_id` y `schedule_id` (`session_type = "class"`) |
 | `AttendanceEvent` | Eventos `check_in` y `check_out` con cálculo de puntualidad y horas trabajadas | Evento `present` único por sesión (`on_time` o `late`) |
 | `User` | Cuentas de acceso (`superadmin`, `org_admin`, `operator`) | Cuentas de acceso (`superadmin`, `org_admin`, `teacher`, `operator`) |
 | `DelegatedCredential` | Claves delegadas hasheadas (`scrypt`) para operaciones sensibles | Misma delegación con trazabilidad de creador y asignado |
 | `AuditLog` | Bitácora inmutable de altas, credenciales y revocaciones | Misma bitácora aislada por organización |
+
+---
+
+## 3.2. Modelo Educativo Completo y Aislamiento Docente (Bloque C)
+
+- **Jerarquía académica (`0002_education_domain` + `0003_academic_periods_and_classrooms`):** `Organization` (`mode = "education"`, con `academic_period_type`) → `Career` (con `period_type` opcional) → `Group` (con `semester` y `default_classroom` para prellenar horarios por aula) → `Person` (alumnos) + `Subject` / `CourseAssignment` (asignatura + profesor) → `ClassSchedule` (bloques multi-día con aula editable) → `AttendanceSession`.
+- **Herencia automática por grupo:** al asignar asignaturas a un grupo (`CourseAssignment`), todos los alumnos inscritos en ese grupo heredan automáticamente esas materias y son elegibles en su galería biométrica sin asignaciones individuales manuales (`/api/academic/students/{person_id}/courses`).
+- **Aislamiento estricto por profesor:** un usuario con rol `teacher` únicamente visualiza y opera sesiones, alumnos y eventos de sus propios `CourseAssignment` (`403 Forbidden` en sesiones o estadísticas globales de otros docentes). Desde **Mi Agenda Docente**, abre su clase actual o próxima en 1 clic hacia el kiosco.
+- **Generación idempotente de sesiones y estadísticas:** `/api/academic/sessions/generate` crea sesiones por horario del día sin duplicarlas, y `/api/academic/stats` consolida porcentajes de asistencia, retardos y faltas **por asignatura** y **por grupo/alumno** para `org_admin` y `superadmin`.
 
 ---
 

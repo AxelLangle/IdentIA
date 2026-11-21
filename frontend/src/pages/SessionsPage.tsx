@@ -1,10 +1,11 @@
-import { useState, type FormEvent } from "react";
-import { CalendarPlus, Download, Lock, Plus, Trash2 } from "lucide-react";
+import { useEffect, useState, type FormEvent } from "react";
+import { CalendarCheck, CalendarPlus, Download, Lock, Plus, Trash2 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
   AttendanceEvent,
   AttendanceSession,
   AuthUser,
+  CourseAssignment,
   Group,
   Organization,
   Person,
@@ -29,7 +30,13 @@ export function SessionsPage({
   events,
   onRefreshAll,
 }: SessionsPageProps) {
+  const isTeacher = currentUser.role === "teacher";
+  const isEducation = organization.mode === "education";
   const canManageGroups = currentUser.role === "superadmin" || currentUser.role === "org_admin";
+  const canGenerateSessions =
+    isEducation && ["superadmin", "org_admin", "teacher"].includes(currentUser.role);
+
+  const [courses, setCourses] = useState<CourseAssignment[]>([]);
   // Crear grupo
   const [groupName, setGroupName] = useState("");
   const [groupCode, setGroupCode] = useState("");
@@ -38,6 +45,7 @@ export function SessionsPage({
 
   // Crear sesión
   const [sessionTitle, setSessionTitle] = useState("");
+  const [sessionCourseId, setSessionCourseId] = useState<string>("");
   const [sessionGroupId, setSessionGroupId] = useState<string>("");
   const [expectedStart, setExpectedStart] = useState("");
 
@@ -50,11 +58,63 @@ export function SessionsPage({
   const [manualNotes, setManualNotes] = useState("");
   const [filterSessionId, setFilterSessionId] = useState<string>("");
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSessionCourseId("");
+    setSessionGroupId("");
+    setManualSessionId("");
+    setManualPersonId("");
+    if (!isEducation) {
+      setCourses([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .listCourses(organization.id)
+      .then((list) => {
+        if (!cancelled) setCourses(list);
+      })
+      .catch(() => {
+        if (!cancelled) setCourses([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isEducation, organization.id]);
 
   const openSessions = sessions.filter((s) => s.status === "open");
   const filteredEvents = filterSessionId
     ? events.filter((e) => e.session_id === Number(filterSessionId))
     : events;
+
+  const selectedManualSession =
+    openSessions.find((s) => String(s.id) === manualSessionId) ?? null;
+  const manualPersonOptions =
+    selectedManualSession && selectedManualSession.group_id !== null
+      ? persons.filter((p) => p.group_ids.includes(selectedManualSession.group_id!))
+      : persons;
+
+  async function handleGenerateTodaySessions() {
+    setErrorMsg(null);
+    setStatusMsg(null);
+    try {
+      const now = new Date();
+      const todayIso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+        now.getDate()
+      ).padStart(2, "0")}`;
+      const res = await api.generateAcademicSessions({
+        organization_id: organization.id,
+        target_date: todayIso,
+      });
+      setStatusMsg(
+        `Sesiones del ${res.target_date}: ${res.created_count} nuevas, ${res.existing_count} existentes.`
+      );
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudieron generar sesiones.");
+    }
+  }
 
   async function handleCreateGroup(e: FormEvent) {
     e.preventDefault();
@@ -79,15 +139,22 @@ export function SessionsPage({
   async function handleCreateSession(e: FormEvent) {
     e.preventDefault();
     if (!sessionTitle.trim()) return;
-    await api.createSession({
-      organization_id: organization.id,
-      group_id: sessionGroupId ? Number(sessionGroupId) : null,
-      title: sessionTitle.trim(),
-      expected_start_time: expectedStart || null,
-    });
-    setSessionTitle("");
-    setExpectedStart("");
-    await onRefreshAll();
+    setErrorMsg(null);
+    try {
+      await api.createSession({
+        organization_id: organization.id,
+        group_id: !sessionCourseId && sessionGroupId ? Number(sessionGroupId) : null,
+        course_assignment_id: sessionCourseId ? Number(sessionCourseId) : null,
+        title: sessionTitle.trim(),
+        expected_start_time: expectedStart || null,
+      });
+      setSessionTitle("");
+      setSessionCourseId("");
+      setExpectedStart("");
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo abrir la sesión.");
+    }
   }
 
   async function handleCloseSession(sessionId: number) {
@@ -98,45 +165,78 @@ export function SessionsPage({
   async function handleManualAttendance(e: FormEvent) {
     e.preventDefault();
     if (!manualSessionId || !manualPersonId) return;
-    await api.createManualAttendance({
-      session_id: Number(manualSessionId),
-      person_id: Number(manualPersonId),
-      event_type: manualEventType,
-      status: "manual",
-      notes: manualNotes.trim() || undefined,
-    });
-    setManualNotes("");
-    setStatusMsg("Asistencia manual registrada.");
-    await onRefreshAll();
+    setErrorMsg(null);
+    try {
+      await api.createManualAttendance({
+        session_id: Number(manualSessionId),
+        person_id: Number(manualPersonId),
+        event_type: manualEventType,
+        status: "manual",
+        notes: manualNotes.trim() || undefined,
+      });
+      setManualNotes("");
+      setStatusMsg("Asistencia manual registrada.");
+      await onRefreshAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "No se pudo registrar asistencia manual.");
+    }
   }
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Grupos, Sesiones e Historial</h2>
+          <h2 className="text-2xl font-bold tracking-tight">
+            {isTeacher ? "Mis Sesiones e Historial" : "Grupos, Sesiones e Historial"}
+          </h2>
           <p className="text-sm text-slate-400">
-            Administra materias/departamentos, sesiones de asistencia y respaldo manual
+            {isTeacher
+              ? "Sesiones y registros de tus asignaturas asignadas"
+              : "Administra materias/departamentos, sesiones de asistencia y respaldo manual"}
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() =>
-            void api.downloadCsv(
-              organization.id,
-              filterSessionId ? Number(filterSessionId) : null
-            )
-          }
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
-        >
-          <Download className="w-4 h-4" />
-          Descargar CSV
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {canGenerateSessions && (
+            <button
+              type="button"
+              onClick={() => void handleGenerateTodaySessions()}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white"
+            >
+              <CalendarCheck className="w-4 h-4" />
+              Generar sesiones de hoy
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() =>
+              void api.downloadCsv(
+                organization.id,
+                filterSessionId ? Number(filterSessionId) : null
+              )
+            }
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
+          >
+            <Download className="w-4 h-4" />
+            Descargar CSV
+          </button>
+        </div>
       </div>
 
+      {statusMsg && (
+        <div className="rounded-xl bg-emerald-500/15 border border-emerald-500/40 px-4 py-2.5 text-xs text-emerald-200">
+          {statusMsg}
+        </div>
+      )}
+      {errorMsg && (
+        <div className="rounded-xl bg-red-500/15 border border-red-500/40 px-4 py-2.5 text-xs text-red-200">
+          {errorMsg}
+        </div>
+      )}
+
       {/* Grupos y Sesiones */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className={`grid grid-cols-1 ${isTeacher ? "" : "lg:grid-cols-2"} gap-6`}>
+        {!isTeacher && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           <h3 className="font-semibold text-base">
             {organization.mode === "education" ? "Grupos / Materias" : "Áreas / Departamentos"}
@@ -215,11 +315,40 @@ export function SessionsPage({
             ))}
           </div>
         </div>
+        )}
 
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
           <h3 className="font-semibold text-base">Sesiones de Asistencia</h3>
 
           <form onSubmit={handleCreateSession} className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            {isEducation && (
+              <select
+                required={isTeacher}
+                value={sessionCourseId}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSessionCourseId(val);
+                  if (val && !sessionTitle.trim()) {
+                    const matched = courses.find((c) => String(c.id) === val);
+                    if (matched) {
+                      setSessionTitle(`${matched.subject_name} — ${matched.group_name}`);
+                    }
+                  }
+                }}
+                className="sm:col-span-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">
+                  {isTeacher
+                    ? "Selecciona asignatura asignada..."
+                    : "Opcional: vincular a asignatura de curso"}
+                </option>
+                {courses.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.subject_name} ({c.subject_code}) · {c.group_name}
+                  </option>
+                ))}
+              </select>
+            )}
             <input
               type="text"
               required
@@ -235,23 +364,26 @@ export function SessionsPage({
               <CalendarPlus className="w-4 h-4" />
               Abrir
             </button>
-            <select
-              value={sessionGroupId}
-              onChange={(e) => setSessionGroupId(e.target.value)}
-              className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-            >
-              <option value="">Sin grupo específico</option>
-              {groups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
+            {!isTeacher && (
+              <select
+                value={sessionGroupId}
+                disabled={Boolean(sessionCourseId)}
+                onChange={(e) => setSessionGroupId(e.target.value)}
+                className="sm:col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
+              >
+                <option value="">Sin grupo específico</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            )}
             <input
               type="time"
               value={expectedStart}
               onChange={(e) => setExpectedStart(e.target.value)}
-              className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
+              className={`${isTeacher ? "sm:col-span-3" : ""} bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm`}
               title="Hora esperada de inicio"
             />
           </form>
@@ -264,6 +396,13 @@ export function SessionsPage({
               >
                 <div>
                   <p className="text-sm font-medium">{s.title}</p>
+                  {s.subject_name && (
+                    <p className="text-[11px] text-indigo-300 mt-0.5">
+                      {s.subject_name}
+                      {s.group_name ? ` · ${s.group_name}` : ""}
+                      {s.teacher_name ? ` · ${s.teacher_name}` : ""}
+                    </p>
+                  )}
                   <p className="text-xs text-slate-500">
                     {s.session_date} · {s.events_count} eventos ·{" "}
                     <span className={s.status === "open" ? "text-emerald-400" : "text-slate-400"}>
@@ -300,7 +439,10 @@ export function SessionsPage({
           <select
             required
             value={manualSessionId}
-            onChange={(e) => setManualSessionId(e.target.value)}
+            onChange={(e) => {
+              setManualSessionId(e.target.value);
+              setManualPersonId("");
+            }}
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
             <option value="">Selecciona sesión abierta...</option>
@@ -318,7 +460,7 @@ export function SessionsPage({
             className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm"
           >
             <option value="">Selecciona persona...</option>
-            {persons.map((p) => (
+            {manualPersonOptions.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.full_name} ({p.external_id})
               </option>

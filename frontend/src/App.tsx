@@ -6,12 +6,14 @@ import {
   setOnUnauthorizedHandler,
   setStoredToken,
 } from "./lib/api";
+import { AcademicPage } from "./pages/AcademicPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { EnrollmentPage } from "./pages/EnrollmentPage";
 import { KioskPage } from "./pages/KioskPage";
 import { LoginPage } from "./pages/LoginPage";
 import { SecurityPage } from "./pages/SecurityPage";
 import { SessionsPage } from "./pages/SessionsPage";
+import { TeacherPortalPage } from "./pages/TeacherPortalPage";
 import type {
   AttendanceEvent,
   AttendanceSession,
@@ -28,6 +30,7 @@ export function App() {
   const [checkingAuth, setCheckingAuth] = useState(true);
 
   const [activeTab, setActiveTab] = useState<NavTab>("dashboard");
+  const [kioskTargetSessionId, setKioskTargetSessionId] = useState<number | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState<number | null>(null);
@@ -48,7 +51,13 @@ export function App() {
     setPersons([]);
     setSessions([]);
     setEvents([]);
+    setKioskTargetSessionId(null);
     setActiveTab("dashboard");
+  }, []);
+
+  const handleOpenSessionInKiosk = useCallback((sessionId: number) => {
+    setKioskTargetSessionId(sessionId);
+    setActiveTab("kiosk");
   }, []);
 
   const loadOrgData = useCallback(async (orgId: number) => {
@@ -67,7 +76,7 @@ export function App() {
   }, []);
 
   const bootstrapWorkspace = useCallback(
-    async (preferredOrgId?: number) => {
+    async (preferredOrgId?: number, userForRouting?: AuthUser | null) => {
       setLoading(true);
       try {
         setLoadError(null);
@@ -76,6 +85,14 @@ export function App() {
         setOrganizations(orgs);
         const targetId = preferredOrgId ?? orgs[0]?.id ?? null;
         setSelectedOrgId(targetId);
+        const targetOrg = orgs.find((o) => o.id === targetId) ?? null;
+        if (userForRouting?.role === "teacher" && targetOrg?.mode === "education") {
+          setActiveTab("teacher_portal");
+        } else if (targetOrg?.mode === "enterprise") {
+          setActiveTab((prev) =>
+            prev === "academic" || prev === "teacher_portal" ? "dashboard" : prev
+          );
+        }
         if (targetId !== null) {
           await loadOrgData(targetId);
         }
@@ -109,7 +126,7 @@ export function App() {
       try {
         const user = await api.getMe();
         setCurrentUser(user);
-        await bootstrapWorkspace(user.organization_id ?? undefined);
+        await bootstrapWorkspace(user.organization_id ?? undefined, user);
       } catch {
         setStoredToken(null);
         setCurrentUser(null);
@@ -123,11 +140,20 @@ export function App() {
   const handleLoginSuccess = async (loginData: LoginResponse) => {
     setCurrentUser(loginData.user);
     setActiveTab("dashboard");
-    await bootstrapWorkspace(loginData.user.organization_id ?? undefined);
+    await bootstrapWorkspace(loginData.user.organization_id ?? undefined, loginData.user);
   };
 
   const handleSelectOrg = async (orgId: number) => {
     setSelectedOrgId(orgId);
+    setKioskTargetSessionId(null);
+    const targetOrg = organizations.find((o) => o.id === orgId) ?? null;
+    if (targetOrg?.mode === "enterprise") {
+      setActiveTab((prev) =>
+        prev === "academic" || prev === "teacher_portal" ? "dashboard" : prev
+      );
+    } else if (currentUser?.role === "teacher" && targetOrg?.mode === "education") {
+      setActiveTab("teacher_portal");
+    }
     await loadOrgData(orgId);
   };
 
@@ -185,7 +211,15 @@ export function App() {
         </div>
       ) : (
         <>
-          {activeTab === "dashboard" && (
+          {activeTab === "teacher_portal" && selectedOrg.mode === "education" && (
+            <TeacherPortalPage
+              currentUser={currentUser}
+              organization={selectedOrg}
+              onRefreshAll={refreshCurrentOrg}
+              onOpenSessionInKiosk={handleOpenSessionInKiosk}
+            />
+          )}
+          {activeTab === "dashboard" && currentUser.role !== "teacher" && (
             <DashboardPage
               currentUser={currentUser}
               organization={selectedOrg}
@@ -201,17 +235,19 @@ export function App() {
           )}
           {activeTab === "kiosk" && (
             <KioskPage
+              currentUser={currentUser}
               organization={selectedOrg}
               groups={groups}
               sessions={sessions}
               events={events}
+              initialSessionId={kioskTargetSessionId}
               onRefreshEvents={async () => {
                 const evs = await api.listEvents(selectedOrg.id);
                 setEvents(evs);
               }}
             />
           )}
-          {activeTab === "enrollment" && (
+          {activeTab === "enrollment" && currentUser.role !== "teacher" && (
             <EnrollmentPage
               currentUser={currentUser}
               organization={selectedOrg}
@@ -227,6 +263,17 @@ export function App() {
               }}
             />
           )}
+          {activeTab === "academic" &&
+            selectedOrg.mode === "education" &&
+            (currentUser.role === "superadmin" || currentUser.role === "org_admin") && (
+              <AcademicPage
+                currentUser={currentUser}
+                organization={selectedOrg}
+                groups={groups}
+                onRefreshOrg={refreshCurrentOrg}
+                onOpenSessionInKiosk={handleOpenSessionInKiosk}
+              />
+            )}
           {activeTab === "sessions" && (
             <SessionsPage
               currentUser={currentUser}
