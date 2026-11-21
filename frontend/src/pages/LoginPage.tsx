@@ -1,37 +1,54 @@
+/**
+ * Pantalla de autenticación de IdentIA.
+ * Permite acceder con credenciales JWT organizacionales e incluye accesos
+ * rápidos para rellenar cuentas de demostración en entornos locales.
+ */
 import { useState, type FormEvent } from "react";
 import { Lock, ScanFace } from "lucide-react";
-import { PasswordInput } from "../components/PasswordInput";
-import { api } from "../lib/api";
-import type { LoginResponse } from "../types/api";
+import { EntradaContrasena } from "../components/PasswordInput";
+import { clienteApi } from "../lib/api";
+import type { RespuestaInicioSesion } from "../types/api";
 
-interface LoginPageProps {
-  onSuccess: (loginData: LoginResponse) => void;
+/** Propiedades recibidas por el componente `PaginaInicioSesion`. */
+interface PropiedadesPaginaInicioSesion {
+  /** Callback ejecutado cuando el servidor emite un token JWT válido. */
+  alIniciarSesion: (datosSesion: RespuestaInicioSesion) => void;
 }
 
-export function LoginPage({ onSuccess }: LoginPageProps) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+/**
+ * Renderiza el formulario de acceso de IdentIA preservando selectores de prueba
+ * (`#login-email` y `#login-password`) y manejo claro de errores.
+ */
+export function PaginaInicioSesion({
+  alIniciarSesion,
+}: PropiedadesPaginaInicioSesion) {
+  const [correo, establecerCorreo] = useState("");
+  const [contrasena, establecerContrasena] = useState("");
+  const [cargando, establecerCargando] = useState(false);
+  const [mensajeError, establecerMensajeError] = useState<string | null>(null);
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setLoading(true);
-    setErrorMsg(null);
+  /** Envía el correo y contraseña capturados contra `POST /api/auth/login`. */
+  async function manejarEnvio(evento: FormEvent) {
+    evento.preventDefault();
+    establecerCargando(true);
+    establecerMensajeError(null);
     try {
-      const res = await api.login(email.trim(), password);
-      onSuccess(res);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "No se pudo iniciar sesión.");
+      const respuesta = await clienteApi.iniciarSesion(correo.trim(), contrasena);
+      alIniciarSesion(respuesta);
+    } catch (errorInicio) {
+      establecerMensajeError(
+        errorInicio instanceof Error ? errorInicio.message : "No se pudo iniciar sesión."
+      );
     } finally {
-      setLoading(false);
+      establecerCargando(false);
     }
   }
 
-  function fillDemo(demoEmail: string, demoPassword: string) {
-    setEmail(demoEmail);
-    setPassword(demoPassword);
-    setErrorMsg(null);
+  /** Completa los campos de entrada con una cuenta demo sin enviar el formulario. */
+  function rellenarDemo(correoDemo: string, contrasenaDemo: string) {
+    establecerCorreo(correoDemo);
+    establecerContrasena(contrasenaDemo);
+    establecerMensajeError(null);
   }
 
   return (
@@ -47,7 +64,7 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={manejarEnvio} className="space-y-4">
           <div>
             <label htmlFor="login-email" className="block text-xs text-slate-400 mb-1.5">
               Correo electrónico
@@ -57,41 +74,44 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
               type="email"
               required
               autoComplete="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              value={correo}
+              onChange={(evento) => establecerCorreo(evento.target.value)}
               placeholder="usuario@organizacion.com"
               className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
             />
           </div>
 
           <div>
-            <label htmlFor="login-password" className="block text-xs text-slate-400 mb-1.5">
+            <label
+              htmlFor="login-password"
+              className="block text-xs text-slate-400 mb-1.5"
+            >
               Contraseña
             </label>
-            <PasswordInput
+            <EntradaContrasena
               id="login-password"
               required
               autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              value={contrasena}
+              onChange={(evento) => establecerContrasena(evento.target.value)}
               placeholder="••••••••"
               className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
             />
           </div>
 
-          {errorMsg && (
+          {mensajeError && (
             <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-xl px-3 py-2">
-              {errorMsg}
+              {mensajeError}
             </p>
           )}
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={cargando}
             className="w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white transition-colors"
           >
             <Lock className="w-4 h-4" />
-            {loading ? "Verificando..." : "Iniciar sesión"}
+            {cargando ? "Verificando..." : "Iniciar sesión"}
           </button>
         </form>
 
@@ -100,14 +120,14 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
           <div className="flex flex-col gap-1.5 text-slate-400">
             <button
               type="button"
-              onClick={() => fillDemo("admin@identia.local", "IdentIA2026!")}
+              onClick={() => rellenarDemo("admin@identia.local", "IdentIA2026!")}
               className="text-left hover:text-indigo-300 transition-colors"
             >
               • <strong>Superadmin:</strong> admin@identia.local / IdentIA2026!
             </button>
             <button
               type="button"
-              onClick={() => fillDemo("empresa@identia.local", "Empresa2026!")}
+              onClick={() => rellenarDemo("empresa@identia.local", "Empresa2026!")}
               className="text-left hover:text-indigo-300 transition-colors"
             >
               • <strong>Admin Organización:</strong> empresa@identia.local / Empresa2026!
