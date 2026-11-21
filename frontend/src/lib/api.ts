@@ -1,4 +1,5 @@
 import type {
+  AcademicPeriodType,
   AcademicStatsResponse,
   ActionMode,
   AttendanceEvent,
@@ -161,6 +162,7 @@ export const api = {
   createOrganization: (data: {
     name: string;
     mode: OrgMode;
+    academic_period_type?: AcademicPeriodType;
     late_tolerance_minutes?: number;
     cooldown_seconds?: number;
     store_avatar_by_default?: boolean;
@@ -180,7 +182,12 @@ export const api = {
     data: Partial<
       Pick<
         Organization,
-        "name" | "mode" | "late_tolerance_minutes" | "cooldown_seconds" | "store_avatar_by_default"
+        | "name"
+        | "mode"
+        | "academic_period_type"
+        | "late_tolerance_minutes"
+        | "cooldown_seconds"
+        | "store_avatar_by_default"
       >
     >
   ) =>
@@ -200,6 +207,7 @@ export const api = {
     schedule_end: string;
     career_id?: number | null;
     semester?: string | null;
+    default_classroom?: string | null;
   }) =>
     requestJson<Group>("/api/groups", {
       method: "POST",
@@ -215,6 +223,7 @@ export const api = {
       schedule_end: string;
       career_id: number | null;
       semester: string | null;
+      default_classroom: string | null;
     }>
   ) =>
     requestJson<Group>(`/api/groups/${groupId}`, {
@@ -392,6 +401,7 @@ export const api = {
     name: string;
     code: string;
     description?: string | null;
+    period_type?: AcademicPeriodType | null;
   }) =>
     requestJson<Career>("/api/academic/careers", {
       method: "POST",
@@ -400,7 +410,12 @@ export const api = {
     }),
   updateCareer: (
     careerId: number,
-    data: Partial<{ name: string; code: string; description: string | null }>
+    data: Partial<{
+      name: string;
+      code: string;
+      description: string | null;
+      period_type: AcademicPeriodType | null;
+    }>
   ) =>
     requestJson<Career>(`/api/academic/careers/${careerId}`, {
       method: "PATCH",
