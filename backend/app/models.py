@@ -102,6 +102,7 @@ class Group(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     code: Mapped[str] = mapped_column(String(40), nullable=False)
     semester: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    period_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     default_classroom: Mapped[str | None] = mapped_column(String(80), nullable=True)
     schedule_start: Mapped[str] = mapped_column(String(5), nullable=False, default="08:00")
     schedule_end: Mapped[str] = mapped_column(String(5), nullable=False, default="17:00")
