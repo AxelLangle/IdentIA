@@ -48,6 +48,7 @@ export function DashboardPage({
   const [academicPeriodType, setAcademicPeriodType] = useState<AcademicPeriodType>(
     organization.academic_period_type
   );
+  const [periodAuthSecret, setPeriodAuthSecret] = useState("");
   const [tolerance, setTolerance] = useState<number>(organization.late_tolerance_minutes);
   const [cooldown, setCooldown] = useState<number>(organization.cooldown_seconds);
   const [storeAvatar, setStoreAvatar] = useState<boolean>(organization.store_avatar_by_default);
@@ -71,6 +72,7 @@ export function DashboardPage({
   useEffect(() => {
     setMode(organization.mode);
     setAcademicPeriodType(organization.academic_period_type ?? "semestral");
+    setPeriodAuthSecret("");
     setTolerance(organization.late_tolerance_minutes);
     setCooldown(organization.cooldown_seconds);
     setStoreAvatar(organization.store_avatar_by_default);
@@ -88,6 +90,9 @@ export function DashboardPage({
     e.preventDefault();
     setSaving(true);
     setFeedback(null);
+    const periodChanged =
+      mode === "education" &&
+      academicPeriodType !== (organization.academic_period_type ?? "semestral");
     try {
       await api.updateOrganization(organization.id, {
         mode,
@@ -95,7 +100,9 @@ export function DashboardPage({
         late_tolerance_minutes: Number(tolerance),
         cooldown_seconds: Number(cooldown),
         store_avatar_by_default: storeAvatar,
+        ...(periodChanged ? { authorization_secret: periodAuthSecret } : {}),
       });
+      setPeriodAuthSecret("");
       await onRefreshAll();
       setFeedback("Configuración actualizada correctamente.");
     } catch (err) {
@@ -367,22 +374,39 @@ export function DashboardPage({
           </div>
 
           {mode === "education" && (
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">
-                Periodo académico general
-              </label>
-              <select
-                value={academicPeriodType}
-                disabled={!canEditOrg}
-                onChange={(e) => setAcademicPeriodType(e.target.value as AcademicPeriodType)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-60"
-              >
-                {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
+            <div className="space-y-2.5">
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">
+                  Periodo académico general
+                </label>
+                <select
+                  value={academicPeriodType}
+                  disabled={!canEditOrg}
+                  onChange={(e) => setAcademicPeriodType(e.target.value as AcademicPeriodType)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-60"
+                >
+                  {ACADEMIC_PERIOD_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {canEditOrg &&
+                academicPeriodType !== (organization.academic_period_type ?? "semestral") && (
+                  <div className="rounded-xl bg-amber-500/10 border border-amber-500/30 p-3 space-y-1.5">
+                    <label className="block text-[11px] font-medium text-amber-200">
+                      Contraseña de administrador requerida para cambiar el tipo de periodo
+                    </label>
+                    <PasswordInput
+                      required
+                      value={periodAuthSecret}
+                      onChange={(e) => setPeriodAuthSecret(e.target.value)}
+                      placeholder="Contraseña de administrador"
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs"
+                    />
+                  </div>
+                )}
             </div>
           )}
 
