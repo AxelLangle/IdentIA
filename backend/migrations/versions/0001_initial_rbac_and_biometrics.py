@@ -3,13 +3,19 @@
 Revision ID: 0001_initial_rbac_and_biometrics
 Revises:
 Create Date: 2026-11-19 14:20:00
+
+Crea las diez tablas fundacionales del sistema manteniendo los nombres físicos
+en SQLite: organizations, groups, users, persons, person_groups, face_embeddings,
+attendance_sessions, attendance_events, delegated_credentials y audit_logs.
 """
+
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
 
 
+# Identificadores requeridos por Alembic (no modificar para conservar historial)
 revision: str = "0001_initial_rbac_and_biometrics"
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
@@ -17,6 +23,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    """Crea el esquema relacional inicial e índices principales."""
+    # Tabla raíz de organizaciones (escuelas o empresas)
     op.create_table(
         "organizations",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -30,6 +38,7 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_organizations_id"), "organizations", ["id"], unique=False)
 
+    # Grupos escolares o departamentos empresariales
     op.create_table(
         "groups",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -45,6 +54,7 @@ def upgrade() -> None:
     op.create_index(op.f("ix_groups_id"), "groups", ["id"], unique=False)
     op.create_index(op.f("ix_groups_organization_id"), "groups", ["organization_id"], unique=False)
 
+    # Cuentas de acceso RBAC con pertenencia opcional a organización
     op.create_table(
         "users",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -64,6 +74,7 @@ def upgrade() -> None:
     op.create_index(op.f("ix_users_id"), "users", ["id"], unique=False)
     op.create_index(op.f("ix_users_organization_id"), "users", ["organization_id"], unique=False)
 
+    # Padrón de personas enrolables (sin almacenar fotografías crudas)
     op.create_table(
         "persons",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -85,6 +96,7 @@ def upgrade() -> None:
     op.create_index(op.f("ix_persons_id"), "persons", ["id"], unique=False)
     op.create_index(op.f("ix_persons_organization_id"), "persons", ["organization_id"], unique=False)
 
+    # Relación muchos-a-muchos entre personas y grupos
     op.create_table(
         "person_groups",
         sa.Column("person_id", sa.Integer(), nullable=False),
@@ -94,6 +106,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("person_id", "group_id"),
     )
 
+    # Vectores faciales normalizados (512 bytes float32) con trazabilidad de modelo
     op.create_table(
         "face_embeddings",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -111,8 +124,11 @@ def upgrade() -> None:
         sa.UniqueConstraint("person_id", "pose_label", name="uq_person_pose"),
     )
     op.create_index(op.f("ix_face_embeddings_id"), "face_embeddings", ["id"], unique=False)
-    op.create_index(op.f("ix_face_embeddings_person_id"), "face_embeddings", ["person_id"], unique=False)
+    op.create_index(
+        op.f("ix_face_embeddings_person_id"), "face_embeddings", ["person_id"], unique=False
+    )
 
+    # Sesiones de pase de lista o jornadas diarias
     op.create_table(
         "attendance_sessions",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -129,10 +145,20 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(op.f("ix_attendance_sessions_group_id"), "attendance_sessions", ["group_id"], unique=False)
-    op.create_index(op.f("ix_attendance_sessions_id"), "attendance_sessions", ["id"], unique=False)
-    op.create_index(op.f("ix_attendance_sessions_organization_id"), "attendance_sessions", ["organization_id"], unique=False)
+    op.create_index(
+        op.f("ix_attendance_sessions_group_id"), "attendance_sessions", ["group_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_attendance_sessions_id"), "attendance_sessions", ["id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_attendance_sessions_organization_id"),
+        "attendance_sessions",
+        ["organization_id"],
+        unique=False,
+    )
 
+    # Eventos individuales de asistencia (entrada, salida o asistencia escolar)
     op.create_table(
         "attendance_events",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -149,10 +175,17 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(op.f("ix_attendance_events_id"), "attendance_events", ["id"], unique=False)
-    op.create_index(op.f("ix_attendance_events_person_id"), "attendance_events", ["person_id"], unique=False)
-    op.create_index(op.f("ix_attendance_events_session_id"), "attendance_events", ["session_id"], unique=False)
-    op.create_index(op.f("ix_attendance_events_timestamp"), "attendance_events", ["timestamp"], unique=False)
+    op.create_index(
+        op.f("ix_attendance_events_person_id"), "attendance_events", ["person_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_attendance_events_session_id"), "attendance_events", ["session_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_attendance_events_timestamp"), "attendance_events", ["timestamp"], unique=False
+    )
 
+    # Credenciales delegadas temporales para autorización controlada de revocaciones
     op.create_table(
         "delegated_credentials",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -173,9 +206,17 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(op.f("ix_delegated_credentials_id"), "delegated_credentials", ["id"], unique=False)
-    op.create_index(op.f("ix_delegated_credentials_organization_id"), "delegated_credentials", ["organization_id"], unique=False)
+    op.create_index(
+        op.f("ix_delegated_credentials_id"), "delegated_credentials", ["id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_delegated_credentials_organization_id"),
+        "delegated_credentials",
+        ["organization_id"],
+        unique=False,
+    )
 
+    # Bitácora de auditoría de operaciones sensibles
     op.create_table(
         "audit_logs",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -190,23 +231,30 @@ def upgrade() -> None:
         sa.Column("details", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["authorized_by_user_id"], ["users.id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["delegated_credential_id"], ["delegated_credentials.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(
+            ["delegated_credential_id"], ["delegated_credentials.id"], ondelete="SET NULL"
+        ),
         sa.ForeignKeyConstraint(["executed_by_user_id"], ["users.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(op.f("ix_audit_logs_created_at"), "audit_logs", ["created_at"], unique=False)
     op.create_index(op.f("ix_audit_logs_id"), "audit_logs", ["id"], unique=False)
-    op.create_index(op.f("ix_audit_logs_organization_id"), "audit_logs", ["organization_id"], unique=False)
+    op.create_index(
+        op.f("ix_audit_logs_organization_id"), "audit_logs", ["organization_id"], unique=False
+    )
 
 
 def downgrade() -> None:
+    """Revierte completamente el esquema inicial eliminando todas las tablas en orden inverso."""
     op.drop_index(op.f("ix_audit_logs_organization_id"), table_name="audit_logs")
     op.drop_index(op.f("ix_audit_logs_id"), table_name="audit_logs")
     op.drop_index(op.f("ix_audit_logs_created_at"), table_name="audit_logs")
     op.drop_table("audit_logs")
 
-    op.drop_index(op.f("ix_delegated_credentials_organization_id"), table_name="delegated_credentials")
+    op.drop_index(
+        op.f("ix_delegated_credentials_organization_id"), table_name="delegated_credentials"
+    )
     op.drop_index(op.f("ix_delegated_credentials_id"), table_name="delegated_credentials")
     op.drop_table("delegated_credentials")
 
@@ -216,7 +264,9 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_attendance_events_id"), table_name="attendance_events")
     op.drop_table("attendance_events")
 
-    op.drop_index(op.f("ix_attendance_sessions_organization_id"), table_name="attendance_sessions")
+    op.drop_index(
+        op.f("ix_attendance_sessions_organization_id"), table_name="attendance_sessions"
+    )
     op.drop_index(op.f("ix_attendance_sessions_id"), table_name="attendance_sessions")
     op.drop_index(op.f("ix_attendance_sessions_group_id"), table_name="attendance_sessions")
     op.drop_table("attendance_sessions")
