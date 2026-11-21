@@ -126,8 +126,10 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
     if not groups:
         return []
 
+    org = db.get(Organization, organization_id)
+    org_period_type = org.academic_period_type if org else "semestral"
     career_map = {
-        c.id: c.name
+        c.id: c
         for c in db.scalars(select(Career).where(Career.organization_id == organization_id)).all()
     }
     counts_rows = db.execute(
@@ -145,23 +147,31 @@ def _serialize_groups(db: Session, groups: list[Group], organization_id: int) ->
     ).all()
     courses_map = {gid: cnt for gid, cnt in courses_rows}
 
-    return [
-        GroupRead(
-            id=g.id,
-            organization_id=g.organization_id,
-            career_id=g.career_id,
-            career_name=career_map.get(g.career_id) if g.career_id else None,
-            name=g.name,
-            code=g.code,
-            semester=g.semester,
-            schedule_start=g.schedule_start,
-            schedule_end=g.schedule_end,
-            created_at=g.created_at,
-            members_count=counts_map.get(g.id, 0),
-            courses_count=courses_map.get(g.id, 0),
+    result: list[GroupRead] = []
+    for g in groups:
+        career = career_map.get(g.career_id) if g.career_id else None
+        effective_period = (
+            career.period_type if career and career.period_type else org_period_type
         )
-        for g in groups
-    ]
+        result.append(
+            GroupRead(
+                id=g.id,
+                organization_id=g.organization_id,
+                career_id=g.career_id,
+                career_name=career.name if career else None,
+                name=g.name,
+                code=g.code,
+                semester=g.semester,
+                default_classroom=g.default_classroom,
+                period_type=effective_period,
+                schedule_start=g.schedule_start,
+                schedule_end=g.schedule_end,
+                created_at=g.created_at,
+                members_count=counts_map.get(g.id, 0),
+                courses_count=courses_map.get(g.id, 0),
+            )
+        )
+    return result
 
 
 @router.get("/groups", response_model=list[GroupRead])
@@ -205,7 +215,13 @@ def create_group(
                 detail="Carrera no encontrada en la organización.",
             )
 
-    group = Group(**payload.model_dump())
+    data = payload.model_dump()
+    if data.get("semester") is not None:
+        data["semester"] = data["semester"].strip() or None
+    if data.get("default_classroom") is not None:
+        data["default_classroom"] = data["default_classroom"].strip() or None
+
+    group = Group(**data)
     db.add(group)
     db.commit()
     db.refresh(group)
@@ -234,7 +250,10 @@ def update_group(
             )
 
     for field, value in data.items():
-        setattr(group, field, value)
+        if field in ("semester", "default_classroom") and isinstance(value, str):
+            setattr(group, field, value.strip() or None)
+        else:
+            setattr(group, field, value)
 
     db.commit()
     db.refresh(group)
