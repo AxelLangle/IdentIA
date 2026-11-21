@@ -1,3 +1,11 @@
+"""Enrutador HTTP para padrón de personas, enrolamiento guiado de 6 poses y revocación.
+
+Gestiona el alta y edición de empleados/alumnos, la captura biométrica en memoria
+RAM sin almacenar imágenes crudas de entrenamiento (con control estricto de calidad,
+iluminación, pose y autoconsistencia) y la revocación individual o por lote protegida
+por contraseña administrativa o credencial delegada + bitácora de auditoría.
+"""
+
 from datetime import datetime
 from fastapi import (
     APIRouter,
@@ -16,649 +24,755 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import get_settings
-from app.db import get_db
-from app.models import FaceEmbedding, Group, Organization, Person, PersonGroup, User, WorkShift
-from app.routers import to_face_box_schema, to_quality_schema
-from app.schemas import (
-    BatchBiometricsRevokeRequest,
-    BatchBiometricsRevokeResponse,
-    BiometricsRevokeRequest,
-    BiometricsRevokeResponse,
-    EnrollFrameResponse,
-    PersonCreate,
-    PersonRead,
-    PersonUpdate,
-    PoseLabel,
-    ShiftSource,
+from app.config import obtener_configuracion
+from app.db import obtener_bd
+from app.models import (
+    Grupo,
+    Organizacion,
+    Persona,
+    PersonaGrupo,
+    TurnoLaboral,
+    Usuario,
+    VectorFacial,
 )
-from app.security import assert_org_access, get_current_user, require_roles, resolve_org_scope
-from app.services.academic_service import get_teacher_group_ids
+from app.routers import convertir_a_esquema_calidad, convertir_a_esquema_cuadro_rostro
+from app.schemas import (
+    EtiquetaPose,
+    OrigenTurno,
+    PersonaActualizar,
+    PersonaCrear,
+    PersonaLeer,
+    RespuestaEnrolarFrame,
+    RespuestaRevocarBiometria,
+    RespuestaRevocarBiometriaLote,
+    SolicitudRevocarBiometria,
+    SolicitudRevocarBiometriaLote,
+)
+from app.security import (
+    obtener_usuario_actual,
+    requerir_roles,
+    resolver_alcance_organizacion,
+    validar_acceso_organizacion,
+)
+from app.services.academic_service import obtener_ids_grupos_docente
 from app.services.security_service import (
-    AuthorizationResult,
-    record_audit_log,
-    verify_sensitive_authorization,
+    ResultadoAutorizacion,
+    registrar_auditoria,
+    verificar_autorizacion_sensible,
 )
 from app.vision.engine import (
-    bytes_to_embedding,
-    cosine_similarity,
-    create_avatar_base64,
-    decode_image_bytes,
-    embedding_to_bytes,
+    bytes_a_vector,
+    crear_avatar_base64,
+    decodificar_bytes_imagen,
+    similitud_coseno,
+    vector_a_bytes,
 )
-from app.vision.quality import evaluate_face_quality
+from app.vision.quality import evaluar_calidad_rostro
 
-router = APIRouter(prefix="/api", tags=["persons"])
-REQUIRED_POSES_COUNT = 6
+enrutador = APIRouter(prefix="/api", tags=["personas"])
+CANTIDAD_POSES_REQUERIDAS = 6
 
 
-def _serialize_persons_batch(
-    db: Session,
-    persons: list[Person],
-    organization_id: int,
-    current_model_version: str,
-) -> list[PersonRead]:
-    if not persons:
+def _serializar_personas_lote(
+    sesion_bd: Session,
+    personas: list[Persona],
+    id_organizacion: int,
+    version_modelo_actual: str,
+) -> list[PersonaLeer]:
+    """Serializa personas con progreso biométrico y turno efectivo (directo o heredado)."""
+    if not personas:
         return []
 
-    shift_map = {
-        sh.id: sh
-        for sh in db.scalars(select(WorkShift).where(WorkShift.organization_id == organization_id)).all()
+    mapa_turnos = {
+        turno.id: turno
+        for turno in sesion_bd.scalars(
+            select(TurnoLaboral).where(TurnoLaboral.id_organizacion == id_organizacion)
+        ).all()
     }
-    group_map = {
-        g.id: g
-        for g in db.scalars(select(Group).where(Group.organization_id == organization_id)).all()
+    mapa_grupos = {
+        grupo.id: grupo
+        for grupo in sesion_bd.scalars(
+            select(Grupo).where(Grupo.id_organizacion == id_organizacion)
+        ).all()
     }
 
-    serialized: list[PersonRead] = []
-    for person in persons:
-        embeddings = person.embeddings
-        current_poses = [
-            e.pose_label for e in embeddings if e.model_version == current_model_version
+    serializadas: list[PersonaLeer] = []
+    for persona in personas:
+        vectores = persona.vectores_faciales
+        poses_actuales = [
+            vector.etiqueta_pose
+            for vector in vectores
+            if vector.version_modelo == version_modelo_actual
         ]
-        needs_reenroll = any(e.model_version != current_model_version for e in embeddings)
-        group_ids = [link.group_id for link in person.group_links]
+        requiere_reenrolamiento = any(
+            vector.version_modelo != version_modelo_actual for vector in vectores
+        )
+        ids_grupos = [enlace.id_grupo for enlace in persona.enlaces_grupos]
 
-        direct_shift = shift_map.get(person.work_shift_id) if person.work_shift_id else None
-        eff_shift = direct_shift
-        shift_source: ShiftSource = "direct" if direct_shift is not None else "none"
-        if eff_shift is None:
-            for gid in sorted(group_ids):
-                grp = group_map.get(gid)
-                if grp and grp.default_work_shift_id and grp.default_work_shift_id in shift_map:
-                    eff_shift = shift_map[grp.default_work_shift_id]
-                    shift_source = "group"
+        turno_directo = (
+            mapa_turnos.get(persona.id_turno_laboral) if persona.id_turno_laboral else None
+        )
+        turno_efectivo = turno_directo
+        origen_turno: OrigenTurno = "direct" if turno_directo is not None else "none"
+        if turno_efectivo is None:
+            for gid in sorted(ids_grupos):
+                grupo = mapa_grupos.get(gid)
+                if (
+                    grupo
+                    and grupo.id_turno_laboral_defecto
+                    and grupo.id_turno_laboral_defecto in mapa_turnos
+                ):
+                    turno_efectivo = mapa_turnos[grupo.id_turno_laboral_defecto]
+                    origen_turno = "group"
                     break
 
-        serialized.append(
-            PersonRead(
-                id=person.id,
-                organization_id=person.organization_id,
-                external_id=person.external_id,
-                full_name=person.full_name,
-                email=person.email,
-                role=person.role,
-                avatar_base64=person.avatar_base64,
-                biometric_consent=person.biometric_consent,
-                biometric_consent_at=person.biometric_consent_at,
-                is_active=person.is_active,
-                created_at=person.created_at,
-                group_ids=group_ids,
-                work_shift_id=person.work_shift_id,
-                work_shift_name=direct_shift.name if direct_shift else None,
-                effective_work_shift_id=eff_shift.id if eff_shift else None,
-                effective_work_shift_name=eff_shift.name if eff_shift else None,
-                effective_work_shift_code=eff_shift.code if eff_shift else None,
-                shift_source=shift_source,
-                embeddings_count=len(current_poses),
-                poses_completed=current_poses,
-                needs_reenroll=needs_reenroll,
+        serializadas.append(
+            PersonaLeer(
+                id=persona.id,
+                id_organizacion=persona.id_organizacion,
+                identificador_externo=persona.identificador_externo,
+                nombre_completo=persona.nombre_completo,
+                correo=persona.correo,
+                rol=persona.rol,
+                avatar_base64=persona.avatar_base64,
+                consentimiento_biometrico=persona.consentimiento_biometrico,
+                fecha_consentimiento_biometrico=persona.fecha_consentimiento_biometrico,
+                esta_activo=persona.esta_activo,
+                creado_en=persona.creado_en,
+                ids_grupos=ids_grupos,
+                id_turno_laboral=persona.id_turno_laboral,
+                nombre_turno_laboral=turno_directo.nombre if turno_directo else None,
+                id_turno_laboral_efectivo=turno_efectivo.id if turno_efectivo else None,
+                nombre_turno_laboral_efectivo=turno_efectivo.nombre if turno_efectivo else None,
+                codigo_turno_laboral_efectivo=turno_efectivo.codigo if turno_efectivo else None,
+                origen_turno=origen_turno,
+                cantidad_vectores=len(poses_actuales),
+                poses_completadas=poses_actuales,
+                requiere_reenrolamiento=requiere_reenrolamiento,
             )
         )
-    return serialized
+    return serializadas
 
 
-def _sync_person_groups(
-    db: Session,
-    person: Person,
-    group_ids: list[int],
+def _sincronizar_grupos_persona(
+    sesion_bd: Session,
+    persona: Persona,
+    ids_grupos: list[int],
 ) -> None:
-    unique_ids = list(dict.fromkeys(group_ids))
-    if unique_ids:
-        valid_groups = db.scalars(
-            select(Group).where(
-                Group.id.in_(unique_ids),
-                Group.organization_id == person.organization_id,
+    """Reemplaza los vínculos `PersonaGrupo` validando que pertenezcan a la organización."""
+    ids_unicos = list(dict.fromkeys(ids_grupos))
+    if ids_unicos:
+        grupos_validos = sesion_bd.scalars(
+            select(Grupo).where(
+                Grupo.id.in_(ids_unicos),
+                Grupo.id_organizacion == persona.id_organizacion,
             )
         ).all()
-        if len(valid_groups) != len(unique_ids):
+        if len(grupos_validos) != len(ids_unicos):
             raise HTTPException(
                 status_code=400,
                 detail="Uno o más grupos no existen o no pertenecen a la organización.",
             )
 
-    existing_links = db.scalars(
-        select(PersonGroup).where(PersonGroup.person_id == person.id)
+    enlaces_actuales = sesion_bd.scalars(
+        select(PersonaGrupo).where(PersonaGrupo.id_persona == persona.id)
     ).all()
-    for link in existing_links:
-        db.delete(link)
-    db.flush()
+    for enlace in enlaces_actuales:
+        sesion_bd.delete(enlace)
+    sesion_bd.flush()
 
-    for gid in unique_ids:
-        db.add(PersonGroup(person_id=person.id, group_id=gid))
+    for gid in ids_unicos:
+        sesion_bd.add(PersonaGrupo(id_persona=persona.id, id_grupo=gid))
 
 
-@router.get("/persons", response_model=list[PersonRead])
-def list_persons(
-    organization_id: int | None = Query(default=None),
-    group_id: int | None = Query(default=None),
-    work_shift_id: int | None = Query(default=None),
-    search: str | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[PersonRead]:
-    settings = get_settings()
-    scoped_org_id = resolve_org_scope(current_user, organization_id)
-    stmt = (
-        select(Person)
-        .options(selectinload(Person.embeddings), selectinload(Person.group_links))
-        .where(Person.organization_id == scoped_org_id)
-        .order_by(Person.id.desc())
+@enrutador.get("/persons", response_model=list[PersonaLeer])
+def listar_personas(
+    id_organizacion: int | None = Query(default=None),
+    id_grupo: int | None = Query(default=None),
+    id_turno_laboral: int | None = Query(default=None),
+    busqueda: str | None = Query(default=None),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> list[PersonaLeer]:
+    """Lista personas del padrón filtradas por grupo, turno laboral o búsqueda de texto."""
+    configuracion = obtener_configuracion()
+    id_org_alcance = resolver_alcance_organizacion(usuario_actual, id_organizacion)
+    consulta = (
+        select(Persona)
+        .options(selectinload(Persona.vectores_faciales), selectinload(Persona.enlaces_grupos))
+        .where(Persona.id_organizacion == id_org_alcance)
+        .order_by(Persona.id.desc())
     )
-    if current_user.role == "teacher":
-        teacher_gids = get_teacher_group_ids(db, current_user.id)
-        if not teacher_gids:
+    if usuario_actual.rol == "teacher":
+        ids_grupos_docente = obtener_ids_grupos_docente(sesion_bd, usuario_actual.id)
+        if not ids_grupos_docente:
             return []
-        stmt = stmt.where(
-            Person.id.in_(
-                select(PersonGroup.person_id).where(PersonGroup.group_id.in_(teacher_gids))
+        consulta = consulta.where(
+            Persona.id.in_(
+                select(PersonaGrupo.id_persona).where(
+                    PersonaGrupo.id_grupo.in_(ids_grupos_docente)
+                )
             )
         )
-    if group_id is not None:
-        stmt = stmt.join(PersonGroup, PersonGroup.person_id == Person.id).where(
-            PersonGroup.group_id == group_id
+    if id_grupo is not None:
+        consulta = consulta.join(PersonaGrupo, PersonaGrupo.id_persona == Persona.id).where(
+            PersonaGrupo.id_grupo == id_grupo
         )
-    if search:
-        pattern = f"%{search.strip()}%"
-        stmt = stmt.where(
-            (Person.full_name.ilike(pattern)) | (Person.external_id.ilike(pattern))
+    if busqueda:
+        patron = f"%{busqueda.strip()}%"
+        consulta = consulta.where(
+            (Persona.nombre_completo.ilike(patron))
+            | (Persona.identificador_externo.ilike(patron))
         )
 
-    persons = list(db.scalars(stmt).all())
-    serialized = _serialize_persons_batch(db, persons, scoped_org_id, settings.model_version)
-    if work_shift_id is not None:
-        serialized = [p for p in serialized if p.effective_work_shift_id == work_shift_id]
-    return serialized
+    personas = list(sesion_bd.scalars(consulta).all())
+    serializadas = _serializar_personas_lote(
+        sesion_bd, personas, id_org_alcance, configuracion.version_modelo
+    )
+    if id_turno_laboral is not None:
+        serializadas = [
+            persona for persona in serializadas if persona.id_turno_laboral_efectivo == id_turno_laboral
+        ]
+    return serializadas
 
 
-@router.post("/persons", response_model=PersonRead, status_code=status.HTTP_201_CREATED)
-def create_person(
-    payload: PersonCreate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
-    db: Session = Depends(get_db),
-) -> PersonRead:
-    settings = get_settings()
-    assert_org_access(current_user, payload.organization_id)
-    org = db.get(Organization, payload.organization_id)
-    if org is None:
+@enrutador.post("/persons", response_model=PersonaLeer, status_code=status.HTTP_201_CREATED)
+def crear_persona(
+    carga: PersonaCrear,
+    usuario_actual: Usuario = Depends(
+        requerir_roles("superadmin", "org_admin", "supervisor", "operator")
+    ),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> PersonaLeer:
+    """Registra a una persona en el padrón con su consentimiento biométrico y grupos."""
+    configuracion = obtener_configuracion()
+    validar_acceso_organizacion(usuario_actual, carga.id_organizacion)
+    organizacion = sesion_bd.get(Organizacion, carga.id_organizacion)
+    if organizacion is None:
         raise HTTPException(status_code=404, detail="Organización no encontrada.")
 
-    if payload.work_shift_id is not None:
-        shift = db.get(WorkShift, payload.work_shift_id)
-        if shift is None or shift.organization_id != org.id:
+    if carga.id_turno_laboral is not None:
+        turno = sesion_bd.get(TurnoLaboral, carga.id_turno_laboral)
+        if turno is None or turno.id_organizacion != organizacion.id:
             raise HTTPException(
                 status_code=404,
                 detail="Turno laboral no encontrado en la organización.",
             )
 
-    person = Person(
-        organization_id=payload.organization_id,
-        work_shift_id=payload.work_shift_id,
-        external_id=payload.external_id.strip(),
-        full_name=payload.full_name.strip(),
-        email=payload.email.strip() if payload.email else None,
-        role=payload.role,
-        biometric_consent=payload.biometric_consent,
-        biometric_consent_at=datetime.now() if payload.biometric_consent else None,
+    persona = Persona(
+        id_organizacion=carga.id_organizacion,
+        id_turno_laboral=carga.id_turno_laboral,
+        identificador_externo=carga.identificador_externo.strip(),
+        nombre_completo=carga.nombre_completo.strip(),
+        correo=carga.correo.strip() if carga.correo else None,
+        rol=carga.rol,
+        consentimiento_biometrico=carga.consentimiento_biometrico,
+        fecha_consentimiento_biometrico=datetime.now() if carga.consentimiento_biometrico else None,
     )
-    db.add(person)
+    sesion_bd.add(persona)
     try:
-        db.flush()
-    except IntegrityError as exc:
-        db.rollback()
+        sesion_bd.flush()
+    except IntegrityError as excepcion:
+        sesion_bd.rollback()
         raise HTTPException(
             status_code=409,
-            detail=f"Ya existe una persona con el ID '{payload.external_id}' en esta organización.",
-        ) from exc
+            detail=(
+                f"Ya existe una persona con el ID '{carga.identificador_externo}' "
+                "en esta organización."
+            ),
+        ) from excepcion
 
-    if payload.group_ids:
-        _sync_person_groups(db, person, payload.group_ids)
+    if carga.ids_grupos:
+        _sincronizar_grupos_persona(sesion_bd, persona, carga.ids_grupos)
 
-    db.commit()
-    loaded = db.scalars(
-        select(Person)
-        .options(selectinload(Person.embeddings), selectinload(Person.group_links))
-        .where(Person.id == person.id)
+    sesion_bd.commit()
+    persona_cargada = sesion_bd.scalars(
+        select(Persona)
+        .options(selectinload(Persona.vectores_faciales), selectinload(Persona.enlaces_grupos))
+        .where(Persona.id == persona.id)
     ).one()
-    return _serialize_persons_batch(db, [loaded], loaded.organization_id, settings.model_version)[0]
+    return _serializar_personas_lote(
+        sesion_bd,
+        [persona_cargada],
+        persona_cargada.id_organizacion,
+        configuracion.version_modelo,
+    )[0]
 
 
-@router.patch("/persons/{person_id}", response_model=PersonRead)
-def update_person(
-    person_id: int,
-    payload: PersonUpdate,
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
-    db: Session = Depends(get_db),
-) -> PersonRead:
-    settings = get_settings()
-    person = db.get(Person, person_id)
-    if person is None:
+@enrutador.patch("/persons/{id_persona}", response_model=PersonaLeer)
+def actualizar_persona(
+    id_persona: int,
+    carga: PersonaActualizar,
+    usuario_actual: Usuario = Depends(
+        requerir_roles("superadmin", "org_admin", "supervisor", "operator")
+    ),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> PersonaLeer:
+    """Actualiza datos generales, consentimiento biométrico, grupos o turno de una persona."""
+    configuracion = obtener_configuracion()
+    persona = sesion_bd.get(Persona, id_persona)
+    if persona is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
-    assert_org_access(current_user, person.organization_id)
+    validar_acceso_organizacion(usuario_actual, persona.id_organizacion)
 
-    data = payload.model_dump(exclude_unset=True)
-    group_ids = data.pop("group_ids", None)
+    datos_parciales = carga.model_dump(exclude_unset=True)
+    ids_grupos = datos_parciales.pop("ids_grupos", None)
 
-    if "work_shift_id" in data and data["work_shift_id"] is not None:
-        shift = db.get(WorkShift, data["work_shift_id"])
-        if shift is None or shift.organization_id != person.organization_id:
+    if "id_turno_laboral" in datos_parciales and datos_parciales["id_turno_laboral"] is not None:
+        turno = sesion_bd.get(TurnoLaboral, datos_parciales["id_turno_laboral"])
+        if turno is None or turno.id_organizacion != persona.id_organizacion:
             raise HTTPException(
                 status_code=404,
                 detail="Turno laboral no encontrado en la organización.",
             )
 
-    if "biometric_consent" in data:
-        new_consent = bool(data["biometric_consent"])
-        if new_consent and not person.biometric_consent:
-            person.biometric_consent_at = datetime.now()
-        elif not new_consent:
-            person.biometric_consent_at = None
+    if "consentimiento_biometrico" in datos_parciales:
+        nuevo_consentimiento = bool(datos_parciales["consentimiento_biometrico"])
+        if nuevo_consentimiento and not persona.consentimiento_biometrico:
+            persona.fecha_consentimiento_biometrico = datetime.now()
+        elif not nuevo_consentimiento:
+            persona.fecha_consentimiento_biometrico = None
 
-    for field, value in data.items():
-        setattr(person, field, value)
+    for campo, valor in datos_parciales.items():
+        setattr(persona, campo, valor)
 
-    if group_ids is not None:
-        _sync_person_groups(db, person, group_ids)
+    if ids_grupos is not None:
+        _sincronizar_grupos_persona(sesion_bd, persona, ids_grupos)
 
-    db.commit()
-    loaded = db.scalars(
-        select(Person)
-        .options(selectinload(Person.embeddings), selectinload(Person.group_links))
-        .where(Person.id == person.id)
+    sesion_bd.commit()
+    persona_cargada = sesion_bd.scalars(
+        select(Persona)
+        .options(selectinload(Persona.vectores_faciales), selectinload(Persona.enlaces_grupos))
+        .where(Persona.id == persona.id)
     ).one()
-    return _serialize_persons_batch(db, [loaded], loaded.organization_id, settings.model_version)[0]
+    return _serializar_personas_lote(
+        sesion_bd,
+        [persona_cargada],
+        persona_cargada.id_organizacion,
+        configuracion.version_modelo,
+    )[0]
 
 
-@router.delete("/persons/{person_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_person(
-    person_id: int,
-    current_user: User = Depends(require_roles("superadmin", "org_admin")),
-    db: Session = Depends(get_db),
+@enrutador.delete("/persons/{id_persona}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_persona(
+    id_persona: int,
+    usuario_actual: Usuario = Depends(requerir_roles("superadmin", "org_admin")),
+    sesion_bd: Session = Depends(obtener_bd),
 ) -> None:
-    person = db.get(Person, person_id)
-    if person is None:
+    """Elimina permanentemente a una persona y sus registros asociados en cascada."""
+    persona = sesion_bd.get(Persona, id_persona)
+    if persona is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
-    assert_org_access(current_user, person.organization_id)
-    db.delete(person)
-    db.commit()
+    validar_acceso_organizacion(usuario_actual, persona.id_organizacion)
+    sesion_bd.delete(persona)
+    sesion_bd.commit()
 
 
-@router.post("/persons/{person_id}/enroll-frame", response_model=EnrollFrameResponse)
-async def enroll_frame(
-    person_id: int,
-    request: Request,
-    image: UploadFile = File(...),
-    pose_label: PoseLabel = Form(...),
-    store_avatar: bool | None = Form(default=None),
-    dry_run: bool = Form(default=False),
-    current_user: User = Depends(require_roles("superadmin", "org_admin", "supervisor", "operator")),
-    db: Session = Depends(get_db),
-) -> EnrollFrameResponse:
-    settings = get_settings()
-    person = db.scalars(
-        select(Person)
-        .options(selectinload(Person.embeddings))
-        .where(Person.id == person_id)
+@enrutador.post("/persons/{id_persona}/enroll-frame", response_model=RespuestaEnrolarFrame)
+async def enrolar_frame(
+    id_persona: int,
+    peticion: Request,
+    imagen: UploadFile = File(...),
+    etiqueta_pose: EtiquetaPose = Form(...),
+    guardar_avatar: bool | None = Form(default=None),
+    solo_validacion: bool = Form(default=False),
+    usuario_actual: Usuario = Depends(
+        requerir_roles("superadmin", "org_admin", "supervisor", "operator")
+    ),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaEnrolarFrame:
+    """Evalúa o registra una pose facial en memoria RAM descartando la imagen original."""
+    configuracion = obtener_configuracion()
+    persona = sesion_bd.scalars(
+        select(Persona)
+        .options(selectinload(Persona.vectores_faciales))
+        .where(Persona.id == id_persona)
     ).first()
-    if person is None:
+    if persona is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
-    assert_org_access(current_user, person.organization_id)
-    if not person.biometric_consent:
+    validar_acceso_organizacion(usuario_actual, persona.id_organizacion)
+    if not persona.consentimiento_biometrico:
         raise HTTPException(
             status_code=400,
             detail="Se requiere consentimiento biométrico explícito antes de registrar el rostro.",
         )
 
-    engine = getattr(request.app.state, "biometric_engine", None)
-    if engine is None:
+    motor = getattr(peticion.app.state, "motor_biometrico", None)
+    if motor is None:
         raise HTTPException(
             status_code=503,
             detail="El motor biométrico no está inicializado en el servidor.",
         )
 
-    raw_bytes = await image.read()
+    bytes_crudos = await imagen.read()
     try:
-        image_bgr = decode_image_bytes(raw_bytes)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        imagen_bgr = decodificar_bytes_imagen(bytes_crudos)
+    except ValueError as excepcion:
+        raise HTTPException(status_code=400, detail=str(excepcion)) from excepcion
 
-    img_h, img_w = image_bgr.shape[:2]
-    current_poses = [
-        e.pose_label
-        for e in person.embeddings
-        if e.model_version == settings.model_version
+    alto_imagen, ancho_imagen = imagen_bgr.shape[:2]
+    poses_actuales = [
+        vector.etiqueta_pose
+        for vector in persona.vectores_faciales
+        if vector.version_modelo == configuracion.version_modelo
     ]
-    already_complete = len(current_poses) >= REQUIRED_POSES_COUNT
+    ya_completo = len(poses_actuales) >= CANTIDAD_POSES_REQUERIDAS
 
-    detections = engine.detect(image_bgr)
-    if len(detections) == 0:
-        return EnrollFrameResponse(
-            accepted=False,
-            pose_valid=False,
-            pose_label=pose_label,
-            message="No se detectó ningún rostro. Colócate frente a la cámara.",
-            embeddings_count=len(current_poses),
-            poses_completed=current_poses,
-            is_complete=already_complete,
-            required_poses_count=REQUIRED_POSES_COUNT,
+    detecciones = motor.detectar(imagen_bgr)
+    if len(detecciones) == 0:
+        return RespuestaEnrolarFrame(
+            aceptado=False,
+            pose_valida=False,
+            etiqueta_pose=etiqueta_pose,
+            mensaje="No se detectó ningún rostro. Colócate frente a la cámara.",
+            cantidad_vectores=len(poses_actuales),
+            poses_completadas=poses_actuales,
+            enrolamiento_completo=ya_completo,
+            cantidad_poses_requeridas=CANTIDAD_POSES_REQUERIDAS,
         )
 
-    primary_box, primary_row = detections[0]
-    face_box_schema = to_face_box_schema(primary_box, img_w, img_h)
+    cuadro_principal, fila_principal = detecciones[0]
+    esquema_cuadro = convertir_a_esquema_cuadro_rostro(cuadro_principal, ancho_imagen, alto_imagen)
 
-    if len(detections) > 1:
-        return EnrollFrameResponse(
-            accepted=False,
-            pose_valid=False,
-            pose_label=pose_label,
-            message="Se detectaron varios rostros; asegúrate de estar solo frente a la cámara.",
-            embeddings_count=len(current_poses),
-            poses_completed=current_poses,
-            is_complete=already_complete,
-            required_poses_count=REQUIRED_POSES_COUNT,
-            face_box=face_box_schema,
+    if len(detecciones) > 1:
+        return RespuestaEnrolarFrame(
+            aceptado=False,
+            pose_valida=False,
+            etiqueta_pose=etiqueta_pose,
+            mensaje="Se detectaron varios rostros; asegúrate de estar solo frente a la cámara.",
+            cantidad_vectores=len(poses_actuales),
+            poses_completadas=poses_actuales,
+            enrolamiento_completo=ya_completo,
+            cantidad_poses_requeridas=CANTIDAD_POSES_REQUERIDAS,
+            cuadro_rostro=esquema_cuadro,
         )
 
-    frontal_emb = next(
+    vector_frontal = next(
         (
-            e
-            for e in person.embeddings
-            if e.pose_label == "frontal" and e.model_version == settings.model_version
+            vector
+            for vector in persona.vectores_faciales
+            if vector.etiqueta_pose == "frontal"
+            and vector.version_modelo == configuracion.version_modelo
         ),
         None,
     )
-    frontal_mouth_ratio = frontal_emb.mouth_ratio if frontal_emb is not None else None
-    frontal_pitch_ratio = frontal_emb.pitch_ratio if frontal_emb is not None else None
-
-    quality = evaluate_face_quality(
-        image_bgr,
-        primary_box,
-        min_size_px=settings.min_face_size_px,
-        min_blur=settings.enroll_min_blur_variance,
-        min_brightness=settings.enroll_min_brightness,
-        max_brightness=settings.max_brightness,
-        expected_pose=pose_label,
-        frontal_mouth_ratio=frontal_mouth_ratio,
-        frontal_pitch_ratio=frontal_pitch_ratio,
-        max_shadow_asymmetry=settings.enroll_max_shadow_asymmetry,
-        backlight_delta_threshold=settings.backlight_delta_threshold,
-        strict_lighting=True,
+    relacion_boca_frontal = (
+        vector_frontal.relacion_boca if vector_frontal is not None else None
     )
-    quality_schema = to_quality_schema(quality)
+    relacion_inclinacion_frontal = (
+        vector_frontal.relacion_inclinacion_vertical
+        if vector_frontal is not None
+        else None
+    )
 
-    if not quality.ok:
-        return EnrollFrameResponse(
-            accepted=False,
-            pose_valid=False,
-            pose_label=pose_label,
-            message=quality.reason or "Calidad de imagen insuficiente.",
-            embeddings_count=len(current_poses),
-            poses_completed=current_poses,
-            is_complete=already_complete,
-            required_poses_count=REQUIRED_POSES_COUNT,
-            face_box=face_box_schema,
-            quality=quality_schema,
+    calidad = evaluar_calidad_rostro(
+        imagen_bgr,
+        cuadro_principal,
+        tamano_minimo_px=configuracion.tamano_minimo_rostro_px,
+        nitidez_minima=configuracion.varianza_minima_nitidez_registro,
+        brillo_minimo=configuracion.brillo_minimo_registro,
+        brillo_maximo=configuracion.brillo_maximo,
+        pose_esperada=etiqueta_pose,
+        relacion_boca_frontal=relacion_boca_frontal,
+        relacion_inclinacion_frontal=relacion_inclinacion_frontal,
+        asimetria_sombra_maxima=configuracion.asimetria_sombra_maxima_registro,
+        umbral_delta_contraluz=configuracion.umbral_delta_contraluz,
+        iluminacion_estricta=True,
+    )
+    esquema_calidad = convertir_a_esquema_calidad(calidad)
+
+    if not calidad.es_valida:
+        return RespuestaEnrolarFrame(
+            aceptado=False,
+            pose_valida=False,
+            etiqueta_pose=etiqueta_pose,
+            mensaje=calidad.motivo or "Calidad de imagen insuficiente.",
+            cantidad_vectores=len(poses_actuales),
+            poses_completadas=poses_actuales,
+            enrolamiento_completo=ya_completo,
+            cantidad_poses_requeridas=CANTIDAD_POSES_REQUERIDAS,
+            cuadro_rostro=esquema_cuadro,
+            calidad=esquema_calidad,
         )
 
-    if not quality.pose_matches:
-        return EnrollFrameResponse(
-            accepted=False,
-            pose_valid=False,
-            pose_label=pose_label,
-            message=quality.pose_feedback or "La orientación del rostro no coincide con la pose solicitada.",
-            embeddings_count=len(current_poses),
-            poses_completed=current_poses,
-            is_complete=already_complete,
-            required_poses_count=REQUIRED_POSES_COUNT,
-            face_box=face_box_schema,
-            quality=quality_schema,
+    if not calidad.pose_coincide:
+        return RespuestaEnrolarFrame(
+            aceptado=False,
+            pose_valida=False,
+            etiqueta_pose=etiqueta_pose,
+            mensaje=(
+                calidad.retroalimentacion_pose
+                or "La orientación del rostro no coincide con la pose solicitada."
+            ),
+            cantidad_vectores=len(poses_actuales),
+            poses_completadas=poses_actuales,
+            enrolamiento_completo=ya_completo,
+            cantidad_poses_requeridas=CANTIDAD_POSES_REQUERIDAS,
+            cuadro_rostro=esquema_cuadro,
+            calidad=esquema_calidad,
         )
 
-    if dry_run:
-        return EnrollFrameResponse(
-            accepted=False,
-            pose_valid=True,
-            pose_label=pose_label,
-            message="Pose validada, mantén firme la posición...",
-            embeddings_count=len(current_poses),
-            poses_completed=current_poses,
-            is_complete=already_complete,
-            required_poses_count=REQUIRED_POSES_COUNT,
-            face_box=face_box_schema,
-            quality=quality_schema,
+    if solo_validacion:
+        return RespuestaEnrolarFrame(
+            aceptado=False,
+            pose_valida=True,
+            etiqueta_pose=etiqueta_pose,
+            mensaje="Pose validada, mantén firme la posición...",
+            cantidad_vectores=len(poses_actuales),
+            poses_completadas=poses_actuales,
+            enrolamiento_completo=ya_completo,
+            cantidad_poses_requeridas=CANTIDAD_POSES_REQUERIDAS,
+            cuadro_rostro=esquema_cuadro,
+            calidad=esquema_calidad,
         )
 
-    embedding_vec = engine.extract_embedding(image_bgr, primary_row)
+    vector_extraido = motor.extraer_vector(imagen_bgr, fila_principal)
 
-    # Verifica que no se mezcle el rostro de otra persona entre poses
-    other_same_version = [
-        e
-        for e in person.embeddings
-        if e.model_version == settings.model_version and e.pose_label != pose_label
+    # Verifica autoconsistencia contra poses previas para evitar mezclar dos personas distintas
+    otros_vectores_misma_version = [
+        vector
+        for vector in persona.vectores_faciales
+        if vector.version_modelo == configuracion.version_modelo
+        and vector.etiqueta_pose != etiqueta_pose
     ]
-    if other_same_version:
-        max_self_sim = max(
-            cosine_similarity(embedding_vec, bytes_to_embedding(e.vector_bytes))
-            for e in other_same_version
+    if otros_vectores_misma_version:
+        similitud_maxima = max(
+            similitud_coseno(vector_extraido, bytes_a_vector(vector.bytes_vector))
+            for vector in otros_vectores_misma_version
         )
-        if max_self_sim < settings.self_consistency_threshold:
-            return EnrollFrameResponse(
-                accepted=False,
-                pose_valid=False,
-                pose_label=pose_label,
-                message="El rostro capturado no coincide con las tomas previas de esta persona.",
-                embeddings_count=len(current_poses),
-                poses_completed=current_poses,
-                is_complete=already_complete,
-                required_poses_count=REQUIRED_POSES_COUNT,
-                face_box=face_box_schema,
-                quality=quality_schema,
+        if similitud_maxima < configuracion.umbral_autoconsistencia:
+            return RespuestaEnrolarFrame(
+                aceptado=False,
+                pose_valida=False,
+                etiqueta_pose=etiqueta_pose,
+                mensaje="El rostro capturado no coincide con las tomas previas de esta persona.",
+                cantidad_vectores=len(poses_actuales),
+                poses_completadas=poses_actuales,
+                enrolamiento_completo=ya_completo,
+                cantidad_poses_requeridas=CANTIDAD_POSES_REQUERIDAS,
+                cuadro_rostro=esquema_cuadro,
+                calidad=esquema_calidad,
             )
 
-    existing_pose = next((e for e in person.embeddings if e.pose_label == pose_label), None)
-    vector_bytes = embedding_to_bytes(embedding_vec)
-    if existing_pose is not None:
-        existing_pose.vector_bytes = vector_bytes
-        existing_pose.model_name = settings.model_name
-        existing_pose.model_version = settings.model_version
-        existing_pose.quality_score = round(quality.blur_score, 2)
-        existing_pose.mouth_ratio = round(quality.mouth_ratio, 4)
-        existing_pose.pitch_ratio = round(quality.pitch_ratio, 4)
-        existing_pose.created_at = datetime.now()
+    pose_existente = next(
+        (vector for vector in persona.vectores_faciales if vector.etiqueta_pose == etiqueta_pose),
+        None,
+    )
+    bytes_vector = vector_a_bytes(vector_extraido)
+    if pose_existente is not None:
+        pose_existente.bytes_vector = bytes_vector
+        pose_existente.nombre_modelo = configuracion.nombre_modelo
+        pose_existente.version_modelo = configuracion.version_modelo
+        pose_existente.puntaje_calidad = round(calidad.puntaje_nitidez, 2)
+        pose_existente.relacion_boca = round(calidad.relacion_boca, 4)
+        pose_existente.relacion_inclinacion_vertical = round(
+            calidad.relacion_inclinacion_vertical, 4
+        )
+        pose_existente.creado_en = datetime.now()
     else:
-        db.add(
-            FaceEmbedding(
-                person_id=person.id,
-                pose_label=pose_label,
-                vector_bytes=vector_bytes,
-                model_name=settings.model_name,
-                model_version=settings.model_version,
-                quality_score=round(quality.blur_score, 2),
-                mouth_ratio=round(quality.mouth_ratio, 4),
-                pitch_ratio=round(quality.pitch_ratio, 4),
+        sesion_bd.add(
+            VectorFacial(
+                id_persona=persona.id,
+                etiqueta_pose=etiqueta_pose,
+                bytes_vector=bytes_vector,
+                nombre_modelo=configuracion.nombre_modelo,
+                version_modelo=configuracion.version_modelo,
+                puntaje_calidad=round(calidad.puntaje_nitidez, 2),
+                relacion_boca=round(calidad.relacion_boca, 4),
+                relacion_inclinacion_vertical=round(calidad.relacion_inclinacion_vertical, 4),
             )
         )
 
-    org = db.get(Organization, person.organization_id)
-    should_store_avatar = (
-        store_avatar
-        if store_avatar is not None
-        else (org.store_avatar_by_default if org is not None else True)
+    organizacion = sesion_bd.get(Organizacion, persona.id_organizacion)
+    debe_guardar_avatar = (
+        guardar_avatar
+        if guardar_avatar is not None
+        else (organizacion.guardar_avatar_por_defecto if organizacion is not None else True)
     )
-    avatar_saved = False
-    if pose_label == "frontal" and should_store_avatar:
-        person.avatar_base64 = create_avatar_base64(image_bgr, primary_box, size=200)
-        avatar_saved = True
+    avatar_guardado = False
+    if etiqueta_pose == "frontal" and debe_guardar_avatar:
+        persona.avatar_base64 = crear_avatar_base64(imagen_bgr, cuadro_principal, tamano=200)
+        avatar_guardado = True
 
-    db.commit()
+    sesion_bd.commit()
 
-    refreshed = db.scalars(
-        select(FaceEmbedding).where(
-            FaceEmbedding.person_id == person.id,
-            FaceEmbedding.model_version == settings.model_version,
-        )
-    ).all()
-    updated_poses = [e.pose_label for e in refreshed]
+    poses_actualizadas = [
+        vector.etiqueta_pose
+        for vector in sesion_bd.scalars(
+            select(VectorFacial).where(
+                VectorFacial.id_persona == persona.id,
+                VectorFacial.version_modelo == configuracion.version_modelo,
+            )
+        ).all()
+    ]
 
-    return EnrollFrameResponse(
-        accepted=True,
-        pose_valid=True,
-        pose_label=pose_label,
-        message=f"Pose '{pose_label}' registrada en memoria y vector almacenado.",
-        embeddings_count=len(updated_poses),
-        poses_completed=updated_poses,
-        is_complete=len(updated_poses) >= REQUIRED_POSES_COUNT,
-        required_poses_count=REQUIRED_POSES_COUNT,
-        face_box=face_box_schema,
-        quality=quality_schema,
-        avatar_saved=avatar_saved,
+    return RespuestaEnrolarFrame(
+        aceptado=True,
+        pose_valida=True,
+        etiqueta_pose=etiqueta_pose,
+        mensaje=f"Pose '{etiqueta_pose}' registrada en memoria y vector almacenado.",
+        cantidad_vectores=len(poses_actualizadas),
+        poses_completadas=poses_actualizadas,
+        enrolamiento_completo=len(poses_actualizadas) >= CANTIDAD_POSES_REQUERIDAS,
+        cantidad_poses_requeridas=CANTIDAD_POSES_REQUERIDAS,
+        cuadro_rostro=esquema_cuadro,
+        calidad=esquema_calidad,
+        avatar_guardado=avatar_guardado,
     )
 
 
-def _revoke_persons_biometrics(
-    db: Session,
+def _revocar_biometria_personas(
+    sesion_bd: Session,
     *,
-    current_user: User,
-    persons: list[Person],
-    authorization_secret: str,
-    reason: str | None,
-) -> tuple[int, bool, AuthorizationResult]:
-    org_ids = {p.organization_id for p in persons}
-    if len(org_ids) != 1:
+    usuario_actual: Usuario,
+    personas: list[Persona],
+    secreto_autorizacion: str,
+    motivo: str | None,
+) -> tuple[int, bool, ResultadoAutorizacion]:
+    """Ejecuta la revocación biométrica validando autorización sensible y auditando cada baja."""
+    ids_organizaciones = {persona.id_organizacion for persona in personas}
+    if len(ids_organizaciones) != 1:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Todas las personas seleccionadas deben pertenecer a la misma organización.",
         )
-    target_org_id = next(iter(org_ids))
-    assert_org_access(current_user, target_org_id)
+    id_org_objetivo = next(iter(ids_organizaciones))
+    validar_acceso_organizacion(usuario_actual, id_org_objetivo)
 
-    auth_res = verify_sensitive_authorization(
-        db,
-        current_user=current_user,
-        organization_id=target_org_id,
-        authorization_secret=authorization_secret,
-        required_operation="revoke_biometrics",
+    resultado_auth = verificar_autorizacion_sensible(
+        sesion_bd,
+        usuario_actual=usuario_actual,
+        id_organizacion=id_org_objetivo,
+        secreto_autorizacion=secreto_autorizacion,
+        operacion_requerida="revoke_biometrics",
     )
 
-    total_deleted = 0
-    any_avatar_cleared = False
-    reason_note = reason.strip() if reason and reason.strip() else "Revocación de datos biométricos"
+    total_eliminados = 0
+    algun_avatar_limpio = False
+    nota_motivo = (
+        motivo.strip() if motivo and motivo.strip() else "Revocación de datos biométricos"
+    )
 
-    for person in persons:
-        deleted_count = len(person.embeddings)
-        total_deleted += deleted_count
-        for emb in list(person.embeddings):
-            db.delete(emb)
+    for persona in personas:
+        conteo_eliminados = len(persona.vectores_faciales)
+        total_eliminados += conteo_eliminados
+        for vector in list(persona.vectores_faciales):
+            sesion_bd.delete(vector)
 
-        if person.avatar_base64 is not None:
-            any_avatar_cleared = True
-            person.avatar_base64 = None
+        if persona.avatar_base64 is not None:
+            algun_avatar_limpio = True
+            persona.avatar_base64 = None
 
-        record_audit_log(
-            db,
-            organization_id=target_org_id,
-            action="revoke_biometrics",
-            target_type="person",
-            target_id=person.id,
-            target_summary=f"{person.full_name} ({person.external_id})",
-            executed_by_user=current_user,
-            authorized_by_user=auth_res.authorized_by_user,
-            delegated_credential=auth_res.delegated_credential,
-            details=f"{reason_note} | Vectores eliminados: {deleted_count} | Método: {auth_res.method}",
+        registrar_auditoria(
+            sesion_bd,
+            id_organizacion=id_org_objetivo,
+            accion="revoke_biometrics",
+            tipo_objetivo="person",
+            id_objetivo=persona.id,
+            resumen_objetivo=f"{persona.nombre_completo} ({persona.identificador_externo})",
+            usuario_ejecutor=usuario_actual,
+            usuario_autorizador=resultado_auth.usuario_autorizador,
+            credencial_delegada=resultado_auth.credencial_delegada,
+            detalles=(
+                f"{nota_motivo} | Vectores eliminados: {conteo_eliminados} | "
+                f"Método: {resultado_auth.metodo}"
+            ),
         )
 
-    db.commit()
-    return total_deleted, any_avatar_cleared, auth_res
+    sesion_bd.commit()
+    return total_eliminados, algun_avatar_limpio, resultado_auth
 
 
-@router.post("/persons/biometrics/revoke", response_model=BatchBiometricsRevokeResponse)
-def revoke_biometrics_batch(
-    payload: BatchBiometricsRevokeRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> BatchBiometricsRevokeResponse:
-    unique_ids = list(dict.fromkeys(payload.person_ids))
-    persons = list(
-        db.scalars(
-            select(Person)
-            .options(selectinload(Person.embeddings))
-            .where(Person.id.in_(unique_ids))
+@enrutador.post("/persons/biometrics/revoke", response_model=RespuestaRevocarBiometriaLote)
+def revocar_biometria_lote(
+    carga: SolicitudRevocarBiometriaLote,
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaRevocarBiometriaLote:
+    """Revoca simultáneamente los vectores biométricos de un lote de personas."""
+    ids_unicos = list(dict.fromkeys(carga.ids_personas))
+    personas = list(
+        sesion_bd.scalars(
+            select(Persona)
+            .options(selectinload(Persona.vectores_faciales))
+            .where(Persona.id.in_(ids_unicos))
         ).all()
     )
-    if len(persons) != len(unique_ids):
+    if len(personas) != len(ids_unicos):
         raise HTTPException(status_code=404, detail="Una o más personas no fueron encontradas.")
 
-    total_deleted, _, auth_res = _revoke_persons_biometrics(
-        db,
-        current_user=current_user,
-        persons=persons,
-        authorization_secret=payload.authorization_secret,
-        reason=payload.reason,
+    total_eliminados, _, resultado_auth = _revocar_biometria_personas(
+        sesion_bd,
+        usuario_actual=usuario_actual,
+        personas=personas,
+        secreto_autorizacion=carga.secreto_autorizacion,
+        motivo=carga.motivo,
     )
-    return BatchBiometricsRevokeResponse(
-        revoked_persons_count=len(persons),
-        deleted_embeddings=total_deleted,
-        authorized_by_name=auth_res.authorized_by_user.full_name if auth_res.authorized_by_user else None,
-        authorization_method=auth_res.method,
-        delegated_credential_label=(
-            auth_res.delegated_credential.label if auth_res.delegated_credential else None
+    return RespuestaRevocarBiometriaLote(
+        cantidad_personas_revocadas=len(personas),
+        vectores_eliminados=total_eliminados,
+        nombre_autorizador=(
+            resultado_auth.usuario_autorizador.nombre_completo
+            if resultado_auth.usuario_autorizador
+            else None
+        ),
+        metodo_autorizacion=resultado_auth.metodo,
+        etiqueta_credencial_delegada=(
+            resultado_auth.credencial_delegada.etiqueta
+            if resultado_auth.credencial_delegada
+            else None
         ),
     )
 
 
-@router.delete("/persons/{person_id}/biometrics", response_model=BiometricsRevokeResponse)
-def revoke_biometrics(
-    person_id: int,
-    payload: BiometricsRevokeRequest | None = Body(default=None),
-    x_authorization_secret: str | None = Header(default=None, alias="X-Authorization-Secret"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> BiometricsRevokeResponse:
-    person = db.scalars(
-        select(Person)
-        .options(selectinload(Person.embeddings))
-        .where(Person.id == person_id)
+@enrutador.delete("/persons/{id_persona}/biometrics", response_model=RespuestaRevocarBiometria)
+def revocar_biometria_individual(
+    id_persona: int,
+    carga: SolicitudRevocarBiometria | None = Body(default=None),
+    x_secreto_autorizacion: str | None = Header(default=None, alias="X-Secreto-Autorizacion"),
+    x_authorization_secret_legado: str | None = Header(
+        default=None, alias="X-Authorization-Secret"
+    ),
+    usuario_actual: Usuario = Depends(obtener_usuario_actual),
+    sesion_bd: Session = Depends(obtener_bd),
+) -> RespuestaRevocarBiometria:
+    """Elimina los vectores faciales y avatar de una persona previa autorización validada."""
+    persona = sesion_bd.scalars(
+        select(Persona)
+        .options(selectinload(Persona.vectores_faciales))
+        .where(Persona.id == id_persona)
     ).first()
-    if person is None:
+    if persona is None:
         raise HTTPException(status_code=404, detail="Persona no encontrada.")
 
-    secret = (payload.authorization_secret if payload else None) or x_authorization_secret or ""
-    reason = payload.reason if payload else None
-
-    deleted_count, had_avatar, auth_res = _revoke_persons_biometrics(
-        db,
-        current_user=current_user,
-        persons=[person],
-        authorization_secret=secret,
-        reason=reason,
+    secreto = (
+        (carga.secreto_autorizacion if carga else None)
+        or x_secreto_autorizacion
+        or x_authorization_secret_legado
+        or ""
     )
-    return BiometricsRevokeResponse(
-        person_id=person.id,
-        deleted_embeddings=deleted_count,
-        avatar_cleared=had_avatar,
-        authorized_by_name=auth_res.authorized_by_user.full_name if auth_res.authorized_by_user else None,
-        authorization_method=auth_res.method,
-        delegated_credential_label=(
-            auth_res.delegated_credential.label if auth_res.delegated_credential else None
+    motivo = carga.motivo if carga else None
+
+    conteo_eliminados, tenia_avatar, resultado_auth = _revocar_biometria_personas(
+        sesion_bd,
+        usuario_actual=usuario_actual,
+        personas=[persona],
+        secreto_autorizacion=secreto,
+        motivo=motivo,
+    )
+    return RespuestaRevocarBiometria(
+        id_persona=persona.id,
+        vectores_eliminados=conteo_eliminados,
+        avatar_eliminado=tenia_avatar,
+        nombre_autorizador=(
+            resultado_auth.usuario_autorizador.nombre_completo
+            if resultado_auth.usuario_autorizador
+            else None
+        ),
+        metodo_autorizacion=resultado_auth.metodo,
+        etiqueta_credencial_delegada=(
+            resultado_auth.credencial_delegada.etiqueta
+            if resultado_auth.credencial_delegada
+            else None
         ),
     )
